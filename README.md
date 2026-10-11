@@ -9,6 +9,10 @@
   compatibility layer, so you can run the game on a server of your own.
 </p>
 
+
+<p align="center"><a href="https://discord.gg/e3HuAZGdU3"><b>Join our Discord Server</b></a></p>
+
+
 <p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-blue"></a>
   <a href="https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0"><img alt="Dauntless 1.12.0: tag dauntless-1.12.0" src="https://img.shields.io/badge/Dauntless%201.12.0-tag%20dauntless--1.12.0-2ea44f"></a>
