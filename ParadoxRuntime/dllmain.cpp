@@ -5723,7 +5723,45 @@ char ProcessRequest(void* Request) {
 // logging caused frame lag) and so it can be disabled after rewrite is enabled.
 // Installed in BOTH client and dedicated-server init (both make backend calls).
 // ============================================================================
-static const wchar_t* kMpApiBase = L"https://" MP_PUBLIC_HOST;
+// [forever-launcher] MYSTICPARADOX_API_BASE (scheme://host:port, no path) replaces the compiled-in
+// https://MP_PUBLIC_HOST for this process. The Dauntless Forever launcher sets it to its local relay
+// (http://127.0.0.1:<port>), which carries the traffic over pinned TLS to the invite's server, so a
+// player needs no hosts entry or trusted certificate. The XMPP ServerAddr/ServerPort follow it.
+struct MpApiOverride {
+    std::wstring Base;    // empty = no override
+    std::wstring WsAddr;  // ws://host or wss://host
+    std::wstring Port;
+};
+
+static const MpApiOverride& MpGetApiOverride() {
+    static const MpApiOverride Value = [] {
+        MpApiOverride O;
+        wchar_t Buf[256]{};
+        const DWORD Len = GetEnvironmentVariableW(L"MYSTICPARADOX_API_BASE", Buf, static_cast<DWORD>(std::size(Buf)));
+        if (Len == 0 || Len >= std::size(Buf)) return O;
+        const std::wstring Raw(Buf, Len);
+        const bool Tls = Raw.rfind(L"https://", 0) == 0;
+        if (!Tls && Raw.rfind(L"http://", 0) != 0) { MpLog("[ApiOverride] ignored: scheme must be http or https"); return O; }
+        const std::wstring Authority = Raw.substr(Tls ? 8 : 7);
+        const size_t Colon = Authority.rfind(L':');
+        if (Authority.empty() || Authority.find(L'/') != std::wstring::npos || Colon == std::wstring::npos || Colon == 0
+            || Colon + 1 == Authority.size() || Authority.find_first_not_of(L"0123456789", Colon + 1) != std::wstring::npos) {
+            MpLog("[ApiOverride] ignored: expected scheme://host:port with no path");
+            return O;
+        }
+        O.Base = Raw;
+        O.WsAddr = (Tls ? L"wss://" : L"ws://") + Authority.substr(0, Colon);
+        O.Port = Authority.substr(Colon + 1);
+        MpLog("[ApiOverride] backend -> " + MpNarrow(Raw));
+        return O;
+    }();
+    return Value;
+}
+
+static const std::wstring& MpApiBase() {
+    static const std::wstring Base = MpGetApiOverride().Base.empty() ? std::wstring(L"https://" MP_PUBLIC_HOST) : MpGetApiOverride().Base;
+    return Base;
+}
 
 // Case-insensitive parsed-host match against the redirect allowlist: exact apex
 // or a dot-delimited subdomain of one. Never a blind substring match.
@@ -5779,7 +5817,7 @@ static bool MpSplitUrl(const std::wstring& Url, std::wstring& OutHost, std::wstr
 
 static std::wstring MpBuildRedirectUrl(const std::wstring& Host, const std::wstring& Tail) {
     // https://paradox.mysticfox.dev/__origin/<original-host><tail>  (Tail begins with '/')
-    std::wstring Out = kMpApiBase;
+    std::wstring Out = MpApiBase();
     Out += L"/__origin/";
     Out += Host;
     Out += Tail;
@@ -6223,7 +6261,10 @@ static void MpLogUrlObservation(const std::wstring& Host, const std::wstring& Ta
 // (naive concat). So ServerAddr MUST be host-only (no path) — a path gets ":443" appended AFTER
 // it (observed reject: GET /__ws/xmpp:443). With a bare host the client connects to
 // wss://paradox.mysticfox.dev:443 and requests the root path, which the gateway accepts.
-static const wchar_t* kMpXmppWsUrl = L"wss://" MP_PUBLIC_HOST;
+static std::wstring MpXmppServerAddr() {
+    const MpApiOverride& O = MpGetApiOverride();
+    return O.WsAddr.empty() ? std::wstring(L"wss://" MP_PUBLIC_HOST) : O.WsAddr;
+}
 
 static bool MpXmppTraceEnabled() {
     static int Cached = -1;
@@ -6261,6 +6302,11 @@ static bool MpIsXmppServerAddr(const std::wstring& Section, const std::wstring& 
         (_wcsicmp(Key.c_str(), L"ServerAddr") == 0) || MpWContainsCI(Key, L"serveraddr");
     if (!KeyIsServerAddr) return false;
     return MpWContainsCI(Section, L"xmpp") || MpWContainsCI(Key, L"xmpp");
+}
+
+// [forever-launcher] Only overridden with MYSTICPARADOX_API_BASE; GetInt reads it through GetString.
+static bool MpIsXmppServerPort(const std::wstring& Section, const std::wstring& Key) {
+    return _wcsicmp(Key.c_str(), L"ServerPort") == 0 && MpWContainsCI(Section, L"xmpp");
 }
 
 // Trace filter: only OBSERVE reads relevant to the social/realtime transport, so the engine's
@@ -6325,18 +6371,19 @@ bool GetConfigStringHook(void* This, const wchar_t* Section, const wchar_t* Key,
     std::wstring K   = (Key && IsReadablePointer((void*)Key, sizeof(wchar_t))) ? std::wstring(Key) : std::wstring();
 
     const bool IsServerAddr = MpIsXmppServerAddr(Sec, K);
+    const bool IsServerPort = !MpGetApiOverride().Port.empty() && MpIsXmppServerPort(Sec, K);
 
     if (Trace && (IsServerAddr || MpIsXmppInterestingConfig(Sec, K))) {
         MpLogXmppConfigObservation(Sec, K, Found, Redirect && IsServerAddr);
     }
 
-    if (Redirect && IsServerAddr && Value != nullptr) {
+    if (Redirect && (IsServerAddr || IsServerPort) && Value != nullptr) {
         // Overwrite the OUTPUT FString (Value), which the client reads AFTER this hook returns,
         // using the proven engine-allocating pattern (see EngineRealloc / GetGameDefaultMap). A
         // shallow FString(wchar_t*) would alias freed CRT storage and dangle here.
         struct RawFString { wchar_t* Data; int Num; int Max; };
         RawFString* Raw = reinterpret_cast<RawFString*>(Value);
-        const std::wstring New = kMpXmppWsUrl;
+        const std::wstring New = IsServerPort ? MpGetApiOverride().Port : MpXmppServerAddr();
         const int Count = static_cast<int>(New.size()) + 1; // include null terminator
 
         if (Raw->Max < Count || Raw->Data == nullptr) {
@@ -6347,8 +6394,8 @@ bool GetConfigStringHook(void* This, const wchar_t* Section, const wchar_t* Key,
             Raw->Num = Count;
             if (Raw->Max < Count) Raw->Max = Count;
 
-            static int LoggedOnce = 0;
-            if (!LoggedOnce) { LoggedOnce = 1; MpLog(std::string("[XmppConfig] ServerAddr -> ") + MpNarrow(New)); }
+            static int LoggedOnce[2] = {};
+            if (!LoggedOnce[IsServerPort]) { LoggedOnce[IsServerPort] = 1; MpLog(std::string(IsServerPort ? "[XmppConfig] ServerPort -> " : "[XmppConfig] ServerAddr -> ") + MpNarrow(New)); }
             return true; // Value now holds our owned endpoint
         }
         // Allocation failed — fall through and leave the original result untouched.
