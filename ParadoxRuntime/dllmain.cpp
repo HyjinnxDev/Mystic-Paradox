@@ -5731,6 +5731,7 @@ struct MpApiOverride {
     std::wstring Base;    // empty = no override
     std::wstring WsAddr;  // ws://host or wss://host
     std::wstring Port;
+    std::wstring UseSsl;  // XMPP bUseSSL: True for https, False for http
 };
 
 static const MpApiOverride& MpGetApiOverride() {
@@ -5752,6 +5753,7 @@ static const MpApiOverride& MpGetApiOverride() {
         O.Base = Raw;
         O.WsAddr = (Tls ? L"wss://" : L"ws://") + Authority.substr(0, Colon);
         O.Port = Authority.substr(Colon + 1);
+        O.UseSsl = Tls ? L"True" : L"False";
         MpLog("[ApiOverride] backend -> " + MpNarrow(Raw));
         return O;
     }();
@@ -6304,9 +6306,14 @@ static bool MpIsXmppServerAddr(const std::wstring& Section, const std::wstring& 
     return MpWContainsCI(Section, L"xmpp") || MpWContainsCI(Key, L"xmpp");
 }
 
-// [forever-launcher] Only overridden with MYSTICPARADOX_API_BASE; GetInt reads it through GetString.
-static bool MpIsXmppServerPort(const std::wstring& Section, const std::wstring& Key) {
-    return _wcsicmp(Key.c_str(), L"ServerPort") == 0 && MpWContainsCI(Section, L"xmpp");
+// [forever-launcher] ServerPort and bUseSSL are only overridden with MYSTICPARADOX_API_BASE; GetInt and
+// GetBool read them through GetString. Returns the override value, or nullptr when the key is not one of them.
+static const std::wstring* MpXmppKeyOverride(const std::wstring& Section, const std::wstring& Key) {
+    const MpApiOverride& O = MpGetApiOverride();
+    if (O.Base.empty() || !MpWContainsCI(Section, L"xmpp")) return nullptr;
+    if (_wcsicmp(Key.c_str(), L"ServerPort") == 0) return &O.Port;
+    if (_wcsicmp(Key.c_str(), L"bUseSSL") == 0) return &O.UseSsl;
+    return nullptr;
 }
 
 // Trace filter: only OBSERVE reads relevant to the social/realtime transport, so the engine's
@@ -6371,19 +6378,19 @@ bool GetConfigStringHook(void* This, const wchar_t* Section, const wchar_t* Key,
     std::wstring K   = (Key && IsReadablePointer((void*)Key, sizeof(wchar_t))) ? std::wstring(Key) : std::wstring();
 
     const bool IsServerAddr = MpIsXmppServerAddr(Sec, K);
-    const bool IsServerPort = !MpGetApiOverride().Port.empty() && MpIsXmppServerPort(Sec, K);
+    const std::wstring* KeyOverride = IsServerAddr ? nullptr : MpXmppKeyOverride(Sec, K);
 
     if (Trace && (IsServerAddr || MpIsXmppInterestingConfig(Sec, K))) {
         MpLogXmppConfigObservation(Sec, K, Found, Redirect && IsServerAddr);
     }
 
-    if (Redirect && (IsServerAddr || IsServerPort) && Value != nullptr) {
+    if (Redirect && (IsServerAddr || KeyOverride) && Value != nullptr) {
         // Overwrite the OUTPUT FString (Value), which the client reads AFTER this hook returns,
         // using the proven engine-allocating pattern (see EngineRealloc / GetGameDefaultMap). A
         // shallow FString(wchar_t*) would alias freed CRT storage and dangle here.
         struct RawFString { wchar_t* Data; int Num; int Max; };
         RawFString* Raw = reinterpret_cast<RawFString*>(Value);
-        const std::wstring New = IsServerPort ? MpGetApiOverride().Port : MpXmppServerAddr();
+        const std::wstring New = KeyOverride ? *KeyOverride : MpXmppServerAddr();
         const int Count = static_cast<int>(New.size()) + 1; // include null terminator
 
         if (Raw->Max < Count || Raw->Data == nullptr) {
@@ -6394,8 +6401,10 @@ bool GetConfigStringHook(void* This, const wchar_t* Section, const wchar_t* Key,
             Raw->Num = Count;
             if (Raw->Max < Count) Raw->Max = Count;
 
-            static int LoggedOnce[2] = {};
-            if (!LoggedOnce[IsServerPort]) { LoggedOnce[IsServerPort] = 1; MpLog(std::string(IsServerPort ? "[XmppConfig] ServerPort -> " : "[XmppConfig] ServerAddr -> ") + MpNarrow(New)); }
+            static int LoggedAddr = 0;
+            static int LoggedKeys = 0;
+            if (!KeyOverride && !LoggedAddr) { LoggedAddr = 1; MpLog(std::string("[XmppConfig] ServerAddr -> ") + MpNarrow(New)); }
+            if (KeyOverride && LoggedKeys < 4) { ++LoggedKeys; MpLog("[XmppConfig] " + MpNarrow(K) + " -> " + MpNarrow(New)); }
             return true; // Value now holds our owned endpoint
         }
         // Allocation failed — fall through and leave the original result untouched.
