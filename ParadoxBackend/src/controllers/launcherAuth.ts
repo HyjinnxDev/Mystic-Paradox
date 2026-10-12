@@ -123,8 +123,21 @@ export function IsValidEmailAddress(raw: unknown): raw is string {
     return true;
 }
 
-function ValidateRegistrationInput(email: string, password: string): void {
-    if (!IsValidEmailAddress(email)) {
+// [forever-launcher] LAUNCHER_INVITE_CODES: comma-separated codes a host puts in its invites. A
+// registration that carries one is approved at once and may leave out the email; without one the
+// account waits for approval as before. Unset = no code is ever valid.
+export function IsValidInviteCode(raw: unknown): boolean {
+    if (typeof raw !== "string" || raw.length === 0 || raw.length > 128) return false;
+    const Given = crypto.createHash("sha256").update(raw).digest();
+    let Match = false;
+    for (const Code of (process.env.LAUNCHER_INVITE_CODES ?? "").split(",").map((c) => c.trim()).filter((c) => c.length > 0)) {
+        if (crypto.timingSafeEqual(Given, crypto.createHash("sha256").update(Code).digest())) Match = true;
+    }
+    return Match;
+}
+
+function ValidateRegistrationInput(email: string | undefined, password: string): void {
+    if (email !== undefined && !IsValidEmailAddress(email)) {
         throw new LauncherApiError("AUTH_VALIDATION_FAILED", "Enter a valid email address.");
     }
 
@@ -187,21 +200,29 @@ export async function RegisterAccount(
     password: string,
     deviceName: string,
     deviceId: string,
-    ip: string
-): Promise<PendingRegistrationResult> {
+    ip: string,
+    inviteCode?: unknown
+): Promise<PendingRegistrationResult | (LauncherSessionResult & { approvalRequired: false })> {
     if (IsRateLimited(`register:${ip}`, 5, 60 * 60 * 1000)) {
         throw new LauncherApiError("AUTH_RATE_LIMITED", "Too many registration attempts. Try again later.");
     }
 
-    const CleanUsername = ValidateUsername(displayName);
-    ValidateRegistrationInput(email, password);
+    const Invited = inviteCode !== undefined && inviteCode !== "";
+    if (Invited && !IsValidInviteCode(inviteCode)) {
+        throw new LauncherApiError("AUTH_INVITE_INVALID", "This invite is not valid on this server. Ask your host for a new one.");
+    }
 
-    const NormalizedEmail = NormalizeEmail(email);
+    const CleanUsername = ValidateUsername(displayName);
+    // An invited player may register without an email; they then sign in with their username.
+    const GivenEmail = Invited && (email === undefined || email === "") ? undefined : email;
+    ValidateRegistrationInput(GivenEmail, password);
+
+    const NormalizedEmail = GivenEmail === undefined ? undefined : NormalizeEmail(GivenEmail);
     const NormalizedDisplayName = NormalizeDisplayName(CleanUsername);
 
     const Repos = GetRepositories();
 
-    if ((await Repos.launcherAccounts.findByEmail(NormalizedEmail)) != undefined) {
+    if (NormalizedEmail !== undefined && (await Repos.launcherAccounts.findByEmail(NormalizedEmail)) != undefined) {
         throw new LauncherApiError("AUTH_EMAIL_TAKEN", "That email is already registered.");
     }
 
@@ -219,11 +240,12 @@ export async function RegisterAccount(
         displayName: CleanUsername,
         passwordHash: PasswordHash,
         status: "active",
-        approvalStatus: "pending",
+        approvalStatus: Invited ? "approved" : "pending",
         roles: ["player"],
         createdAt: new Date().toISOString(),
         usernameSet: true
     };
+    if (NormalizedEmail === undefined) delete Account.email;
 
     try {
         await Repos.launcherAccounts.create(Account);
@@ -239,7 +261,12 @@ export async function RegisterAccount(
         throw error;
     }
 
-    logger.info(`Launcher account registered: ${UserId}`);
+    logger.info(`Launcher account registered: ${UserId}${Invited ? " (invite, approved)" : ""}`);
+
+    if (Invited) {
+        const Session = await CreateSessionForUser(UserId, deviceId, deviceName);
+        return { approvalRequired: false, ...Session, account: await ToAccountView(Account) };
+    }
 
     // Pending accounts deliberately receive no access/refresh token. Possession
     // of the open-source launcher cannot bypass server-side admission.
@@ -255,7 +282,10 @@ export async function LoginWithPassword(email: string, password: string, deviceI
         throw new LauncherApiError("AUTH_INVALID_CREDENTIALS", "The email or password is incorrect.");
     }
 
-    const Account = await GetRepositories().launcherAccounts.findByEmail(NormalizeEmail(email));
+    // [forever-launcher] An identifier without "@" is a username (invited accounts may have no email).
+    const Account = email.includes("@")
+        ? await GetRepositories().launcherAccounts.findByEmail(NormalizeEmail(email))
+        : await GetRepositories().launcherAccounts.findByDisplayNameNormalized(NormalizeDisplayName(email));
     const PasswordOk = await VerifyPassword(Account?.passwordHash, password);
 
     if (Account == undefined || !PasswordOk) {

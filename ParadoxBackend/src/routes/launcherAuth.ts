@@ -113,10 +113,10 @@ function GetDeviceFields(req: Request): { deviceId: string; deviceName: string }
 /** Every handler below funnels errors through here so a thrown LauncherApiError
  *  becomes the documented {error:{code,message,requestId}} body, and anything
  *  unexpected is logged (never leaked to the client) and reported as INTERNAL. */
-async function Handle(req: Request, res: Response, fn: () => Promise<unknown>, successStatus = 200): Promise<void> {
+async function Handle(req: Request, res: Response, fn: () => Promise<unknown>, successStatus: number | ((result: unknown) => number) = 200): Promise<void> {
     try {
         const Result = await fn();
-        res.status(successStatus).json(Result ?? {});
+        res.status(typeof successStatus === "function" ? successStatus(Result) : successStatus).json(Result ?? {});
     } catch (error) {
         if (error instanceof LauncherApiError) {
             SendLauncherError(res, error);
@@ -128,11 +128,12 @@ async function Handle(req: Request, res: Response, fn: () => Promise<unknown>, s
     }
 }
 
+// 202 = waiting for approval (no tokens); a registration with a valid invite code is signed in at once (200).
 launcherAuthRouter.post("/launcher/v1/auth/register", (req, res) =>
     Handle(req, res, () => {
         const { deviceId, deviceName } = GetDeviceFields(req);
-        return RegisterAccount(req.body?.displayName, req.body?.email, req.body?.password, deviceName, deviceId, GetClientIp(req));
-    }, 202)
+        return RegisterAccount(req.body?.displayName, req.body?.email, req.body?.password, deviceName, deviceId, GetClientIp(req), req.body?.inviteCode);
+    }, (Result) => (Result as { approvalRequired?: boolean }).approvalRequired === false ? 200 : 202)
 );
 
 launcherAuthRouter.post("/launcher/v1/auth/login", (req, res) =>
