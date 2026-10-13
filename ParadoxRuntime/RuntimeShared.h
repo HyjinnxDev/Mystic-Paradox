@@ -39,5 +39,10 @@ std::string SafeObjectNameForDiagnostic(void* Object);
 // Narrow copy of a UE FString (ASCII content), guarded and bounded.
 std::string CoreCapFString(void* fstr);
 
+// CrashReporter.cpp: replaces the engine's CrashReportClient (see the header comment there).
+void MpCrashReporterInstall();
+// Backend base URL the runtime talks to (scheme://host:port), including the launcher relay override.
+std::wstring MpApiBaseForCrashReports();
+
 // Game thread: UKismetSystemLibrary::QuitGame on the current world.
 void MpQuitGame();

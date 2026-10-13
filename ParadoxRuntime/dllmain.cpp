@@ -4503,6 +4503,40 @@ static bool NativeNetTick() {
 // to confirm the collection.NetDriver==null root; superseded by the collection-registration fix (item 2).
 
 static bool PlayerRepBoost();  // [fwd] defined with the replication helpers below; used in GameEngineTickHook
+
+// [2026-10-13 net rate] UE4's default per-client bandwidth caps (MaxClientRate 15000, MaxInternetClientRate
+// 10000 bytes/s) are too small for a 4-player hunt now that player pawns replicate at ~30Hz (PlayerRepBoost):
+// the connection saturates and updates queue -> rubber-banding / late hits. Raise the NetDriver caps
+// (UNetDriver +0x60/+0x64) and each connection's CurrentNetSpeed (UPlayer +0x38). The client's NMT_Netspeed
+// is clamped to the driver cap, and the per-connection write covers clients that never ask for more, so this
+// is server-only. The first [NetRate] lines record the build's original values.
+// DISABLE_NET_RATE_BOOST.flag next to the game exe reverts.
+static constexpr int32_t kNetRateBytesPerSec = 100000;
+static void ApplyNetRateBoost(void* NetDriver, UNetConnection** Conns, int32_t Count) {
+    static int c = -1;
+    if (c < 0) c = MpExeRelativeFlagPresent(L"DISABLE_NET_RATE_BOOST.flag") ? 0 : 1;
+    if (c == 0) return;
+    static int Logs = 0;  // cap: one line per driver/connection, never per-tick spam if the engine resets a value
+    auto* Rates = reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(NetDriver) + 0x58);
+    // Rates[0] NetServerMaxTickRate, [1] MaxNetTickRate, [2] MaxInternetClientRate, [3] MaxClientRate
+    if (Rates[2] < kNetRateBytesPerSec || Rates[3] < kNetRateBytesPerSec) {
+        if (Logs++ < 32) MpLog("[NetRate] driver=" + MpPtr(NetDriver)
+            + " NetServerMaxTickRate=" + std::to_string(Rates[0]) + " MaxNetTickRate=" + std::to_string(Rates[1])
+            + " MaxInternetClientRate=" + std::to_string(Rates[2]) + " MaxClientRate=" + std::to_string(Rates[3])
+            + " -> client rates " + std::to_string(kNetRateBytesPerSec));
+        if (Rates[2] < kNetRateBytesPerSec) Rates[2] = kNetRateBytesPerSec;
+        if (Rates[3] < kNetRateBytesPerSec) Rates[3] = kNetRateBytesPerSec;
+    }
+    for (int32_t Index = 0; Index < Count; ++Index) {
+        UNetConnection* Conn = Conns[Index];
+        if (!IsReadablePointer(Conn, 0x140)) continue;
+        auto* Speed = reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Conn) + 0x38);
+        if (*Speed >= kNetRateBytesPerSec) continue;
+        if (Logs++ < 32) MpLog("[NetRate] conn=" + MpPtr(Conn) + " CurrentNetSpeed=" + std::to_string(*Speed)
+            + " -> " + std::to_string(kNetRateBytesPerSec));
+        *Speed = kNetRateBytesPerSec;
+    }
+}
 static void MpReportReplicationMembership();  // [fwd] 1.14.7 client-replication membership probe
 static void MpRouteBaseActorsToConnections(); // [fwd] 1.14.7 client PlayerState/GameState route fix
 static void MpDriveReplicationGraph(float DeltaTime);  // [fwd] 1.14.7 replication-graph drive
@@ -5376,6 +5410,8 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
                 }
             }
 
+            ApplyNetRateBoost(Networking::NetDriver, ClientConnectionData, ClientConnectionCount);
+
             for (int32_t Index = 0; Index < ClientConnectionCount; ++Index) {
                 UNetConnection* Conn = ClientConnectionData[Index];
                 if (!IsReadablePointer(Conn, 0x140)) {
@@ -5786,6 +5822,8 @@ static const std::wstring& MpApiBase() {
     static const std::wstring Base = MpGetApiOverride().Base.empty() ? std::wstring(L"https://" MP_PUBLIC_HOST) : MpGetApiOverride().Base;
     return Base;
 }
+
+std::wstring MpApiBaseForCrashReports() { return MpApiBase(); }
 
 // Case-insensitive parsed-host match against the redirect allowlist: exact apex
 // or a dot-delimited subdomain of one. Never a blind substring match.
@@ -15214,6 +15252,57 @@ static void MpLmWorldCensus(const char* Tag) {
     MpLog(std::string("[LoadMapPL] ") + Tag + " worlds=" + std::to_string(Worlds) + S);
 }
 
+// [2026-10-13 FIX] Census confirmed it: re-entering the hub, the previous visit's world is still in
+// GObjects as PENDINGKILL (pl=null); LoadMap reuses it and SetGameMode/LoadPackagesFully deref null.
+// Purge it with a GC before LoadMap so the map loads a fresh world.
+static bool MpLmHasZombieWorld(const std::string& Map) {
+    const std::string Name = Map.substr(Map.find_last_of('/') + 1);
+    if (Name.empty() || !UObject::GObjects) return false;
+    for (int i = 0, N = UObject::GObjects->Num(); i < N; i++) {
+        UObject* Obj = UObject::GObjects->GetByIndex(i);
+        if (!Obj || Obj->IsDefaultObject() || !Obj->IsA(UWorld::StaticClass())) continue;
+        const uint32_t IF = MpLmItemFlags(Obj);
+        if (IF < 0xFFFFFFFE && (IF & (1u << 29)) && Obj->GetName() == Name) return true;
+    }
+    return false;
+}
+
+// [2026-10-13 FIX 2, crash report 000002165ee2...] The GC above never helped: UKismetSystemLibrary::CollectGarbage
+// only requests a GC for the next tick, and the world survives the GCs LoadMap runs itself (something in the game
+// still references it). LoadPackage then finds the old package in memory and LoadMap reuses its dead world
+// (pl=null) -> null deref in SetGameMode/LoadMap. Do what the engine does with a package it must not reuse
+// (TRASH_%s, 0x3b541eb): Rename it out of the way, so the map loads a fresh package. Rename is UObject vtable
+// +0x140 (bool Rename(const TCHAR*, UObject* NewOuter, ERenameFlags)); flags 0x35 = ForceNoResetLoaders |
+// DoNotDirty | DontCreateRedirectors | NonTransactional, as the engine call site passes.
+// DISABLE_ZOMBIE_WORLD_TRASH.flag reverts to the old (GC request only) behaviour.
+using MpRenameFn = bool(__fastcall*)(UObject*, const wchar_t*, UObject*, uint32_t);
+static bool MpLmRenameSeh(UObject* Obj, const wchar_t* NewName) {
+    __try {
+        return reinterpret_cast<MpRenameFn>((*reinterpret_cast<void***>(Obj))[0x140 / 8])(Obj, NewName, nullptr, 0x35);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+static void MpLmTrashZombieWorlds() {
+    static int s_trashed = 0;
+    std::vector<UObject*> Packages;
+    for (int i = 0, N = UObject::GObjects->Num(); i < N; i++) {
+        UObject* Obj = UObject::GObjects->GetByIndex(i);
+        if (!Obj || Obj->IsDefaultObject() || !Obj->IsA(UWorld::StaticClass())) continue;
+        const uint32_t IF = MpLmItemFlags(Obj);
+        if (IF >= 0xFFFFFFFE || !(IF & (1u << 29)) || (IF & (1u << 30))) continue;   // PENDINGKILL, not ROOT
+        UObject* Pkg = Obj;
+        while (Pkg->Outer) Pkg = Pkg->Outer;
+        if (Pkg != Obj && std::find(Packages.begin(), Packages.end(), Pkg) == Packages.end()) Packages.push_back(Pkg);
+    }
+    for (UObject* Pkg : Packages) {
+        const std::string Old = Pkg->GetName();
+        const std::wstring New = L"TRASH_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(++s_trashed);
+        const bool Ok = MpLmRenameSeh(Pkg, New.c_str());
+        MpLog("[LoadMapPL] trashed zombie package " + Old + " -> " + std::string(New.begin(), New.end()) + " ok=" + (Ok ? "1" : "0"));
+    }
+}
+
 void* OrigLoadMapDiag = nullptr;
 bool LoadMapDiagHook(void* Engine, void* Ctx, void* URL, void* Pending, void* Error) {
     // FURL::Map is the FString at +0x28.
@@ -15225,6 +15314,16 @@ bool LoadMapDiagHook(void* Engine, void* Ctx, void* URL, void* Pending, void* Er
     void* Prev = s_lmCtx;
     s_lmCtx = Ctx;
     MpLog("[LoadMapPL] ENTER map=" + Map + " pending=" + MpPtr(Pending) + " ctx=" + MpPtr(Ctx) + " " + MpLmWorld(MpLmCtxWorld()));
+    if (MpLmHasZombieWorld(Map)) {
+        if (MpExeRelativeFlagPresent(L"DISABLE_ZOMBIE_WORLD_TRASH.flag")) {
+            MpLog("[LoadMapPL] zombie PENDINGKILL world for " + Map + "; requesting GC (trash disabled by flag)");
+            UKismetSystemLibrary::CollectGarbage();
+        } else {
+            MpLog("[LoadMapPL] zombie PENDINGKILL world for " + Map + "; trashing its package before LoadMap");
+            MpLmTrashZombieWorlds();
+        }
+        MpLmWorldCensus("after-trash");
+    }
     MpLmWorldCensus("enter");
     ++s_lmDepth;
     const bool Ok = reinterpret_cast<bool(*)(void*, void*, void*, void*, void*)>(OrigLoadMapDiag)(Engine, Ctx, URL, Pending, Error);
@@ -15264,6 +15363,34 @@ static void InstallLoadMapDiagHooks() {
     }
 }
 
+// [CRASH b3e98798ee81] Hunt Pass "Claim Rewards" with no hunt pass tracks loaded: UHuntingPassScreen::OnClaimRewards
+// (+0x1F86460) -> view model claim (+0x1F66100) fails its precondition -> OnTrackRewardsClaimed_Old (+0x1F91E90)
+// tail-jumps here with Track = &Tracks[0] (vm+0x108, Num at vm+0x110). Empty TArray -> Track is null and the
+// TSharedPtr copy at +0xA183E0 reads 0x0. Skip only that call; the claim flags were already reset by the caller.
+// DISABLE_HUNTPASS_CLAIM_GUARD.flag reverts.
+using HuntPassClaimResultFn = void(__fastcall*)(void*, uint8_t, void*, void*);
+static HuntPassClaimResultFn OrigHuntPassClaimResult = nullptr;
+static void __fastcall HuntPassClaimResultGuard(void* Self, uint8_t bSuccess, void* Errors, void* Track) {
+    if (!Track) {
+        MpLog(std::string("[HuntPassClaimGuard] skipped claim result with no hunt pass track (success=")
+            + std::to_string(bSuccess) + " self=" + MpPtr(Self) + ")");
+        return;
+    }
+    OrigHuntPassClaimResult(Self, bSuccess, Errors, Track);
+}
+
+static void InstallHuntPassClaimGuard() {
+    if (MpExeRelativeFlagPresent(L"DISABLE_HUNTPASS_CLAIM_GUARD.flag")) {
+        MpLog("[HuntPassClaimGuard] DISABLE_HUNTPASS_CLAIM_GUARD.flag present -> not installed");
+        return;
+    }
+    void* Target = reinterpret_cast<void*>(Globals::BaseAddress + 0x01F69E20);
+    const MH_STATUS C = MH_CreateHook(Target, reinterpret_cast<LPVOID>(&HuntPassClaimResultGuard),
+        reinterpret_cast<LPVOID*>(&OrigHuntPassClaimResult));
+    const MH_STATUS E = C == MH_OK ? MH_EnableHook(Target) : C;
+    MpLog(std::string("[HuntPassClaimGuard] (+0x1F69E20) create=") + MH_StatusToString(C) + " enable=" + MH_StatusToString(E));
+}
+
 void InitClientHooks() {
     MH_STATUS InitStatus = MH_Initialize();
     MpLog(std::string("[InitClientHooks] MH_Initialize=") + MH_StatusToString(InitStatus));
@@ -15278,6 +15405,7 @@ void InitClientHooks() {
     MpLog(std::string("[InitClientHooks] NetConnectionClose create=")
         + MH_StatusToString(ClientCloseCreate) + " enable=" + MH_StatusToString(ClientCloseEnable));
     InstallLoadMapDiagHooks();
+    InstallHuntPassClaimGuard();
 
     // [1.12.0 FIX 2026-07-10] Client-side HasFinishedLoading hook re-enabled.
     // Root cause of frozen initial loading screen despite successful ClientRestart:
@@ -15387,6 +15515,27 @@ void InitClientHooks() {
     // The old XMPP config detour target at +0x025E6890 does not yet have a verified
     // GetString ABI. Keep the optional redirect and observer uninstalled until mapped.
     MpLog("[InitClientHooks] XMPP config hook skipped (1.14.7 target ABI unresolved)");
+
+    // [1.14.7 party poll 2026-10-13] UArchonPartyPrimary::UpdateParty (+0x01C8BB40) polls
+    // POST /party + GET /party/invites every PollRate seconds: this+0xE8, or the shared .rdata
+    // 5.0f (+0x05038768) / 10.0f (+0x0503876C) in two branches. Live logs showed the 10 s branch,
+    // so invites and "leader started a hunt" reached party members 0-10 s late. Repoint all three
+    // movss xmm6 loads at the image's own 1.0f (+0x05038754). DISABLE_FAST_PARTY_POLL.flag reverts.
+    if (!MpExeRelativeFlagPresent(L"DISABLE_FAST_PARTY_POLL.flag")) {
+        struct PollSite { uintptr_t Rva; uint8_t Expected[8]; uint8_t Replacement[8]; };
+        static const PollSite Sites[] = {
+            { 0x01C8BB97, { 0xF3, 0x0F, 0x10, 0xB3, 0xE8, 0x00, 0x00, 0x00 }, { 0xF3, 0x0F, 0x10, 0x35, 0xB5, 0xCB, 0x3A, 0x03 } },
+            { 0x01C8BBED, { 0xF3, 0x0F, 0x10, 0x35, 0x73, 0xCB, 0x3A, 0x03 }, { 0xF3, 0x0F, 0x10, 0x35, 0x5F, 0xCB, 0x3A, 0x03 } },
+            { 0x01C8BC38, { 0xF3, 0x0F, 0x10, 0x35, 0x2C, 0xCB, 0x3A, 0x03 }, { 0xF3, 0x0F, 0x10, 0x35, 0x14, 0xCB, 0x3A, 0x03 } },
+        };
+        const float* One = reinterpret_cast<const float*>(Globals::BaseAddress + 0x05038754);
+        if (*One == 1.0f) {
+            for (const PollSite& Site : Sites)
+                MpPatchBytesVerified(Site.Rva, Site.Expected, Site.Replacement, sizeof(Site.Expected), "party poll 1s");
+        } else {
+            MpLog("[InitClientHooks] party poll patch skipped (1.0f constant not found)");
+        }
+    }
 
     // [1.14.7 login fix 2026-10-03] IsEOSEnabled (+0x01C30030) decides EOS-SDK auth vs MCP auth.
     // The previous note ("Launcher supplies -DisableEOS ... preserve as-is") was disproved by an
@@ -15513,6 +15662,7 @@ void InitClientHooks() {
         VectoredExceptionHandle = AddVectoredExceptionHandler(1, VectoredExceptionTrace);
         MpLog("[ExceptionTrace] (client) AddVectoredExceptionHandler handle=" + MpPtr(VectoredExceptionHandle));
     }
+    MpCrashReporterInstall();
     // [1.14.7] +0x02657770 is an exception-text formatter, not the UE unhandled-exception
     // filter. Its ABI differs from UEUnhandledExceptionFilterHook, so do not detour it.
     MpLog("[ExitTrace] (client) UEUnhandledExceptionFilter hook skipped (1.14.7 target ABI mismatch)");
@@ -20367,6 +20517,7 @@ void InitServerHooks() {
     InstallApiHook(L"msvcrt.dll", "abort", MsvcrtAbortHook, reinterpret_cast<LPVOID*>(&OrigMsvcrtAbort), "msvcrt!abort");
     VectoredExceptionHandle = AddVectoredExceptionHandler(1, VectoredExceptionTrace);
     MpLog("[ExceptionTrace] AddVectoredExceptionHandler handle=" + MpPtr(VectoredExceptionHandle));
+    MpCrashReporterInstall();
 
     // UE's top-level crash/exception filter. It calls FPlatformMisc::RequestExit(1),
     // which is the immediate source of the observed code=3 TerminateProcess.
