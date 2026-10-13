@@ -13,6 +13,8 @@ import express from "express";
 import { logger } from "../logger";
 import { GetRepositories, FriendEdgeRecord } from "../persistence";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
+import { sessionRegistry } from "../realtime/SessionRegistry";
+import { escapeXml } from "../realtime/xml";
 
 // Epic MCP "friends-public-service" endpoints. The in-process DLL redirect rewrites
 // friends-public-service-*.ol.epicgames.com to paradox.mysticfox.dev/__origin/<host>/...,
@@ -24,6 +26,33 @@ import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 // Blocklist/recentPlayers/settings remain benign stubs. See
 // Plans/MULTIPLAYER_AUTH_SOCIAL_LAUNCHER_PLAN.md.
 export const friendsRouter = express.Router();
+
+const XMPP_DOMAIN = "prod.ol.epicgames.com";
+
+// Epic friends-service XMPP push, parsed by the client's FOnlineFriendsMcp::OnXmppMessageReceived.
+// Without it the other player only sees an invite/accept/removal on their next friends-list fetch.
+function PushFriendEvent(to: string, type: "Friend" | "FriendRemoval", payload: Record<string, unknown>) {
+    const body = escapeXml(JSON.stringify({
+        payload,
+        type: `com.epicgames.friends.core.apiobjects.${type}`,
+        timestamp: new Date().toISOString()
+    }));
+    for (const conn of sessionRegistry.connectionsFor(to)) {
+        conn.send(`<message from="xmpp-admin@${XMPP_DOMAIN}" to="${escapeXml(to)}@${XMPP_DOMAIN}"><body>${body}</body></message>`);
+    }
+}
+
+// PresenceService only exchanges presence on login, so a fresh friendship between two online
+// players would show "offline" until one relogs. Swap current presence once on accept.
+function ExchangePresence(a: string, b: string) {
+    for (const [from, to] of [[a, b], [b, a]]) {
+        for (const src of sessionRegistry.connectionsFor(from)) {
+            for (const dst of sessionRegistry.connectionsFor(to)) {
+                dst.send(`<presence from="${escapeXml(from)}@${XMPP_DOMAIN}/${escapeXml(src.resource ?? "")}" to="${escapeXml(to)}@${XMPP_DOMAIN}"/>`);
+            }
+        }
+    }
+}
 
 // Map an internal directed edge to Epic's friends-list entry shape.
 function ToEpicFriend(edge: FriendEdgeRecord) {
@@ -74,6 +103,9 @@ friendsRouter.post("/friends/api/public/friends/:accountId/:friendId", HasParado
         // They already invited us — accept: both edges become ACCEPTED.
         await Friendships.upsert({ ownerId: Owner, otherId: Friend, status: "ACCEPTED", created: Existing.created });
         await Friendships.upsert({ ownerId: Friend, otherId: Owner, status: "ACCEPTED", created: Now });
+        PushFriendEvent(Owner, "Friend", { accountId: Friend, status: "ACCEPTED", direction: "INBOUND", created: Existing.created, favorite: false });
+        PushFriendEvent(Friend, "Friend", { accountId: Owner, status: "ACCEPTED", direction: "OUTBOUND", created: Existing.created, favorite: false });
+        ExchangePresence(Owner, Friend);
         logger.info(`${Owner} accepted friend invite from ${Friend}`);
         res.status(204).send();
         return;
@@ -82,6 +114,8 @@ friendsRouter.post("/friends/api/public/friends/:accountId/:friendId", HasParado
     // New/outbound invite: OUTBOUND edge on us, INBOUND edge on them.
     await Friendships.upsert({ ownerId: Owner, otherId: Friend, status: "PENDING", direction: "OUTBOUND", created: Now });
     await Friendships.upsert({ ownerId: Friend, otherId: Owner, status: "PENDING", direction: "INBOUND", created: Now });
+    PushFriendEvent(Owner, "Friend", { accountId: Friend, status: "PENDING", direction: "OUTBOUND", created: Now, favorite: false });
+    PushFriendEvent(Friend, "Friend", { accountId: Owner, status: "PENDING", direction: "INBOUND", created: Now, favorite: false });
     logger.info(`${Owner} sent friend invite to ${Friend}`);
     res.status(204).send();
 });
@@ -92,8 +126,14 @@ friendsRouter.delete("/friends/api/public/friends/:accountId/:friendId", HasPara
     const Friend: string = req.params.friendId;
 
     const Friendships = GetRepositories().friendships;
+    const Existing = await Friendships.find(Owner, Friend);
     await Friendships.remove(Owner, Friend);
     await Friendships.remove(Friend, Owner);
+    if (Existing != undefined) {
+        const Reason = Existing.status === "ACCEPTED" ? "DELETED" : Existing.direction === "INBOUND" ? "REJECTED" : "ABORTED";
+        PushFriendEvent(Owner, "FriendRemoval", { accountId: Friend, reason: Reason });
+        PushFriendEvent(Friend, "FriendRemoval", { accountId: Owner, reason: Reason });
+    }
 
     logger.info(`${Owner} removed/rejected friend ${Friend}`);
     res.status(204).send();

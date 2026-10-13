@@ -134,6 +134,9 @@ export async function EnsureMongoIndexes(Db: Db): Promise<void> {
     await Db.collection(Collections.InventoryTransactions).createIndex({ userId: 1, characterId: 1 });
     await Db.collection(Collections.Friendships).createIndex({ ownerId: 1 });
     await Db.collection(Collections.Friendships).createIndex({ otherId: 1 });
+    await Db.collection(Collections.SlayerLinks).createIndex({ senderId: 1 });
+    await Db.collection(Collections.SlayerLinks).createIndex({ targetId: 1 });
+    await Db.collection(Collections.SlayerLinks).createIndex({ purgeAt: 1 }, { expireAfterSeconds: 0 });
 
     await Db.collection(Collections.LauncherGuardSessions).createIndex({ accountId: 1, status: 1, expiresAt: -1 });
     // Role is part of the authorization predicate: a healthy client session must never

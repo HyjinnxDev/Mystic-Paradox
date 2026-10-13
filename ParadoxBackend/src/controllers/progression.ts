@@ -103,7 +103,11 @@ export const APPROVED_XP_PROGRESSION_TRACK_IDS = Object.freeze([
     "PrestigeTrack_Weapon_Spear",
     "PrestigeTrack_Weapon_Sword",
     "PrestigeTrack_Weapon_Strikers",
-    ACTIVE_HUNTPASS_PROGRESSION_ID
+    ACTIVE_HUNTPASS_PROGRESSION_ID,
+    // Slayer Link progress, one per link slot (routes/slayerLinks.ts resets them when a link starts)
+    "Linked_Slayer_Slot_1",
+    "Linked_Slayer_Slot_2",
+    "Linked_Slayer_Slot_3"
 ] as const);
 
 const ApprovedXpTracks = new Set<string>(APPROVED_XP_PROGRESSION_TRACK_IDS);

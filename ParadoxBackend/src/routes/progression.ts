@@ -10,11 +10,12 @@
  */
 
 import { Router } from "express";
+import { randomUUID } from "crypto";
 import { loadGameData } from "../gameData/loader";
 import { WidenHuntPassWindows } from "./system";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
-import { AddEncounteredContent, GetBreadcrumbsForCharacterIdAndUserId, GetPlayerJourney, QueryEncounteredContent, SavePlayerJourney, SetBreadcrumbsForCharacterIdAndUserId, GrantProgressionXp, GetPersistedProgressionForUser, CaptureProgressionObjectiveEvent, GetPersistedObjectivesForUser, ConfirmPublicProgressionRank, IsAuthorizedProgressionReader, IsAuthorizedProgressionReporter, IsApprovedXpProgressionTrack, IsValidProgressionGrantId, ProgressionGrantConflictError, IsCharacterOwnedByUser } from "../controllers/progression";
+import { AddEncounteredContent, GetBreadcrumbsForCharacterIdAndUserId, GetPlayerJourney, QueryEncounteredContent, SavePlayerJourney, SetBreadcrumbsForCharacterIdAndUserId, GrantProgressionXp, GetPersistedProgressionForUser, CaptureProgressionObjectiveEvent, GetPersistedObjectivesForUser, ConfirmPublicProgressionRank, IsAuthorizedProgressionReader, IsAuthorizedProgressionReporter, IsApprovedXpProgressionTrack, IsValidProgressionGrantId, ProgressionGrantConflictError, IsCharacterOwnedByUser, GetTrackCurve } from "../controllers/progression";
 import { GetUnlockedNodeIds, GrantSlayersPathRewards } from "../controllers/slayersPath";
 import { IsPrestigeSourceTrack } from "../controllers/wallet";
 import { MonitorProgressionReport, MonitorProgressionServed, MonitorSourceOf } from "../diagnostics/economyMonitor";
@@ -406,7 +407,11 @@ progressionRouter.post("/progression/:userId/:progressionId/:amount", HasParadox
     const RequestedUserId = req.params.userId;
     const ProgressionId = req.params.progressionId;
     const AmountRaw = req.params.amount;
-    const GrantId = ReadAuthoritativeGrantId(req);
+    // The stock 1.14.7 gameserver sends no grant id, so every grant was rejected (no weapon/player/season XP).
+    // Mint one only when the caller supplied none; a supplied-but-bad id still fails. Cost: no replay dedupe for these.
+    const NoGrantIdSupplied = req.get?.("x-mysticparadox-grant-id") === undefined && req.get?.("idempotency-key") === undefined
+        && req.body?.grant_id === undefined && req.body?.grantId === undefined;
+    const GrantId = NoGrantIdSupplied ? randomUUID() : ReadAuthoritativeGrantId(req);
 
     if(typeof RequestedUserId !== "string" || RequestedUserId.length === 0 || RequestedUserId === NO_PLAYER_SENTINEL){
         logger.warn(`Rejected XP grant: invalid/sentinel userId (${RequestedUserId})`);
@@ -787,3 +792,31 @@ progressionRouter.post("/progression/tracked_objectives/:phxAccountId", HasParad
     });
 });
 
+
+// [1.14.7 2026-10-13] One track. The client polls its Slayer Link slots here (Linked_Slayer_Slot_<n>, 238 polls
+// per session were 404). Same row shape as GET /progression/:userId; a track never granted is a zero row,
+// any id in the progression config or already persisted is answered. Registered last so the two-segment
+// /progression/tracked_objectives/:id above keeps its own handler.
+progressionRouter.get("/progression/:userId/:progressionId", HasParadoxBackendAuth, async (req: any, res) => {
+    const RequestorAccountId = ResolveRequestUserId(req);
+    if(!RequireProgressionRead(req, res, RequestorAccountId)) return;
+    const ProgressionId = req.params.progressionId;
+    const Rows = RequestorAccountId === NO_PLAYER_SENTINEL ? [] : await GetPersistedProgressionForUser(RequestorAccountId, []);
+    const Row = Rows.find((r) => r.progression_id === ProgressionId);
+    if(!Row && GetTrackCurve(ProgressionId) === undefined){
+        res.status(404).json({ code: "404", message: "Unknown progression track", payload: null });
+        return;
+    }
+    res.status(200).json({
+        code: null,
+        message: "OK",
+        payload: Row ?? {
+            phx_account_id: RequestorAccountId,
+            progression_id: ProgressionId,
+            progress: DEFAULT_PROGRESS,
+            confirmed_fremium_rank: DEFAULT_CONFIRMED_RANK,
+            confirmed_premium_rank: DEFAULT_CONFIRMED_RANK,
+            confirmed_date: new Date().toISOString(),
+        }
+    });
+});

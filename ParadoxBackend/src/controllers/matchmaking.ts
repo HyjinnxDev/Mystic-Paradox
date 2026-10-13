@@ -132,9 +132,9 @@ function ClientVisibleResult(Result: MatchmakingResult): MatchmakingResult {
 }
 
 export function GetCandidateStatusPeriodMillis(Result: MatchmakingResult): number {
-    // Poll once per second only during the post-ready release window, then return to
-    // the original 10s cadence. Existing queue behavior and timers are unchanged.
-    return Result.ReadyAt > Date.now() ? 1000 : 10000;
+    // Poll once per second until the client may travel (server spin-up AND the post-ready release
+    // window); the old 10s cadence while the hunt server booted added up to 10s to every hunt join.
+    return IsClientReady(Result) ? 10000 : 1000;
 }
 
 function GetFallbackHuntId(GameMode: string, GameArgs: string, HuntId: string | undefined){

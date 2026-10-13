@@ -70,5 +70,8 @@ export const Collections = {
     Parties: "parties",
     PartyMemberships: "partyMemberships",
     PartyInvites: "partyInvites",
-    PartyOutbox: "partyOutbox"
+    PartyOutbox: "partyOutbox",
+
+    // Slayer Links invites and links, one row per invite (src/slayerLinks.ts). Purged by the purgeAt TTL.
+    SlayerLinks: "slayerLinks"
 } as const;
