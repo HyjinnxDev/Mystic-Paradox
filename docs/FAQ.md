@@ -28,6 +28,9 @@ alpha: every component is ported and the self-hosting guides describe it
 [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag. Other
 versions are not expected to work.
 
+If Dauntless is in your Epic Games library, [Installing Dauntless](INSTALLING_DAUNTLESS.md) shows how to download
+1.14.7 from Epic with your own account. Epic itself now only offers 2.1.1, which is not supported.
+
 ## How can I test the project, help with development, or contact you?
 
 - **Bugs, feature requests and testing feedback:** open an issue on GitHub. Include the component,

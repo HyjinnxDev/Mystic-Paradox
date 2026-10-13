@@ -50,15 +50,17 @@ Expect active development, not production-grade uptime.
 ## 🚀 Get started
 
 1. **Read the [FAQ](docs/FAQ.md)** — what the project is, what it isn't, and where to get help.
-2. **Generate the SDK** from your own 1.14.7 install — [Generating the SDK](docs/GENERATING_SDK.md).
-3. **Generate the game data** from the same install — [Generating game data](docs/GENERATING_GAME_DATA.md).
-4. **Deploy and play** — [Self-hosting](docs/SELF_HOSTING.md) walks from source to Ramsgate:
+2. **Install Dauntless 1.14.7** from Epic with your own account — [Installing Dauntless](docs/INSTALLING_DAUNTLESS.md).
+3. **Generate the SDK** from your own 1.14.7 install — [Generating the SDK](docs/GENERATING_SDK.md).
+4. **Generate the game data** from the same install — [Generating game data](docs/GENERATING_GAME_DATA.md).
+5. **Deploy and play** — [Self-hosting](docs/SELF_HOSTING.md) walks from source to Ramsgate:
    prerequisites, DNS/TLS, services, launcher and the first acceptance test.
 
 ## 📚 Documentation
 
 | Guide | What's inside |
 |---|---|
+| 🎮 [Installing Dauntless](docs/INSTALLING_DAUNTLESS.md) | Getting the 1.14.7 client from Epic with your own account and Legendary |
 | 🏠 [Self-hosting](docs/SELF_HOSTING.md) | Full deployment: prerequisites, configuration helper, ports, validation, troubleshooting |
 | 🧩 [Generating the SDK](docs/GENERATING_SDK.md) | Dumping the Unreal SDK with Dumper-7 and building the C++ projects |
 | 📦 [Generating game data](docs/GENERATING_GAME_DATA.md) | Exporting the catalogue and tables from your install |
