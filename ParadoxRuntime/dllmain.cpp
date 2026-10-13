@@ -60,6 +60,7 @@ using namespace SDK;
 static void DumpLoadManagerEntries(const char* Tag);
 // [1.14.7 active hunt pass] defined later; used by the readiness predicate hook.
 static void* g_archonGameInstanceForHuntPass = nullptr;
+static void CallHuntPassSeasonQuery();
 static void CallFindActiveHuntPassRow(const char* Why);
 
 namespace Globals {
@@ -4788,6 +4789,27 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
             + " tid=" + std::to_string(CurTid));
     }
 
+    // [1.14.7 hunt join stall 2026-10-13] Issue the progression configuration query as soon as the server
+    // listens. The readiness hook issues it on its second check, which on a hub happens at boot (the hub's
+    // local player) but on a hunt only once the first player joins. That player's progression component then
+    // takes its WAIT branch, nothing re-checks the predicate, and the load completes only via the 60 s
+    // player-data timeout: a ~60 s longer loading screen, then a client crash (null read +0x248 in a
+    // ReceiveGameplayStart chain) on 13 Oct. With the config cached before anyone joins, ReadFromBackend
+    // takes its loaded branch, as it does on the hub.
+    if (Globals::Listening && MpExeRelativeFlagPresent(L"CALL_HUNTPASS_QUERY.flag")) {
+        static bool s_bootQueryDone = false;
+        if (!s_bootQueryDone) {
+            UWorld* World = UWorld::GetWorld();
+            void* GameInstance = World ? reinterpret_cast<void*>(World->OwningGameInstance) : nullptr;
+            if (GameInstance) {
+                s_bootQueryDone = true;
+                if (!g_archonGameInstanceForHuntPass) g_archonGameInstanceForHuntPass = GameInstance;
+                MpLog("[HuntPassQuery] issuing at listen (boot), before any player joins");
+                CallHuntPassSeasonQuery();
+            }
+        }
+    }
+
     // [1.14.7 client replication membership 2026-10-05] Bounded, read-only server probe: does the
     // replication graph's per-connection actor-info map ever hold the GameState and the PlayerState?
     // [2026-10-05] GATED OFF BY DEFAULT. Both of these walk the whole GObjects array (with several IsA
@@ -6486,7 +6508,7 @@ static bool UseArchonRepGraph() {
 // changing every false result to true can release the loading screen while streamed materials and
 // sublevels are still initializing. On clients, allow the compatibility override only for the exact
 // local AArchonPlayerController whose missing backend callback blocks player start.
-static bool IsLocalArchonControllerReadinessObject(UObject* Object) {
+static bool IsLocalArchonControllerReadinessObject(UObject* Object, UObject** OutStablePawn) {
     if (Globals::AmServer || !Object) return false;
     __try {
         if (!IsReadablePointer(Object, 0x2A0)
@@ -6512,12 +6534,42 @@ static bool IsLocalArchonControllerReadinessObject(UObject* Object) {
         // The controller override itself must obey the same travel-settle and stable-chain proof as
         // input/cinematic repair. Otherwise the hook could still close the loading screen before the
         // new map's possession graph has converged, even though non-controller blockers are natural.
-        UObject* StablePawn = nullptr;
-        return IsClientRolePumpPossessionStable(Object, &StablePawn);
+        return IsClientRolePumpPossessionStable(Object, OutStablePawn);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+static bool PawnWeaponReplicated(UObject* Pawn) {
+    __try {
+        return Pawn && IsReadablePointer(Pawn, 0x5F8) && IsRegisteredLiveObject(Pawn)
+            && Pawn->IsA(SDK::AArchonCharacter::StaticClass())
+            && *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Pawn) + 0x5F0) != nullptr;   // AArchonCharacter::Weapon
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// [1.14.7 DIAG 2026-10-13] Live AArchonWeapon actors on this client, and how many are owned by Pawn:
+// tells "weapon never replicated" apart from "replicated but not linked to the pawn".
+static void CountClientWeapons(UObject* Pawn, int* OutTotal, int* OutOwnedByPawn) {
+    *OutTotal = -1; *OutOwnedByPawn = -1;
+    __try {
+        if (!SDK::UObject::GObjects) return;
+        int Total = 0, Owned = 0;
+        const int Count = SDK::UObject::GObjects->Num();
+        for (int i = 0; i < Count; ++i) {
+            SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+            if (!Obj || Obj->IsDefaultObject() || !Obj->IsA(SDK::AArchonWeapon::StaticClass())) continue;
+            ++Total;
+            if (Pawn && IsReadablePointer(Obj, 0xE8)
+                && *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Obj) + 0xE0) == Pawn) ++Owned;   // AActor::Owner
+        }
+        *OutTotal = Total; *OutOwnedByPawn = Owned;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 bool HasFinishedLoadingHook(UObject* a1) {
@@ -6551,7 +6603,24 @@ bool HasFinishedLoadingHook(UObject* a1) {
         return true;
     }
 
-    if (IsLocalArchonControllerReadinessObject(a1)) {
+    UObject* StablePawn = nullptr;
+    if (IsLocalArchonControllerReadinessObject(a1, &StablePawn)) {
+        // [1.14.7 hunt arrival crash 2026-10-13] Forcing readiness lets gameplay start, and the HUD's
+        // ReceiveGameplayStart chain reads the pawn's weapon through AArchonCharacter::Weapon (+0x5F0,
+        // getter +0x18CE900) and then Weapon+0x240 (+0x1F6D6BE) with no null check. On hunt arrival the
+        // weapon actor can replicate after the 3 s force window, which crashed the client twice
+        // (EXCEPTION_ACCESS_VIOLATION reading 0x248). Keep the loading screen until the weapon is there.
+        if (!PawnWeaponReplicated(StablePawn)) {
+            static std::atomic<int> s_waitWeapon{ 0 };
+            if (s_waitWeapon.fetch_add(1, std::memory_order_relaxed) < 10) {
+                int Weapons = -1, OwnedByPawn = -1;
+                CountClientWeapons(StablePawn, &Weapons, &OwnedByPawn);
+                MpLog("[ReadinessCompat] HOLD scope=local-controller reason=pawn-weapon-not-replicated pawn="
+                    + MpPtr(StablePawn) + " clientWeapons=" + std::to_string(Weapons)
+                    + " ownedByPawn=" + std::to_string(OwnedByPawn));
+            }
+            return false;
+        }
         static std::atomic<int> s_hflController{ 0 };
         if (s_hflController.fetch_add(1, std::memory_order_relaxed) < 20) {
             const uint64_t Elapsed = s_LastPossessedAtMs != 0
@@ -7436,6 +7505,34 @@ void __fastcall ArchonRouteAddNetworkActorHook(
                 + std::to_string((*Flags59 & 0x02u) != 0 ? 1 : 0)
                 + " cullFix=" + std::to_string(SettingsResult) + SettingsDetail
                 + " route=global-always-relevant");
+        } else if (!MpExeRelativeFlagPresent(L"DISABLE_WEAPON_GLOBAL_ROUTE.flag")
+            && ActorObject->IsA(SDK::AArchonWeapon::StaticClass())) {
+            // [1.14.7 HUNT WEAPON ROUTE 2026-10-13] Same fault and fix as the Omnicell above. On a hunt the
+            // server pawn had its weapon (flags58=0x88, flags59=0x0F: always-relevant but also
+            // bNetUseOwnerRelevancy) while the joining client held ZERO AArchonWeapon actors for the whole
+            // 120 s join, so AArchonCharacter::Weapon stayed null and the join timed out (with the
+            // readiness override it crashed reading Weapon+0x240 instead). Route it globally, stop
+            // re-evaluating relevancy through the pawn, and clear the per-connection cull distance.
+            // Actor.Owner is untouched. Revert with DISABLE_WEAPON_GLOBAL_ROUTE.flag.
+            uint8_t* Flags58 = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(Actor) + 0x58);
+            uint8_t* Flags59 = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(Actor) + 0x59);
+            const uint8_t Before58 = *Flags58;
+            const uint8_t Before59 = *Flags59;
+            *Flags58 = static_cast<uint8_t>((*Flags58 | 0x08u) & ~0x04u);
+            *Flags59 = static_cast<uint8_t>(*Flags59 & ~0x02u);
+            std::string SettingsDetail;
+            const int SettingsResult = RepGraphRelevanceFixEnabled()
+                ? RepGraphApplyGlobalSettings(GlobalInfo, true, kRepGraphPlayerChannelGraceFrames, &SettingsDetail)
+                : -2;
+            static std::atomic<int> s_weaponRouteLogged{ 0 };
+            if (s_weaponRouteLogged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                MpLog("[WeaponRouteGuard] actor=" + MpPtr(Actor)
+                    + " class=" + std::string(ActorObject->Class ? ActorObject->Class->GetName() : "?")
+                    + " flags58Before=" + MpHex(Before58) + " flags58After=" + MpHex(*Flags58)
+                    + " flags59Before=" + MpHex(Before59) + " flags59After=" + MpHex(*Flags59)
+                    + " cullFix=" + std::to_string(SettingsResult) + SettingsDetail
+                    + " route=global-always-relevant");
+            }
         } else if (RepGraphRelevanceFixEnabled()
             && ActorObject->IsA(SDK::AArchonCharacter::StaticClass())) {
             // [2026-07-26 REMOTE REFERENCE-POSE ROOT FIX] Player characters stay on their ordinary
@@ -15053,6 +15150,120 @@ static void ExecGetViewportSizeHook(void* ctx, void* stack, void* result) {
 
 // [Group D2 cleanup 2026-07-13] ProcessRemoteFunctionWrapperHook + OrigProcessRemoteFunctionWrapper removed ([WrapperProbe]; passthrough).
 
+// [2026-10-13 LOADMAP-PL DIAG] Client crash on travel into a hub (Dojo -> Ramsgate, hunt -> Ramsgate):
+// AV reading 0x20 at +0x285E6F0 (UObject Outer walk, this=null) called from UEngine::LoadMap
+// (+0x04271370) at +0x04272D28, i.e.
+//   LoadPackagesFully(World(), FULLYLOAD_Map, World()->PersistentLevel->GetOutermost()->GetName())
+// so the NEW world's PersistentLevel is null after SetCurrentWorld(NewWorld) (+0x042728A2).
+// Hypothesis under test: the previous visit's hub world survived GC, LoadMap reused it, and GC then
+// nulled its pending-kill PersistentLevel. Observe-only: UWorld census at LoadMap entry/exit, plus the
+// current world's PersistentLevel + GUObjectArray flags at the checkpoints LoadMap passes between
+// SetCurrentWorld and the crash site (SetGameMode +0x042D9AA0, ProcessAsyncResults +0x04153460).
+static thread_local int s_lmDepth = 0;
+static void* s_lmCtx = nullptr;
+
+// FUObjectItem::Flags (EInternalObjectFlags) for Obj; 0xFFFFFFFF unreadable, 0xFFFFFFFE stale slot.
+static uint32_t MpLmItemFlags(const void* Obj) {
+    if (!Obj || !UObject::GObjects) return 0xFFFFFFFF;
+    __try {
+        const int32_t Index = reinterpret_cast<const UObject*>(Obj)->Index;
+        TUObjectArray* Arr = UObject::GObjects.GetTypedPtr();
+        if (Index < 0 || Index >= Arr->Num()) return 0xFFFFFFFF;
+        FUObjectItem* Chunk = Arr->GetDecrytedObjPtr()[Index / TUObjectArray::ElementsPerChunk];
+        if (!Chunk) return 0xFFFFFFFF;
+        FUObjectItem* Item = &Chunk[Index % TUObjectArray::ElementsPerChunk];
+        if (Item->Object != Obj) return 0xFFFFFFFE;
+        return *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(Item) + 8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0xFFFFFFFF;
+    }
+}
+
+static std::string MpLmObj(void* Obj) {
+    if (!Obj) return "null";
+    const uint32_t IF = MpLmItemFlags(Obj);
+    std::string S = MpPtr(Obj) + "{if=" + MpHex(IF);
+    if (IF < 0xFFFFFFFE) {
+        if (IF & (1u << 28)) S += " UNREACHABLE";
+        if (IF & (1u << 29)) S += " PENDINGKILL";
+        if (IF & (1u << 30)) S += " ROOT";
+        S += " rf=" + MpHex(static_cast<uint32_t>(reinterpret_cast<UObject*>(Obj)->Flags)) + " " + reinterpret_cast<UObject*>(Obj)->GetFullName();
+    }
+    return S + "}";
+}
+
+static std::string MpLmWorld(void* World) {
+    void* Level = (World && IsReadablePointer(World, 0x38)) ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(World) + 0x30) : nullptr;
+    return "world=" + MpLmObj(World) + " pl=" + MpLmObj(Level);
+}
+
+static void* MpLmCtxWorld() {
+    // FWorldContext::ThisCurrentWorld at +0x280 (LoadMap: mov [r12+0x280], NewWorld).
+    return (s_lmCtx && IsReadablePointer(s_lmCtx, 0x288)) ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(s_lmCtx) + 0x280) : nullptr;
+}
+
+static void MpLmWorldCensus(const char* Tag) {
+    if (!UObject::GObjects) return;
+    int Worlds = 0;
+    std::string S;
+    for (int i = 0, N = UObject::GObjects->Num(); i < N; i++) {
+        UObject* Obj = UObject::GObjects->GetByIndex(i);
+        if (!Obj || Obj->IsDefaultObject() || !Obj->IsA(UWorld::StaticClass())) continue;
+        if (++Worlds <= 8) S += " | " + MpLmWorld(Obj);
+    }
+    MpLog(std::string("[LoadMapPL] ") + Tag + " worlds=" + std::to_string(Worlds) + S);
+}
+
+void* OrigLoadMapDiag = nullptr;
+bool LoadMapDiagHook(void* Engine, void* Ctx, void* URL, void* Pending, void* Error) {
+    // FURL::Map is the FString at +0x28.
+    std::string Map;
+    if (URL && IsReadablePointer(URL, 0x38)) {
+        const wchar_t* W = *reinterpret_cast<const wchar_t**>(reinterpret_cast<uintptr_t>(URL) + 0x28);
+        if (W && IsReadablePointer(W, 2)) for (; *W && Map.size() < 200; ++W) Map += static_cast<char>(*W);
+    }
+    void* Prev = s_lmCtx;
+    s_lmCtx = Ctx;
+    MpLog("[LoadMapPL] ENTER map=" + Map + " pending=" + MpPtr(Pending) + " ctx=" + MpPtr(Ctx) + " " + MpLmWorld(MpLmCtxWorld()));
+    MpLmWorldCensus("enter");
+    ++s_lmDepth;
+    const bool Ok = reinterpret_cast<bool(*)(void*, void*, void*, void*, void*)>(OrigLoadMapDiag)(Engine, Ctx, URL, Pending, Error);
+    --s_lmDepth;
+    MpLog(std::string("[LoadMapPL] EXIT ok=") + (Ok ? "1" : "0") + " " + MpLmWorld(MpLmCtxWorld()));
+    MpLmWorldCensus("exit");
+    s_lmCtx = Prev;
+    return Ok;
+}
+
+void* OrigLmSetGameMode = nullptr;
+bool LmSetGameModeHook(void* World, void* URL) {
+    if (s_lmDepth) MpLog("[LoadMapPL] SetGameMode enter " + MpLmWorld(World));
+    const bool R = reinterpret_cast<bool(*)(void*, void*)>(OrigLmSetGameMode)(World, URL);
+    if (s_lmDepth) MpLog("[LoadMapPL] SetGameMode exit " + MpLmWorld(World));
+    return R;
+}
+
+void* OrigLmProcessAsync = nullptr;
+void LmProcessAsyncHook(void* Mgr, bool bLimitTime, bool bBlockGlobal) {
+    if (s_lmDepth) MpLog("[LoadMapPL] ProcessAsyncResults enter " + MpLmWorld(MpLmCtxWorld()));
+    reinterpret_cast<void(*)(void*, bool, bool)>(OrigLmProcessAsync)(Mgr, bLimitTime, bBlockGlobal);
+    if (s_lmDepth) MpLog("[LoadMapPL] ProcessAsyncResults exit " + MpLmWorld(MpLmCtxWorld()));
+}
+
+static void InstallLoadMapDiagHooks() {
+    struct { uintptr_t Rva; void* Detour; void** Orig; const char* Name; } Hooks[] = {
+        { 0x04271370, reinterpret_cast<void*>(LoadMapDiagHook), &OrigLoadMapDiag, "LoadMap" },
+        { 0x042D9AA0, reinterpret_cast<void*>(LmSetGameModeHook), &OrigLmSetGameMode, "SetGameMode" },
+        { 0x04153460, reinterpret_cast<void*>(LmProcessAsyncHook), &OrigLmProcessAsync, "ProcessAsyncResults" },
+    };
+    for (auto& H : Hooks) {
+        void* Target = reinterpret_cast<void*>(Globals::BaseAddress + H.Rva);
+        const MH_STATUS C = MH_CreateHook(Target, H.Detour, H.Orig);
+        const MH_STATUS E = MH_EnableHook(Target);
+        MpLog(std::string("[InitClientHooks] LoadMapPL ") + H.Name + " create=" + MH_StatusToString(C) + " enable=" + MH_StatusToString(E) + " target=+" + MpHex(H.Rva));
+    }
+}
+
 void InitClientHooks() {
     MH_STATUS InitStatus = MH_Initialize();
     MpLog(std::string("[InitClientHooks] MH_Initialize=") + MH_StatusToString(InitStatus));
@@ -15066,6 +15277,7 @@ void InitClientHooks() {
     MH_STATUS ClientCloseEnable = MH_EnableHook((void*)(Globals::BaseAddress + 0x03F62B90));
     MpLog(std::string("[InitClientHooks] NetConnectionClose create=")
         + MH_StatusToString(ClientCloseCreate) + " enable=" + MH_StatusToString(ClientCloseEnable));
+    InstallLoadMapDiagHooks();
 
     // [1.12.0 FIX 2026-07-10] Client-side HasFinishedLoading hook re-enabled.
     // Root cause of frozen initial loading screen despite successful ClientRestart:
@@ -17494,7 +17706,17 @@ void ApplyPlayerRoleHook(void* a1) {
         NoteTempestChargeDiagRole(PawnRole);
     }
     const std::string RoleCharge = PlayerRoleChargeSummary(PawnRole);
-    MpLog("[PlayerRoleState #" + std::to_string(Seq) + "] inputId=" + InputRoleId
+    // [1.14.7 DIAG 2026-10-13] Hunt clients wait forever for AArchonCharacter::Weapon (+0x5F0). Record the
+    // server's side: does the pawn have a weapon here, who owns it, and its net flags.
+    void* PawnWeapon = (Pawn && IsReadablePointer(Pawn, 0x5F8))
+        ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Pawn) + 0x5F0) : nullptr;
+    void* WeaponOwner = (PawnWeapon && IsReadablePointer(PawnWeapon, 0xE8))
+        ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(PawnWeapon) + 0xE0) : nullptr;
+    const std::string WeaponDiag = "weapon=" + MpPtr(PawnWeapon) + " weaponOwner=" + MpPtr(WeaponOwner)
+        + " weaponFlags58=" + std::to_string(PawnWeapon ? SafeReadU8At(reinterpret_cast<uintptr_t>(PawnWeapon), 0x58) : -1)
+        + " weaponFlags59=" + std::to_string(PawnWeapon ? SafeReadU8At(reinterpret_cast<uintptr_t>(PawnWeapon), 0x59) : -1)
+        + " weaponRemoteRole=" + std::to_string(PawnWeapon ? SafeReadU8At(reinterpret_cast<uintptr_t>(PawnWeapon), 0x5F) : -1);
+    MpLog("[PlayerRoleState #" + std::to_string(Seq) + "] " + WeaponDiag + " inputId=" + InputRoleId
         + " inputInstance=" + InputRoleInstance + " slotCached=" + MpPtr(SlotCachedItem)
         + "/" + SlotCachedId + " pc=" + MpPtr(PC) + " pawn=" + MpPtr(Pawn)
         + " playerState=" + MpPtr(PlayerState) + " playerStateRoleId=" + PlayerStateRoleId
@@ -19051,11 +19273,15 @@ static void DumpFeatureFlags(const char* Tag) {
 // argument: the callback simply will not fire, while the QUERY itself - the part that was missing - is
 // issued. Called on the game thread from the readiness hook, flag gated by CALL_HUNTPASS_QUERY.flag.
 static void CallHuntPassSeasonQuery() {
+    // Once per process: the boot call in GameEngineTickHook and the readiness hook's call both land here.
+    static bool s_issued = false;
+    if (s_issued) return;
     void* GameInstance = g_archonGameInstanceForHuntPass;
     if (!GameInstance) {
         MpLog("[HuntPassQuery] game instance not captured yet");
         return;
     }
+    s_issued = true;
     MpLog("[HuntPassQuery] calling UArchonGameInstance::QueryCurrentHuntPassSeasonData (unbound delegate) instance="
         + MpPtr(GameInstance));
     SDK::UArchonGameInstance* GI = reinterpret_cast<SDK::UArchonGameInstance*>(GameInstance);

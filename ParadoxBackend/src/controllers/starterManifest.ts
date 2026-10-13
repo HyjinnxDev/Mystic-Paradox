@@ -75,8 +75,14 @@ export const STARTER_INSTANCED_CATALOG_IDS = [
     "FL_HEALING_DEFAULT",
     "GD_FRAME_STARTER_BASE",
     "BN_BEGINNER_00",
+    // [1.14.7 2026-10-13] The equipped Omnicell. With player_role empty the hunt server applies
+    // PlayerRole=INVALID, the pawn never gets its weapon, and the client either crashes reading
+    // AArchonCharacter::Weapon (null, +0x248) or holds until "Loading timeout while joining the
+    // server". Every account upstream tested hunts with had PR_TEMPEST.
+    "PR_TEMPEST",
 ] as const;
 
+export const STARTER_PLAYER_ROLE_CATALOG_ID = "PR_TEMPEST";
 const STARTER_WEAPON_CATALOG_ID = "WP_EB_BEGINNER";
 const STARTER_WEAPON_PART_CATALOG_ID = "PART_EB_SPECIAL_DEFAULT";
 export const STARTER_BANNER_CATALOG_ID = "BN_BEGINNER_00";
@@ -148,7 +154,8 @@ function BuildInstanceData(): string {
 // v4 adds TOKEN_DAILY_CHALLENGE_DRAFT to the stacked items. The bump is what makes existing accounts pick
 // it up: EnsureStarterBootstrapRecords re-runs on inventory GET and compares this version, so a player
 // seeded under v3 is repaired rather than left without the token.
-export const BOOTSTRAP_VERSION = "starter-1.12-v4";
+// v5 adds the PR_TEMPEST Omnicell (instanced, appended by ReconcileMissingDefaultWeaponParts).
+export const BOOTSTRAP_VERSION = "starter-1.12-v5";
 
 export interface StarterManifest {
     instanceIdsByCatalogId: Record<string, string>;
@@ -167,6 +174,7 @@ const LOADOUT_EQUIPMENT: Array<[string, string]> = [
     ["arms", "AR_BEGINNER_ARMS"],
     ["legs", "AR_BEGINNER_LEGS"],
     ["lantern", "LT_BASIC"],
+    ["player_role", STARTER_PLAYER_ROLE_CATALOG_ID],
 ];
 
 function BuildStarterPersistent(instanceIdsByCatalogId: Record<string, string>): any {
@@ -216,7 +224,6 @@ export function BuildStarterLoadoutSlot(
     }
     return {
         ...Slot,
-        player_role: null,
         subweapon: null,
         appearance: "{\"CreationState\":\"EArchonCharacterCreationState::FaceComplete\",\"Data\":[{\"SkeletalMeshComponentName\":\"Head Slot\",\"MorphData\":[]}],\"AssetReferences\":[],\"StringData\":[{\"Key\":\"BodyType\",\"Data\":\"Feminine\"},{\"Key\":\"Hair\",\"Data\":\"Hair12\"},{\"Key\":\"SkinName\",\"Data\":\"Tan\"},{\"Key\":\"SkinValue\",\"Data\":\"(R=0.610496,G=0.417885,B=0.254152,A=1.000000)\"},{\"Key\":\"Hair_Color\",\"Data\":\"(R=0.196843,G=0.042531,B=0.019093,A=1.000000)\"},{\"Key\":\"Beard\",\"Data\":\"NoBeard\"},{\"Key\":\"Facepaint\",\"Data\":\"NoFacepaint\"},{\"Key\":\"Makeup\",\"Data\":\"NoMakeup\"}]}",
         flask: "FL_HEALING_DEFAULT", quick_items: [], slot_index: 0, update_version: 0, custom_name: "", persistent,
@@ -282,7 +289,7 @@ function ReconcileMissingDefaultWeaponParts(existingItems: any[]): {
     }
 
     const AddedCatalogIds: string[] = [];
-    for (const CatalogId of STARTER_DEFAULT_WEAPON_PART_CATALOG_IDS) {
+    for (const CatalogId of [...STARTER_DEFAULT_WEAPON_PART_CATALOG_IDS, STARTER_PLAYER_ROLE_CATALOG_ID]) {
         if (OwnedCatalogIds.has(CatalogId)) continue;
         InstancedItems.push({
             catalogId: CatalogId,

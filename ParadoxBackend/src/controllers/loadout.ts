@@ -10,7 +10,7 @@
  */
 
 import { GetRepositories } from "../persistence";
-import { EnsureStarterBootstrapRecords } from "./starterManifest";
+import { EnsureStarterBootstrapRecords, STARTER_PLAYER_ROLE_CATALOG_ID } from "./starterManifest";
 import { ValidateLoadoutWriteData } from "../validation";
 import { logger } from "../logger";
 import {
@@ -42,6 +42,22 @@ function CloneLoadoutForSlot(Source: any, SlotIndex: number): any {
     return Clone;
 }
 
+// [1.14.7 2026-10-13] A slot without an Omnicell leaves the hunt pawn without a weapon (see
+// STARTER_PLAYER_ROLE_CATALOG_ID). Accounts saved before v5 have player_role.instance_id "", so serve
+// an owned Omnicell in its place; the next loadout save from the game stores it. Read-time only.
+export async function FillEmptyPlayerRoles(Loadouts: any[], CharacterId: string): Promise<void> {
+    if (!Loadouts.some((Slot) => !Slot?.player_role?.instance_id)) return;
+    const Inventory = await GetRepositories().inventories.findByCharacterId(CharacterId);
+    let Items: any[] = [];
+    try { Items = JSON.parse(Inventory?.instancedItems ?? "[]"); } catch { return; }
+    const Owned = Items.find((Item) => Item?.catalogId === STARTER_PLAYER_ROLE_CATALOG_ID && Item.instanceId)
+        ?? Items.find((Item) => typeof Item?.catalogId === "string" && Item.catalogId.startsWith("PR_") && Item.instanceId);
+    if (!Owned) return;
+    for (const Slot of Loadouts) {
+        if (Slot && !Slot.player_role?.instance_id) Slot.player_role = { ...(Slot.player_role ?? {}), item_id: Owned.catalogId, instance_id: Owned.instanceId };
+    }
+}
+
 export async function GetLoadoutStateForUserIdAndCharacterId(UserId: string, CharacterId: string){
     // This is a no-op when inventory and loadout both exist. If either is missing, the helper
     // repairs both records atomically and derives slot IDs from inventory rather than constants.
@@ -49,6 +65,7 @@ export async function GetLoadoutStateForUserIdAndCharacterId(UserId: string, Cha
     const LoadoutDbRow = await GetRepositories().loadouts.findByCharacterIdAndUserId(CharacterId, UserId);
     if (LoadoutDbRow == undefined) throw new Error(`Bootstrap recovery did not create loadout for ${CharacterId}`);
     const StoredLoadouts = ParseLoadoutArray(LoadoutDbRow.loadouts, CharacterId);
+    await FillEmptyPlayerRoles(StoredLoadouts, CharacterId);
     const VisibleTotalSlots = ResolveVisibleTotalLoadoutSlots(StoredLoadouts.length, LoadoutDbRow.unlockedTotalSlots);
     return {
         loadouts: StoredLoadouts.slice(0, VisibleTotalSlots),
