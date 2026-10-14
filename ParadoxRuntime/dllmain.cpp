@@ -5267,14 +5267,14 @@ static void Tick() {
 // [1.14.7 2026-10-15] Staff nameplates. The backend prefixes server owners' and admins' names with "[Owner] " /
 // "[Admin] " (ParadoxBackend security/staffRoles.ts StaffNameTag), which is what chat and the nameplate show. Here
 // the nameplate is styled by that prefix: owners get pulsing gold text with an orange glow and a "Server Owner"
-// title line, admins plain light-blue text. Client only, game thread, from ProcessEventClientHook like the
+// title line, with "[Owner] " taken off the plate (chat keeps it); admins plain light-blue text. Client only, game thread, from ProcessEventClientHook like the
 // behemoth bar. DISABLE_STAFF_NAMEPLATES.flag beside the exe turns it off.
 // ponytail: re-reads plate text every kScanMs; hook UNamePlatesWidget::UpdateName instead if that ever costs.
 namespace StaffNameplates {
 
 using BehemothHealthBar::Ref;
 enum class Tier { None, Admin, Owner };
-struct Plate { Ref W; Tier T = Tier::None; };
+struct Plate { Ref W; Tier T = Tier::None; std::string Name; };   // Name: owner plate text after stripping
 
 constexpr ULONGLONG kTickMs = 100, kScanMs = 1000;
 static const SDK::FLinearColor kAdmin{ 0.35f, 0.72f, 1.f, 1.f };
@@ -5317,12 +5317,10 @@ static void Decorate(SDK::UNamePlatesWidget* W, Tier T) {
     }
 }
 
-static Tier TierOf(SDK::UNamePlatesWidget* W) {
-    if (!W->TextBlock_Name) return Tier::None;
-    const std::string Text = SDK::UKismetTextLibrary::Conv_TextToString(W->TextBlock_Name->GetText()).ToString();
-    if (Text.rfind("[Owner]", 0) == 0) return Tier::Owner;
-    if (Text.rfind("[Admin]", 0) == 0) return Tier::Admin;
-    return Tier::None;
+static void SetName(SDK::UTextBlock* Tb, const std::string& Utf8) {
+    std::wstring W(Utf8.size(), wchar_t{});
+    W.resize(MultiByteToWideChar(CP_UTF8, 0, Utf8.data(), static_cast<int>(Utf8.size()), W.data(), static_cast<int>(W.size())));
+    Tb->SetText(SDK::UKismetTextLibrary::Conv_StringToText(SDK::FString(W.c_str())));
 }
 
 static void Update() {
@@ -5341,10 +5339,22 @@ static void Update() {
         std::vector<Plate> Next;
         for (int32_t i = 0; i < s_Found->Num(); ++i) {
             auto* W = static_cast<SDK::UNamePlatesWidget*>((*s_Found)[i]);
-            if (!W) continue;
-            const Tier T = TierOf(W);
-            if (T == Tier::None) continue;
+            if (!W || !W->TextBlock_Name) continue;
+            const std::string Text = SDK::UKismetTextLibrary::Conv_TextToString(W->TextBlock_Name->GetText()).ToString();
             auto Old = std::find_if(s_Plates.begin(), s_Plates.end(), [&](const Plate& P) { return P.W.Get() == W; });
+            Tier T = Tier::None;
+            std::string Name;
+            if (Text.rfind("[Owner] ", 0) == 0) {          // new plate, or the game re-set the name: strip again
+                T = Tier::Owner;
+                Name = Text.substr(8);
+                SetName(W->TextBlock_Name, Name);
+            } else if (Old != s_Plates.end() && Old->T == Tier::Owner && Text == Old->Name) {
+                T = Tier::Owner;                             // already stripped
+                Name = Text;
+            } else if (Text.rfind("[Admin]", 0) == 0) {
+                T = Tier::Admin;
+            }
+            if (T == Tier::None) continue;
             if (Old == s_Plates.end() || Old->T != T) {
                 Decorate(W, T);
                 Log(std::string(T == Tier::Owner ? "owner" : "admin") + " plate " + W->GetFullName());
@@ -5352,6 +5362,7 @@ static void Update() {
             Next.push_back(Plate{});
             Next.back().W.Set(W);
             Next.back().T = T;
+            Next.back().Name = Name;
         }
         static bool s_LoggedCount = false;
         if (!s_LoggedCount && s_Found->Num() > 0) {
