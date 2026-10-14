@@ -39,6 +39,8 @@ export interface LauncherAccountRecord {
     /** Argon2id hash. Absent for Discord-only accounts. */
     passwordHash?: string;
     status: AccountOperationalStatus;
+    /** Set with status "banned" for a timed ban; absent = permanent. See IsBanActive. */
+    bannedUntil?: string;
     /** Closed-test admission state. Legacy rows without this field are treated as
      * approved until the explicit migration script is run, avoiding accidental
      * lockout during deployment. New accounts always set it to pending. */
@@ -90,6 +92,8 @@ export interface LauncherAccountRepository {
         changes: {
             approvalStatus?: AccountApprovalStatus;
             status?: AccountOperationalStatus;
+            /** Only read when status is given: banned + bannedUntil = timed ban; otherwise cleared. */
+            bannedUntil?: string;
             approvalUpdatedAt: string;
             approvalUpdatedBy: string;
             approvalReason?: string;

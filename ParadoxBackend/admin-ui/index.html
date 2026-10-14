@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server Staff</title>
+<style>
+  :root { --bg:#121417; --panel:#1b1f24; --line:#2c323a; --text:#e6e8eb; --dim:#8b949e; --accent:#e0a33a; --bad:#e5534b; --ok:#57ab5a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:16px; margin:0; color:var(--accent); }
+  header .me { margin-left:auto; color:var(--dim); }
+  nav button { background:none; border:0; color:var(--dim); padding:6px 10px; cursor:pointer; font:inherit; border-radius:4px; }
+  nav button.on { color:var(--text); background:var(--line); }
+  main { padding:20px; max-width:1200px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:16px; margin-bottom:16px; }
+  input, select, textarea { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px; padding:6px 8px; font:inherit; }
+  button.btn { background:var(--line); color:var(--text); border:1px solid #3a414a; border-radius:4px; padding:6px 12px; cursor:pointer; font:inherit; }
+  button.btn:hover { border-color:var(--accent); }
+  button.danger { border-color:var(--bad); color:#ffb3ae; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  tr.pick { cursor:pointer; } tr.pick:hover td { background:#22272e; }
+  .tag { display:inline-block; padding:1px 6px; border-radius:3px; font-size:12px; background:var(--line); margin-right:4px; }
+  .tag.bad { background:#4a1f1d; color:#ffb3ae; } .tag.ok { background:#1d3a20; color:#b4f0b6; } .tag.warn { background:#4a3a1a; color:#f5d08a; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  .dim { color:var(--dim); }
+  .err { color:#ffb3ae; min-height:1.4em; }
+  .login { max-width:340px; margin:80px auto; }
+  .login input { width:100%; margin-bottom:10px; }
+  #actions h2 { margin:0 0 4px; font-size:18px; }
+  #actions h3 { font-size:13px; color:var(--dim); text-transform:uppercase; letter-spacing:.04em; margin:18px 0 6px; }
+  textarea { width:100%; min-height:54px; }
+  .hidden { display:none !important; }
+  @media (max-width: 700px) { main { padding:12px; } .hide-sm { display:none; } }
+</style>
+</head>
+<body>
+<div id="login" class="card login hidden">
+  <h1 style="margin-top:0;font-size:18px">Staff sign-in</h1>
+  <input id="l-user" placeholder="Username or email" autocomplete="username">
+  <input id="l-pass" type="password" placeholder="Password" autocomplete="current-password">
+  <input id="l-totp" placeholder="Authenticator code (if enabled)" inputmode="numeric" autocomplete="one-time-code">
+  <div class="row"><button class="btn" id="l-go">Sign in</button><a class="dim" href="/admin/v1/auth/discord/start">Sign in with Discord (allow-listed)</a></div>
+  <div class="err" id="l-err"></div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>Server Staff</h1>
+    <nav><button data-tab="players" class="on">Players</button><button data-tab="online">Online</button><button data-tab="audit">Audit log</button></nav>
+    <span class="me" id="me"></span>
+    <button class="btn" id="logout">Sign out</button>
+  </header>
+  <main>
+    <div class="err" id="err"></div>
+    <section id="tab-players">
+      <div class="row">
+        <input id="p-search" placeholder="Search name or email">
+        <select id="p-status"><option value="">Any status</option><option>active</option><option>banned</option><option>disabled</option></select>
+        <select id="p-approval"><option value="">Any approval</option><option>pending</option><option>approved</option><option>rejected</option></select>
+        <button class="btn" id="p-go">Search</button>
+        <span class="dim" id="p-count"></span>
+      </div>
+      <div class="card" style="padding:0"><table><thead><tr><th>Name</th><th>Status</th><th>Roles</th><th class="hide-sm">Last login</th></tr></thead><tbody id="p-rows"></tbody></table></div>
+      <div class="row"><button class="btn" id="p-prev">Prev</button><button class="btn" id="p-next">Next</button></div>
+    </section>
+    <section id="tab-online" class="hidden">
+      <div class="row"><button class="btn" id="o-go">Refresh</button><span class="dim" id="o-count"></span></div>
+      <div class="card" style="padding:0"><table><thead><tr><th>Name</th></tr></thead><tbody id="o-rows"></tbody></table></div>
+    </section>
+    <section id="tab-audit" class="hidden">
+      <div class="row"><button class="btn" id="a-go">Refresh</button><button class="btn" id="a-prev">Prev</button><button class="btn" id="a-next">Next</button></div>
+      <div class="card" style="padding:0"><table><thead><tr><th>When (UTC)</th><th>Staff</th><th>Player</th><th>Action</th><th>Reason</th></tr></thead><tbody id="a-rows"></tbody></table></div>
+    </section>
+
+    <div id="actions" class="card hidden"></div>
+  </main>
+</div>
+<script src="admin.js"></script>
+</body>
+</html>

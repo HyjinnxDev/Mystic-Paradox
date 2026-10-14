@@ -11,6 +11,7 @@
  */
 
 import express from "express";
+import path from "path";
 import { rateLimit } from "express-rate-limit";
 import { loginRouter } from "./routes/login.js";
 import { logger } from "./logger.js";
@@ -234,6 +235,11 @@ app.use("/", launcherLogsRouter);
 app.use("/", crashReportsRouter);
 app.use("/", adminLauncherLogsRouter);
 app.use("/", adminRouter);
+// Staff dashboard (admin-ui/): a static page calling /admin/v1 from the same origin.
+app.use("/admin", (_req, res, next) => {
+    res.header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'");
+    next();
+}, express.static(path.resolve(__dirname, "..", "admin-ui")));
 Extension.http.mountRoutes(app);
 app.use("/", launcherGuardRouter);
 

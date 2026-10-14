@@ -7,9 +7,10 @@
  */
 
 // Roles the admin dashboard is allowed to grant/revoke via PATCH /admin/v1/players/:userId/roles.
-// "player" and "admin" are assigned elsewhere (registration, bootstrap script) and are
-// intentionally excluded so this endpoint can't be used to self-promote or demote admins.
-export const ASSIGNABLE_ROLES: readonly string[] = ["tester"];
+// That route is owner-only and can't target the caller or another owner (security/staffRoles.ts).
+// "player" and "owner" are assigned elsewhere (registration, bootstrap script) so the API
+// can never mint another owner.
+export const ASSIGNABLE_ROLES: readonly string[] = ["tester", "moderator", "admin"];
 
 export const TESTER_ROLE = "tester";
 

@@ -8,7 +8,7 @@
 
 import { Router } from "express";
 import { logger } from "../logger";
-import { HasAdminAuth } from "../middleware/HasAdminAuth";
+import { HasAdminAuth, RequireStaff } from "../middleware/HasAdminAuth";
 import { AdminLogin, AdminLogout, AdminMe, DeletePlayer, ListAudit, ListOnlinePlayers, ListPlayers, UpdatePlayerAccess, UpdatePlayerRoles } from "../controllers/admin";
 import {
     ADMIN_DISCORD_BINDING_COOKIE_NAME,
@@ -49,7 +49,9 @@ function ReadCookieValue(header: string | undefined, name: string): string | und
 adminRouter.use("/admin/v1", (req, res, next) => {
     const Origin = req.headers.origin;
     if (typeof Origin === "string") {
-        if (!AllowedOrigins().includes(Origin)) {
+        // Same origin = the /admin page this backend serves itself (routes in app.ts).
+        const SameOrigin = Origin === `${req.protocol}://${req.headers.host}`;
+        if (!SameOrigin && !AllowedOrigins().includes(Origin)) {
             logger.warn(`[ADMIN] rejected origin ${Origin}`);
             res.status(403).send();
             return;
@@ -109,11 +111,12 @@ adminRouter.get("/admin/v1/auth/discord/callback", async (req, res) => {
 });
 
 adminRouter.get("/admin/v1/me", HasAdminAuth, AdminMe);
-adminRouter.get("/admin/v1/online-players", HasAdminAuth, ListOnlinePlayers);
-adminRouter.get("/admin/v1/players", HasAdminAuth, ListPlayers);
+adminRouter.get("/admin/v1/online-players", HasAdminAuth, RequireStaff("players.read"), ListOnlinePlayers);
+adminRouter.get("/admin/v1/players", HasAdminAuth, RequireStaff("players.read"), ListPlayers);
+// Per-change permission (timed ban vs. permanent/approval) is checked inside the controller.
 adminRouter.patch("/admin/v1/players/:userId/access", HasAdminAuth, UpdatePlayerAccess);
-adminRouter.patch("/admin/v1/players/:userId/roles", HasAdminAuth, UpdatePlayerRoles);
-adminRouter.delete("/admin/v1/players/:userId", HasAdminAuth, DeletePlayer);
-adminRouter.get("/admin/v1/audit", HasAdminAuth, ListAudit);
-adminRouter.get("/admin/v1/operations/overview", HasAdminAuth, GetOperationsOverview);
-adminRouter.patch("/admin/v1/operations/policy", HasAdminAuth, UpdateOperationsPolicy);
+adminRouter.patch("/admin/v1/players/:userId/roles", HasAdminAuth, RequireStaff("players.roles"), UpdatePlayerRoles);
+adminRouter.delete("/admin/v1/players/:userId", HasAdminAuth, RequireStaff("players.delete"), DeletePlayer);
+adminRouter.get("/admin/v1/audit", HasAdminAuth, RequireStaff("players.read"), ListAudit);
+adminRouter.get("/admin/v1/operations/overview", HasAdminAuth, RequireStaff("operations"), GetOperationsOverview);
+adminRouter.patch("/admin/v1/operations/policy", HasAdminAuth, RequireStaff("operations"), UpdateOperationsPolicy);

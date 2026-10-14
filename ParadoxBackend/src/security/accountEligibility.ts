@@ -15,9 +15,17 @@ export function EffectiveApprovalStatus(account: LauncherAccountRecord): "pendin
     return account.approvalStatus ?? "approved";
 }
 
+/** A timed ban whose bannedUntil has passed no longer counts; nothing has to run to lift it. */
+export function IsBanActive(account: LauncherAccountRecord, nowMs = Date.now()): boolean {
+    if (account.status !== "banned") return false;
+    return account.bannedUntil == undefined || Date.parse(account.bannedUntil) > nowMs;
+}
+
 export function AssertAccountAdmitted(account: LauncherAccountRecord): void {
-    if (account.status === "banned") {
-        throw new LauncherApiError("AUTH_ACCOUNT_BANNED", "This account has been banned.");
+    if (IsBanActive(account)) {
+        throw new LauncherApiError("AUTH_ACCOUNT_BANNED", account.bannedUntil
+            ? `This account is banned until ${account.bannedUntil.replace("T", " ").slice(0, 16)} UTC.`
+            : "This account has been banned.");
     }
     if (account.status === "disabled") {
         throw new LauncherApiError("AUTH_ACCOUNT_DISABLED", "This account has been disabled.");

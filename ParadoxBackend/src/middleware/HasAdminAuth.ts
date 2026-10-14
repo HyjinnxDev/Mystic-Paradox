@@ -10,6 +10,7 @@ import { NextFunction, Request, Response } from "express";
 import { GetRepositories } from "../persistence";
 import { HashOpaqueToken } from "../security/launcherTokens";
 import { IsAccountEligible } from "../security/accountEligibility";
+import { HasStaffPermission, StaffPermission, StaffRank } from "../security/staffRoles";
 
 export const ADMIN_COOKIE_NAME = "mysticparadox_admin";
 
@@ -38,7 +39,7 @@ export async function HasAdminAuth(req: Request, res: Response, next: NextFuncti
     }
 
     const Account = await Repos.launcherAccounts.findByUserId(Session.userId);
-    if (!Account || !Account.roles.includes("admin") || !IsAccountEligible(Account)) {
+    if (!Account || StaffRank(Account.roles) === 0 || !IsAccountEligible(Account)) {
         await Repos.admin.revokeSession(Session.id);
         res.status(403).json({ error: { code: "ADMIN_FORBIDDEN", message: "Administrator access denied." } });
         return;
@@ -54,4 +55,15 @@ export async function HasAdminAuth(req: Request, res: Response, next: NextFuncti
 
     (req as any).AdminAuth = { session: Session, account: Account };
     next();
+}
+
+/** Use after HasAdminAuth: rejects staff whose tier lacks the permission. */
+export function RequireStaff(permission: StaffPermission) {
+    return (req: Request, res: Response, next: NextFunction): void => {
+        if (!HasStaffPermission((req as any).AdminAuth.account.roles, permission)) {
+            res.status(403).json({ error: { code: "ADMIN_FORBIDDEN", message: "Your staff role can't do that." } });
+            return;
+        }
+        next();
+    };
 }

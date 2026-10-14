@@ -11,12 +11,14 @@ import { Request, Response } from "express";
 import { GetRepositories, AccountApprovalStatus, AccountOperationalStatus, LauncherAccountRecord } from "../persistence";
 import { VerifyPassword } from "../security/passwords";
 import { GenerateOpaqueToken, HashOpaqueToken } from "../security/launcherTokens";
-import { EffectiveApprovalStatus, IsAccountEligible } from "../security/accountEligibility";
+import { EffectiveApprovalStatus, IsAccountEligible, IsBanActive } from "../security/accountEligibility";
 import { VerifyTotp } from "../security/totp";
 import { IsRateLimited } from "../security/rateLimit";
 import { ADMIN_COOKIE_NAME } from "../middleware/HasAdminAuth";
 import { sessionRegistry } from "../realtime/SessionRegistry";
 import { ASSIGNABLE_ROLES, TESTER_ROLE } from "../security/testerFeatures";
+import { CanActOn, HasStaffPermission, MODERATOR_MAX_BAN_HOURS, StaffRank } from "../security/staffRoles";
+import { SetVoiceBlocked } from "../voiceRelay";
 
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
@@ -27,6 +29,8 @@ function PublicAccount(account: LauncherAccountRecord): Record<string, unknown> 
         email: account.email ?? "",
         approvalStatus: EffectiveApprovalStatus(account),
         status: account.status,
+        bannedUntil: account.bannedUntil,
+        banActive: IsBanActive(account),
         roles: account.roles,
         rolesUpdatedAt: account.rolesUpdatedAt,
         rolesUpdatedBy: account.rolesUpdatedBy,
@@ -51,10 +55,12 @@ export async function AdminLogin(req: Request, res: Response): Promise<void> {
         return;
     }
 
+    // "email" also accepts a launcher username: invite-code accounts may have no email.
     const Email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
     const Password = typeof req.body?.password === "string" ? req.body.password : "";
-    const Account = await GetRepositories().launcherAccounts.findByEmail(Email);
-    if (!Account || !(await VerifyPassword(Account.passwordHash, Password)) || !Account.roles.includes("admin") || !IsAccountEligible(Account)) {
+    const Repos = GetRepositories();
+    const Account = await Repos.launcherAccounts.findByEmail(Email) ?? await Repos.launcherAccounts.findByDisplayNameNormalized(Email);
+    if (!Account || !(await VerifyPassword(Account.passwordHash, Password)) || StaffRank(Account.roles) === 0 || !IsAccountEligible(Account)) {
         res.status(401).json({ error: { code: "ADMIN_INVALID_CREDENTIALS", message: "Administrator credentials are invalid." } });
         return;
     }
@@ -141,6 +147,7 @@ export async function UpdatePlayerAccess(req: Request, res: Response): Promise<v
     const TargetUserId = String(req.params.userId ?? "");
     const Approval = req.body?.approvalStatus;
     const Status = req.body?.status;
+    const DurationHours = req.body?.durationHours;
     const Reason = typeof req.body?.reason === "string" ? req.body.reason.trim().slice(0, 500) : "";
 
     if (Approval != undefined && !["pending", "approved", "rejected"].includes(Approval)) {
@@ -149,6 +156,19 @@ export async function UpdatePlayerAccess(req: Request, res: Response): Promise<v
     }
     if (Status != undefined && !["active", "disabled", "banned"].includes(Status)) {
         res.status(400).json({ error: { code: "ADMIN_VALIDATION", message: "Invalid account status." } });
+        return;
+    }
+    if (DurationHours != undefined && (Status !== "banned" || !Number.isInteger(DurationHours) || DurationHours < 1 || DurationHours > 24 * 365)) {
+        res.status(400).json({ error: { code: "ADMIN_VALIDATION", message: "durationHours must be 1-8760 and only goes with a ban." } });
+        return;
+    }
+    // Moderators may only issue timed bans up to MODERATOR_MAX_BAN_HOURS; everything else needs admin.
+    const IsModeratorBan = Approval == undefined && Status === "banned"
+        && DurationHours != undefined && DurationHours <= MODERATOR_MAX_BAN_HOURS;
+    if (!HasStaffPermission(Actor.roles, IsModeratorBan ? "players.ban.timed" : "players.access")) {
+        res.status(403).json({
+            error: { code: "ADMIN_FORBIDDEN", message: `Moderators can only issue timed bans of up to ${MODERATOR_MAX_BAN_HOURS} hours.` }
+        });
         return;
     }
     if (Approval == undefined && Status == undefined) {
@@ -180,9 +200,14 @@ export async function UpdatePlayerAccess(req: Request, res: Response): Promise<v
         res.status(404).json({ error: { code: "NOT_FOUND", message: "Player not found." } });
         return;
     }
+    if (TargetUserId !== Actor.userId && !CanActOn(Actor.roles, Before.roles)) {
+        res.status(403).json({ error: { code: "ADMIN_RANK", message: "You can't change access for staff at or above your role." } });
+        return;
+    }
     const After = await Repos.launcherAccounts.setAccessState(TargetUserId, {
         approvalStatus: Approval,
         status: Status,
+        bannedUntil: DurationHours != undefined ? new Date(Date.now() + DurationHours * 3600_000).toISOString() : undefined,
         approvalUpdatedAt: new Date().toISOString(),
         approvalUpdatedBy: Actor.userId,
         approvalReason: Reason
@@ -197,6 +222,13 @@ export async function UpdatePlayerAccess(req: Request, res: Response): Promise<v
             Repos.refreshSessions.revokeAllForUser(TargetUserId),
             Repos.gameExchangeCodes.revokeUnusedForUser(TargetUserId)
         ]);
+        // Game API calls already 403 per request (HasParadoxBackendAuth). Also drop live chat
+        // (XMPPAuth refuses the reconnect) and party voice. The game server itself has no kick
+        // path yet: the player stays in their current map until they travel.
+        for (const Conn of sessionRegistry.connectionsFor(TargetUserId)) Conn.close(1008, "account suspended");
+        SetVoiceBlocked(TargetUserId, After.bannedUntil ? Date.parse(After.bannedUntil) : Infinity);
+    } else {
+        SetVoiceBlocked(TargetUserId, undefined);
     }
 
     const RequestId = crypto.randomUUID();
@@ -205,8 +237,8 @@ export async function UpdatePlayerAccess(req: Request, res: Response): Promise<v
         actorUserId: Actor.userId,
         targetUserId: TargetUserId,
         action: "player.access.update",
-        oldState: { approvalStatus: EffectiveApprovalStatus(Before), status: Before.status },
-        newState: { approvalStatus: EffectiveApprovalStatus(After), status: After.status },
+        oldState: { approvalStatus: EffectiveApprovalStatus(Before), status: Before.status, bannedUntil: Before.bannedUntil },
+        newState: { approvalStatus: EffectiveApprovalStatus(After), status: After.status, bannedUntil: After.bannedUntil },
         reason: Reason || undefined,
         ip: req.ip ?? "unknown",
         requestId: RequestId,
@@ -239,6 +271,10 @@ export async function UpdatePlayerRoles(req: Request, res: Response): Promise<vo
     const Before = await Repos.launcherAccounts.findByUserId(TargetUserId);
     if (!Before) {
         res.status(404).json({ error: { code: "NOT_FOUND", message: "Player not found." } });
+        return;
+    }
+    if (!CanActOn(Actor.roles, Before.roles)) {
+        res.status(403).json({ error: { code: "ADMIN_RANK", message: "You can't change roles for yourself or staff at or above your role." } });
         return;
     }
 
@@ -288,6 +324,10 @@ export async function DeletePlayer(req: Request, res: Response): Promise<void> {
     const Target = await Repos.launcherAccounts.findByUserId(TargetUserId);
     if (!Target) {
         res.status(404).json({ error: { code: "NOT_FOUND", message: "Player not found." } });
+        return;
+    }
+    if (!CanActOn(Actor.roles, Target.roles)) {
+        res.status(403).json({ error: { code: "ADMIN_RANK", message: "You can't delete staff at or above your role." } });
         return;
     }
 

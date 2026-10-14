@@ -32,6 +32,7 @@ function ToRecord(Doc: any): LauncherAccountRecord {
         displayName: Doc.displayName,
         passwordHash: Doc.passwordHash ?? undefined,
         status: Doc.status,
+        bannedUntil: Doc.bannedUntil ?? undefined,
         approvalStatus: Doc.approvalStatus ?? undefined,
         approvalUpdatedAt: Doc.approvalUpdatedAt ?? undefined,
         approvalUpdatedBy: Doc.approvalUpdatedBy ?? undefined,
@@ -150,6 +151,7 @@ export class MongoLauncherAccountRepository implements LauncherAccountRepository
         changes: {
             approvalStatus?: AccountApprovalStatus;
             status?: AccountOperationalStatus;
+            bannedUntil?: string;
             approvalUpdatedAt: string;
             approvalUpdatedBy: string;
             approvalReason?: string;
@@ -161,12 +163,17 @@ export class MongoLauncherAccountRepository implements LauncherAccountRepository
             approvalUpdatedBy: changes.approvalUpdatedBy,
             approvalReason: changes.approvalReason ?? ""
         };
+        const Unset: Record<string, ""> = {};
         if (changes.approvalStatus != undefined) Set.approvalStatus = changes.approvalStatus;
-        if (changes.status != undefined) Set.status = changes.status;
+        if (changes.status != undefined) {
+            Set.status = changes.status;
+            if (changes.status === "banned" && changes.bannedUntil != undefined) Set.bannedUntil = changes.bannedUntil;
+            else Unset.bannedUntil = "";
+        }
 
         const Result = await Db.collection(Collections.Accounts).findOneAndUpdate(
             { _id: userId as any, displayNameNormalized: { $exists: true } },
-            { $set: Set },
+            Object.keys(Unset).length > 0 ? { $set: Set, $unset: Unset } : { $set: Set },
             { returnDocument: "after" }
         );
         return Result == null ? undefined : ToRecord(Result);

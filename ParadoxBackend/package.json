@@ -21,7 +21,7 @@
     "test:matchmaking": "node --import tsx --test src/matchmakingParty.test.ts src/apiKeysConfig.test.ts",
     "test:loadout": "node --import tsx --test src/loadoutSlots.test.ts",
     "test:realtime": "node --import tsx --test src/realtime/jid.test.ts src/realtime/stateMachine.test.ts src/realtime/xml.test.ts src/realtime/XMPPAuth.test.ts src/realtime/DirectChatService.test.ts src/realtime/RoomService.test.ts src/realtime/PresenceService.test.ts src/realtime/SessionRegistry.test.ts",
-    "test:auth-security": "node --import tsx --test src/security/accountEligibility.test.ts src/security/totp.test.ts src/security/runtimeAuthorization.test.ts src/security/launcherVersion.test.ts src/controllers/adminDiscordAuth.test.ts src/launcherAuthValidation.test.ts src/launcherUpdatesValidation.test.ts src/security/apiKeyHash.test.ts",
+    "test:auth-security": "node --import tsx --test src/security/accountEligibility.test.ts src/security/staffRoles.test.ts src/security/totp.test.ts src/security/runtimeAuthorization.test.ts src/security/launcherVersion.test.ts src/controllers/adminDiscordAuth.test.ts src/launcherAuthValidation.test.ts src/launcherUpdatesValidation.test.ts src/security/apiKeyHash.test.ts",
     "test:inventory-storage": "node --import tsx --test src/inventoryStoragePolicy.gamedata.test.ts",
     "test:store": "node --import tsx --test src/controllers/storeRegistry.gamedata.test.ts src/security/logRedaction.test.ts",
     "test:platinum": "node --import tsx --test src/platinumWallet.test.ts src/skuProgression.test.ts",

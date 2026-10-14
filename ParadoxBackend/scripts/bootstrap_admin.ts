@@ -48,7 +48,8 @@ async function main(): Promise<void> {
         await Accounts.updateOne(
             { _id: Account._id },
             {
-                $addToSet: { roles: "admin" },
+                // "owner" is the top staff tier (src/security/staffRoles.ts) and is only ever granted here.
+                $addToSet: { roles: { $each: ["admin", "owner"] } },
                 $set: {
                     email: Email,
                     status: "active",
@@ -59,7 +60,7 @@ async function main(): Promise<void> {
                 }
             }
         );
-        console.log(`Administrator role granted to userId=${Account.userId}; email=${Email}.`);
+        console.log(`Owner + administrator roles granted to userId=${Account.userId}; email=${Email}.`);
     } finally {
         await Lifecycle.stop();
     }

@@ -152,8 +152,21 @@ export function StartVoiceRelay(port: number, deps: RelayDeps): dgram.Socket {
     return socket;
 }
 
+// Users an admin banned/disabled. Their ticket stays valid up to 24 h, so hellos are refused
+// here and the peer expires within PEER_TTL_MS. ponytail: in-memory, a backend restart forgets
+// it until the old ticket expires; check account eligibility in validate if that matters.
+const VoiceBlockedUntil = new Map<string, number>();
+
+export function SetVoiceBlocked(userId: string, untilMs: number | undefined): void {
+    if (untilMs == undefined) VoiceBlockedUntil.delete(userId);
+    else VoiceBlockedUntil.set(userId, untilMs);
+}
+
 export const DefaultRelayDeps: RelayDeps = {
-    validate: ValidateVoiceTicket,
+    validate: (ticket) => {
+        const userId = ValidateVoiceTicket(ticket);
+        return userId && (VoiceBlockedUntil.get(userId) ?? 0) <= Date.now() ? userId : undefined;
+    },
     partyMembers: async (userId) => (await GetPartyForPlayer(userId))?.members ?? [],
     now: () => Date.now(),
 };
