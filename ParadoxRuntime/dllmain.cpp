@@ -2572,6 +2572,43 @@ static void OnLoginScreenEvent(SDK::UObject* Object, const std::string& Function
     if (!Object->IsA(SDK::ULoginScreen_bps_C::StaticClass())) return;
     auto* Screen = static_cast<SDK::ULoginScreen_bps_C*>(Object);
 
+    // [BRANDING DIAG] one-shot dump of the screen's widget tree (name, class, visibility) to find the
+    // credits/options/etc. widgets to hide. Fires on the first two events that arrive after the intro.
+    static int s_Dumps = 0;
+    if (s_Dumps < 2 && (FunctionName.find("OnStartupMovieFinished") != std::string::npos
+                     || FunctionName.find("OnPlayScreenPollTimer") != std::string::npos)
+        && Screen->WidgetTree && IsReadablePointer(Screen->WidgetTree, sizeof(SDK::UWidgetTree))) {
+        ++s_Dumps;
+        int N = 0;
+        for (int32_t i = 0; i < SDK::UObject::GObjects->Num(); ++i) {
+            SDK::UObject* O = SDK::UObject::GObjects->GetByIndex(i);
+            if (!O || O->Outer != static_cast<SDK::UObject*>(Screen->WidgetTree)) continue;
+            if (!IsReadablePointer(O, sizeof(SDK::UWidget)) || !O->IsA(SDK::UWidget::StaticClass())) continue;
+            auto* W = static_cast<SDK::UWidget*>(O);
+            MpLog("[LoginTree] " + O->GetName() + " : " + O->Class->GetName()
+                + " vis=" + std::to_string(static_cast<int>(W->Visibility)));
+            ++N;
+        }
+        MpLog("[LoginTree] dump " + std::to_string(s_Dumps) + " after " + FunctionName + ": " + std::to_string(N) + " widgets");
+    }
+
+    // The Epic Games badge next to the signed-in name. Not a member of the screen class, so it is found by name
+    // in the widget tree once per tree and cached (one GObjects walk, then a pointer compare).
+    static SDK::UObject* s_EpicIconTree = nullptr;
+    static SDK::UWidget* s_EpicIcon = nullptr;
+    if (Screen->WidgetTree && s_EpicIconTree != static_cast<SDK::UObject*>(Screen->WidgetTree)
+        && IsReadablePointer(Screen->WidgetTree, sizeof(SDK::UWidgetTree))) {
+        s_EpicIconTree = Screen->WidgetTree;
+        s_EpicIcon = nullptr;
+        for (int32_t i = 0; i < SDK::UObject::GObjects->Num(); ++i) {
+            SDK::UObject* O = SDK::UObject::GObjects->GetByIndex(i);
+            if (!O || O->Outer != s_EpicIconTree || O->GetName() != "Icon_EpicAccount") continue;
+            if (IsReadablePointer(O, sizeof(SDK::UWidget)) && O->IsA(SDK::UWidget::StaticClass())) s_EpicIcon = static_cast<SDK::UWidget*>(O);
+            break;
+        }
+    }
+    Collapse(s_EpicIcon, "Epic Games badge (Icon_EpicAccount)");
+
     ApplyBackground(Screen, FunctionName);
     Collapse(Screen->ArchonLogoMat, "DAUNTLESS logo (ArchonLogoMat)");
 
@@ -2843,6 +2880,23 @@ static void OnPressStartEvent(SDK::UObject* Object, const std::string& FunctionN
     CreditsBranding::SetText(Panel->WelcomeText, kWelcome);
     static int s_Logged = 0;
     if (s_Logged++ < 6) MpLog("[PressStartBranding] welcome text set after " + FunctionName);
+
+    // The popup is skipped: the panel is asked to dismiss itself, the same call a Continue click makes. Done on
+    // the panel's second event so its own Construct has finished binding. DISABLE_PRESS_START_SKIP.flag reverts.
+    static const bool s_NoSkip = MpExeRelativeFlagPresent(L"DISABLE_PRESS_START_SKIP.flag");
+    static SDK::UObject* s_Panel = nullptr;
+    static int s_Events = 0;
+    if (s_NoSkip || Panel->bQuitOnDismiss) return;
+    if (s_Panel != static_cast<SDK::UObject*>(Panel)) { s_Panel = Panel; s_Events = 0; }
+    // Measured (0.2.19): the panel's own events come before the screen has finished Construct and bound its
+    // Dismissed handler, so a dismissal then is lost. The screen's GetDefaultFocusedWidget is the last of its
+    // construction events.
+    if (FunctionName.find("PressStartScreen_bps_C.GetDefaultFocusedWidget") != std::string::npos && ++s_Events == 1) {
+        SDK::UFunction* Fn = Panel->Class->GetFunction("PressStartPanel_bpw_C", "RequestDismissal");
+        struct { int32_t UserIndex; } Parms{ 0 };
+        if (Fn) Panel->ProcessEvent(Fn, &Parms);
+        MpLog(std::string("[PressStartBranding] ") + (Fn ? "auto-dismissed" : "RequestDismissal not found for") + " press-start popup after " + FunctionName);
+    }
 }
 
 }  // namespace PressStartBranding
@@ -3534,6 +3588,7 @@ void ServerBootCrash(void* param_1) {
 // (IsReadablePointer). We also declare two new size-specific readers.
 static uintptr_t SafeReadPtr(uintptr_t base, uintptr_t offset);
 static int SafeReadU8At(uintptr_t base, uintptr_t offset);
+static void MpTickPartyRestartHold();   // defined beside MpIsPhantomThatMayNotRestart
 // [1.14.7 identity diagnostic] defined near the Move10 patch helper; declared here because the
 // client hook-install block appears earlier in this translation unit than the definition.
 static void InstallLoadMgrBeginHook(const char* Role);
@@ -4797,6 +4852,321 @@ static constexpr uint64_t kClientRolePumpStableChainMs = 750;
 //     ManualTickDispatchSEH code=0xC0000005 params=0x0,0x88 regs{rax=0x0 ...}
 // 0x88 is UNetDriver::ServerConnection, which Networking::Listen deliberately nulls - i.e. the code was
 // following a client-style path off a garbage base. Calling it with the real engine is the correct fix.
+// [1.14.7 2026-10-14] Behemoth health bar: the old-style fixed bar with the HP number ("12,345/15,654") at the
+// bottom middle of the screen, as the 1.4.4 UE4SS BehemothHealthBars mod drew it. Done here because UE4SS cannot
+// call UFunctions on this build: it takes ProcessEvent from a vtable slot this game customises, gets a stub, and
+// every call returns 0/nullptr (health 0, CreateWidget nullptr).
+// Bar: /Game/UI/EndOfHunt/StackableProgressBar (a UMG ProgressBar inside SizeBox_0). Number: a
+// w_chat_log_label_bpw TextBlock laid over the bar's top-left, in the player HUD's health-number font when found.
+// Shows a living behemoth within 35 m (hidden otherwise, e.g. the arrival intro): the one damaged last, else the
+// nearest. Client only, game thread (driven
+// from ProcessEventClientHook, throttled: the engine tick hook is server-only). DISABLE_BEHEMOTH_HEALTH_BAR.flag
+// beside the exe turns it off.
+// ponytail: one bar, no shield bar/shading/frame/second-behemoth bar or move keys (the mod had them); add if wanted.
+namespace BehemothHealthBar {
+
+constexpr float kWidth = 676.f, kBarH = 37.f, kPosY = -240.f;           // viewport units, anchored bottom-middle
+constexpr int32_t kTextSize = 29;
+constexpr float kTextIndent = 24.f, kTextOverlap = 10.f;
+constexpr ULONGLONG kUpdateMs = 100, kScanMs = 500, kRetryMs = 5000;
+constexpr float kShowRange = 3500.f, kHideRange = 5000.f;               // cm: show within 35 m, hide past 50 m
+static const SDK::FLinearColor kFill{ 0.62f, 0.08f, 0.07f, 1.f };
+static const SDK::FLinearColor kBack{ 0.03f, 0.03f, 0.03f, 0.85f };
+
+// A UObject pointer checked through GObjects before each use, so a destroyed object is never touched.
+struct Ref {
+    SDK::UObject* P = nullptr;
+    int32_t Idx = -1;
+    void Set(SDK::UObject* O) { P = O; Idx = O ? O->Index : -1; }
+    template <class T = SDK::UObject> T* Get() const {
+        return (P && Idx >= 0 && SDK::UObject::GObjects->GetByIndex(Idx) == P) ? static_cast<T*>(P) : nullptr;
+    }
+};
+
+static Ref s_PC, s_Bar, s_Label, s_BarClass, s_TextClass, s_Target;
+static std::vector<Ref> s_Behemoths;
+static std::unordered_map<SDK::UObject*, float> s_LastHp;
+static std::wstring s_LastText;
+static bool s_Shown = false;
+static ULONGLONG s_NextUpdate = 0, s_NextScan = 0, s_NextCreate = 0;
+static int s_Logs = 0;
+static volatile bool s_Faulted = false;
+
+static void Log(const std::string& Msg) {
+    if (s_Logs++ < 40) MpLog("[BehemothHealthBar] " + Msg);
+}
+
+static SDK::UClass* LoadClass(Ref& Cache, const wchar_t* Path) {
+    if (auto* C = Cache.Get<SDK::UClass>()) return C;
+    SDK::FSoftClassPath P = SDK::UKismetSystemLibrary::MakeSoftClassPath(SDK::FString(Path));
+    SDK::UClass* C = SDK::UKismetSystemLibrary::LoadClassAsset_Blocking(
+        SDK::UKismetSystemLibrary::Conv_SoftClassPathToSoftClassRef(P));
+    Cache.Set(C);
+    return C;
+}
+
+// The player HUD's health number (HealthStamina_bpw WidgetTree.HealthValueText), for its font. Scans GObjects once
+// per bar creation (a hunt start), matching the FName index first.
+static SDK::UTextBlock* FindHudHealthText() {
+    static int32_t s_NameIdx = SDK::UKismetStringLibrary::Conv_StringToName(SDK::FString(L"HealthValueText")).ComparisonIndex;
+    auto* TextCls = SDK::UTextBlock::StaticClass();
+    for (int32_t i = 0; i < SDK::UObject::GObjects->Num(); ++i) {
+        SDK::UObject* O = SDK::UObject::GObjects->GetByIndex(i);
+        if (O && O->Name.ComparisonIndex == s_NameIdx && O->IsA(TextCls)) return static_cast<SDK::UTextBlock*>(O);
+    }
+    return nullptr;
+}
+
+static std::wstring Commas(float V) {
+    std::wstring S = std::to_wstring(static_cast<long long>(V));
+    for (int i = static_cast<int>(S.size()) - 3; i > 0; i -= 3) S.insert(i, L",");
+    return S;
+}
+
+// Behemoths keep two ArchonHealthAttributeSets and only one drains on the client; the getters read the one that
+// stays full (0.2.15: bar never moved). So: the set with the lowest fraction, the getters only without any set.
+static bool ReadHealth(SDK::AArchonBehemoth* B, float& Hp, float& Max) {
+    float Best = 2.f;
+    auto* Asc = B->AbilitySystemComponent;
+    for (int32_t i = 0; Asc && i < Asc->SpawnedAttributes.Num(); ++i) {
+        SDK::UAttributeSet* S = Asc->SpawnedAttributes[i];
+        if (!S || !S->IsA(SDK::UArchonHealthAttributeSet::StaticClass())) continue;
+        auto* H = static_cast<SDK::UArchonHealthAttributeSet*>(S);
+        if (H->MaxHealth > 0.f && H->CurrentHealth / H->MaxHealth < Best) {
+            Best = H->CurrentHealth / H->MaxHealth;
+            Hp = H->CurrentHealth;
+            Max = H->MaxHealth;
+        }
+    }
+    if (Best <= 1.f) return true;
+    Hp = B->GetCurrentHealth();
+    Max = B->GetMaxHealth();
+    return Max > 0.f;
+}
+
+// A plain tinted box: no texture, drawn as Image. Fields one by one (TintColor holds a TSharedPtr). The texture
+// NAME and margins go too: with only the object cleared the fill kept faded ends (0.2.16).
+static void SolidBrush(SDK::FSlateBrush& B, const SDK::FLinearColor& Color) {
+    B.ResourceObject = nullptr;
+    B.ResourceName = SDK::FName();
+    B.Margin = SDK::FMargin{ 0.f, 0.f, 0.f, 0.f };
+    B.DrawAs = SDK::ESlateBrushDrawType::Image;
+    B.TintColor.SpecifiedColor = Color;
+    B.TintColor.ColorUseRule = SDK::ESlateColorStylingMode::UseColor_Specified;
+}
+
+// (X, Y) is the point given by Alignment on the widget, relative to the bottom-middle of the screen.
+static void Place(SDK::UUserWidget* W, float X, float Y, float Width, float Height, SDK::FVector2D Alignment) {
+    W->SetPositionInViewport(SDK::FVector2D{ X, Y }, false);
+    W->SetDesiredSizeInViewport(SDK::FVector2D{ Width, Height });
+    // SetPositionInViewport resets the anchors, so they go after it
+    W->SetAnchorsInViewport(SDK::FAnchors{ SDK::FVector2D{ 0.5f, 1.f }, SDK::FVector2D{ 0.5f, 1.f } });
+    W->SetAlignmentInViewport(Alignment);
+}
+
+static bool Create(SDK::APlayerController* PC) {
+    SDK::UClass* BarCls = LoadClass(s_BarClass, L"/Game/UI/EndOfHunt/StackableProgressBar.StackableProgressBar_C");
+    SDK::UClass* TextCls = LoadClass(s_TextClass, L"/Game/UI/Chat/w_chat_log_label_bpw.w_chat_log_label_bpw_C");
+    if (!BarCls || !TextCls) {
+        Log("widget class not loaded: bar=" + MpPtr(BarCls) + " text=" + MpPtr(TextCls));
+        return false;
+    }
+    auto* Bar = static_cast<SDK::UStackableProgressBar_C*>(SDK::UWidgetBlueprintLibrary::Create(PC, BarCls, PC));
+    if (!Bar || !Bar->ProgressBarComponent) {
+        Log("CreateWidget(StackableProgressBar) returned " + MpPtr(Bar));
+        return false;
+    }
+    SDK::UProgressBar* Fill = Bar->ProgressBarComponent;
+    if (Bar->BoostIconBarImage) Bar->BoostIconBarImage->SetVisibility(SDK::ESlateVisibility::Collapsed);
+    // The end-of-hunt screen gives this bar its images (no background of its own). Solid brushes, written before
+    // AddToViewport because Slate reads the style when it builds.
+    SolidBrush(Fill->WidgetStyle.FillImage, SDK::FLinearColor{ 1.f, 1.f, 1.f, 1.f });   // tinted by kFill
+    SolidBrush(Fill->WidgetStyle.BackgroundImage, kBack);
+    Fill->SetFillColorAndOpacity(kFill);
+    if (SDK::UPanelSlot* FillSlot = Fill->Slot) {
+        SDK::UPanelWidget* Box = FillSlot->Parent;
+        if (Box && Box->IsA(SDK::USizeBox::StaticClass())) {
+            static_cast<SDK::USizeBox*>(Box)->SetWidthOverride(kWidth);
+            static_cast<SDK::USizeBox*>(Box)->SetHeightOverride(kBarH);
+            SDK::UPanelSlot* BoxSlot = Box->Slot;
+            if (BoxSlot && BoxSlot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                auto* C = static_cast<SDK::UCanvasPanelSlot*>(BoxSlot);
+                C->SetAnchors(SDK::FAnchors{ SDK::FVector2D{ 0.f, 0.f }, SDK::FVector2D{ 0.f, 0.f } });
+                C->SetAlignment(SDK::FVector2D{ 0.f, 0.f });
+                C->SetAutoSize(false);
+                C->SetPosition(SDK::FVector2D{ 0.f, 0.f });
+                C->SetSize(SDK::FVector2D{ kWidth, kBarH });
+            }
+        }
+    }
+    // The blueprint's Construct (run by AddToViewport) applies its own ColourAndOpacity and lerps the fill from
+    // Startpercent with PercentLerpAnim (0.2.15: empty bar). Seed its variables, then stop the animation.
+    Bar->ColourAndOpacity = kFill;
+    Bar->Startpercent = 1.f;
+    Bar->FillPercent = 1.f;
+    Bar->AddToViewport(997);
+    Bar->StopAllAnimations();
+    Fill->SetFillColorAndOpacity(kFill);
+    Place(Bar, 0.f, kPosY, kWidth, kBarH, SDK::FVector2D{ 0.5f, 1.f });
+    Fill->SetPercent(1.f);
+    s_Bar.Set(Bar);
+
+    auto* Label = static_cast<SDK::Uw_chat_log_label_bpw_C*>(SDK::UWidgetBlueprintLibrary::Create(PC, TextCls, PC));
+    if (Label && Label->ChatLogLabelTextBlock) {
+        SDK::UTextBlock* Tb = Label->ChatLogLabelTextBlock;
+        if (SDK::UTextBlock* Hud = FindHudHealthText()) {   // field by field: the font info holds TSharedPtrs
+            Tb->Font.FontObject = Hud->Font.FontObject;
+            Tb->Font.TypefaceFontName = Hud->Font.TypefaceFontName;
+            Tb->Font.OutlineSettings = Hud->Font.OutlineSettings;
+            Tb->ShadowOffset = Hud->ShadowOffset;
+            Tb->ShadowColorAndOpacity = Hud->ShadowColorAndOpacity;
+        } else {
+            Log("HUD health number not found - default font");
+        }
+        // contrast on bright backgrounds (the HUD font alone washed out on snow): black outline and drop shadow
+        Tb->Font.OutlineSettings.OutlineSize = 2;
+        Tb->Font.OutlineSettings.OutlineColor = SDK::FLinearColor{ 0.f, 0.f, 0.f, 1.f };
+        Tb->Font.OutlineSettings.bApplyOutlineToDropShadows = true;
+        Tb->ShadowOffset = SDK::FVector2D{ 2.f, 2.f };
+        Tb->ShadowColorAndOpacity = SDK::FLinearColor{ 0.f, 0.f, 0.f, 0.8f };
+        Tb->ColorAndOpacity.SpecifiedColor = SDK::FLinearColor{ 1.f, 1.f, 1.f, 1.f };   // chat-label tint off
+        Tb->ColorAndOpacity.ColorUseRule = SDK::ESlateColorStylingMode::UseColor_Specified;
+        Tb->Font.Size = kTextSize;                           // before AddToViewport: Slate reads it when built
+        Label->AddToViewport(1000);
+        Tb->SetJustification(SDK::ETextJustify::Left);
+        // label's bottom-left sits on the bar's top-left, dipping into it
+        Place(Label, -kWidth / 2.f + kTextIndent, kPosY - kBarH + kTextOverlap, kWidth, kTextSize * 1.35f,
+            SDK::FVector2D{ 0.f, 1.f });
+        s_Label.Set(Label);
+    } else {
+        Log("CreateWidget(w_chat_log_label_bpw) returned " + MpPtr(Label) + " - bar without number");
+    }
+    s_LastText.clear();
+    s_Shown = true;
+    Log("bar created for " + PC->GetFullName());
+    return true;
+}
+
+static void SetShown(bool Show) {
+    if (s_Shown == Show) return;
+    s_Shown = Show;
+    const auto Vis = Show ? SDK::ESlateVisibility::HitTestInvisible : SDK::ESlateVisibility::Collapsed;
+    if (auto* Bar = s_Bar.Get<SDK::UUserWidget>()) Bar->SetVisibility(Vis);
+    if (auto* Label = s_Label.Get<SDK::UUserWidget>()) Label->SetVisibility(Vis);
+}
+
+static void Update() {
+    static const bool s_Disabled = MpExeRelativeFlagPresent(L"DISABLE_BEHEMOTH_HEALTH_BAR.flag");
+    if (s_Disabled) return;
+    static bool s_Started = false;
+    if (!s_Started) { s_Started = true; Log("update running"); }
+    const ULONGLONG Now = GetTickCount64();
+    if (Now < s_NextUpdate) return;
+    s_NextUpdate = Now + kUpdateMs;
+
+    SDK::UWorld* World = SDK::UWorld::GetWorld();
+    if (!World) return;
+    SDK::APlayerController* PC = SDK::UGameplayStatics::GetPlayerController(World, 0);
+    if (!PC) return;
+    if (PC != s_PC.Get()) {                    // new world: the old widgets went with the old one
+        s_PC.Set(PC);
+        s_Bar.Set(nullptr);
+        s_Label.Set(nullptr);
+        s_Target.Set(nullptr);
+        s_Behemoths.clear();
+        s_LastHp.clear();
+        s_NextScan = s_NextCreate = 0;
+    }
+
+    if (Now >= s_NextScan) {
+        s_NextScan = Now + kScanMs;
+        static auto* s_Actors = new SDK::TArray<SDK::AActor*>();   // engine-allocated storage, never freed (exit-safe)
+        SDK::UGameplayStatics::GetAllActorsOfClass(PC, SDK::AArchonBehemoth::StaticClass(), s_Actors);
+        s_Behemoths.clear();
+        for (int32_t i = 0; i < s_Actors->Num(); ++i) {
+            if ((*s_Actors)[i]) s_Behemoths.emplace_back().Set((*s_Actors)[i]);
+        }
+    }
+
+    // Only behemoths near the player count (none during the arrival intro): in range within kShowRange, and the
+    // one already shown stays until kHideRange. Of those: the one damaged last; else the shown one; else the nearest.
+    SDK::APawn* Pawn = PC->Pawn;
+    if (!Pawn) { SetShown(false); return; }
+    const SDK::FVector Me = Pawn->K2_GetActorLocation();
+    SDK::AArchonBehemoth* Current = s_Target.Get<SDK::AArchonBehemoth>();
+    SDK::AArchonBehemoth *Damaged = nullptr, *Nearest = nullptr;
+    float DamagedHp = 0.f, DamagedMax = 0.f, CurHp = 0.f, CurMax = 0.f, NearHp = 0.f, NearMax = 0.f;
+    float NearDist = 1e30f;
+    for (const Ref& R : s_Behemoths) {
+        auto* B = R.Get<SDK::AArchonBehemoth>();
+        float Hp = 0.f, Max = 0.f;
+        if (!B || !ReadHealth(B, Hp, Max)) continue;
+        auto It = s_LastHp.find(B);
+        if (It == s_LastHp.end()) Log(B->GetFullName() + " hp=" + std::to_string(Hp) + " max=" + std::to_string(Max));
+        const bool WasHit = It != s_LastHp.end() && Hp < It->second - 0.01f;
+        s_LastHp[B] = Hp;
+        if (Hp <= 0.f) continue;
+        const SDK::FVector At = B->K2_GetActorLocation();
+        const float Dx = At.X - Me.X, Dy = At.Y - Me.Y, Dz = At.Z - Me.Z;
+        const float Dist = std::sqrt(Dx * Dx + Dy * Dy + Dz * Dz);
+        if (Dist > (B == Current ? kHideRange : kShowRange)) continue;
+        if (WasHit) { Damaged = B; DamagedHp = Hp; DamagedMax = Max; }
+        if (B == Current) { CurHp = Hp; CurMax = Max; }
+        if (Dist < NearDist) { Nearest = B; NearDist = Dist; NearHp = Hp; NearMax = Max; }
+    }
+    SDK::AArchonBehemoth* Target = Damaged;
+    float TargetHp = DamagedHp, TargetMax = DamagedMax;
+    if (!Target && CurHp > 0.f) { Target = Current; TargetHp = CurHp; TargetMax = CurMax; }
+    if (!Target && Nearest) { Target = Nearest; TargetHp = NearHp; TargetMax = NearMax; }
+    s_Target.Set(Target);
+
+    if (!Target) { SetShown(false); return; }
+    if (!s_Bar.Get()) {
+        if (Now < s_NextCreate) return;
+        s_NextCreate = Now + kRetryMs;
+        if (!Create(PC)) return;
+    }
+    SetShown(true);
+    auto* Bar = s_Bar.Get<SDK::UStackableProgressBar_C>();
+    if (!Bar) return;
+    float Pct = TargetHp / TargetMax;
+    Pct = Pct < 0.f ? 0.f : (Pct > 1.f ? 1.f : Pct);
+    // compared with the widget's own value, so anything else moving the fill gets put back
+    if (Bar->ProgressBarComponent && std::fabs(Pct - Bar->ProgressBarComponent->Percent) >= 0.0005f) {
+        Bar->ProgressBarComponent->SetPercent(Pct);
+    }
+    std::wstring Text = Commas(std::ceil(TargetHp)) + L"/" + Commas(std::floor(TargetMax + 0.5f));
+    auto* Label = s_Label.Get<SDK::Uw_chat_log_label_bpw_C>();
+    if (Label && Label->ChatLogLabelTextBlock && Text != s_LastText) {
+        Label->ChatLogLabelTextBlock->SetText(SDK::UKismetTextLibrary::Conv_StringToText(SDK::FString(Text.c_str())));
+        s_LastText = Text;
+        Log("shows " + std::string(Text.begin(), Text.end()));
+    }
+}
+
+// SEH around Update (no C++ objects in this function, so __try is allowed): a fault turns the bar off for the
+// session instead of taking the game down.
+static void UpdateGuarded() {
+    if (s_Faulted) return;
+    __try {
+        Update();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        s_Faulted = true;
+    }
+}
+
+static void Tick() {
+    if (Globals::AmServer) return;
+    UpdateGuarded();
+    static bool s_FaultLogged = false;
+    if (s_Faulted && !s_FaultLogged) {
+        s_FaultLogged = true;
+        MpLog("[BehemothHealthBar] fault in update - bar off for this session");
+    }
+}
+
+}  // namespace BehemothHealthBar
+
 void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender) {
     if (GameEngine != nullptr && g_GameEnginePtr == nullptr) {
         g_GameEnginePtr = GameEngine;
@@ -4996,6 +5366,8 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
     }
 
     if (Globals::Listening) {
+        MpTickPartyRestartHold();
+
         // [1.12.0 player-host roster gate] Keep ExpectedPlayerCount synchronized with the
         // concrete launch roster. The previous blanket zero forced a two-player hunt to enter
         // InProgress as soon as P1 arrived; an SDR joiner arriving a few seconds later then hit
@@ -9247,6 +9619,37 @@ static bool s_AirshipHUDCompatHidden = false;
 // `!s_ArchonInputActivated && PC && !DiagNaturalMode()`
 // gate — this function does not re-check it, only the internal reentrancy guard
 // (s_ArchonInputActivated = true, set before any ProcessEvent call, same ordering as before).
+
+// [1.14.7 HUD-in-arrival FIX 2026-10-13] Measured 13 Oct 22:21: the hunt arrival beam keeps the pawn in
+// MOVE_Custom (CharacterMovement +0x168 == 6) for ~16 s and the game collapses the gameplay HUD for it.
+// SetCinematicMode(false) at the 3 s travel-settle point re-showed the HUD 14 s early (HUDTrace 1 -> 3 at
+// 22:21:32.534, natural end 22:21:46.930). While the beam runs the clear is deferred to the beam's end
+// (K2_OnMovementModeChanged 6 -> other, ProcessEventClientHook), which still unsticks input afterwards.
+static UObject* s_CinematicClearAfterArrivalPC = nullptr;
+
+static bool LocalPawnInArrivalBeam(UObject* PC) {
+    const uintptr_t Pawn = SafeReadPtr(reinterpret_cast<uintptr_t>(PC), 0x0250);      // APlayerController pawn
+    const uintptr_t CharMove = Pawn ? SafeReadPtr(Pawn, 0x0288) : 0;                    // ACharacter::CharacterMovement
+    return CharMove && SafeReadByte(CharMove, 0x0168, 0xEE) == 6;                       // MovementMode == MOVE_Custom
+}
+
+static void CallSetCinematicModeFalse(UObject* PC) {
+    static UFunction* s_Fn = nullptr;
+    if (!s_Fn) {
+        s_Fn = PC->Class->GetFunction("PlayerController", "SetCinematicMode");
+        MpLog(std::string("[ArchonInputActivate] Resolve SetCinematicMode → ") + MpPtr(s_Fn));
+    }
+    if (!s_Fn) return;
+    struct {
+        bool bInCinematicMode;
+        bool bHidePlayer;
+        bool bAffectsHUD;
+        bool bAffectsMovement;
+        bool bAffectsTurning;
+    } cineParms = { false, false, false, false, false };
+    reinterpret_cast<void(*)(UObject*, UFunction*, void*)>(OrigProcessEventClient)(PC, s_Fn, &cineParms);
+}
+
 void TriggerArchonInputActivation(UObject* PC, const char* TriggerLabel, bool AllowCinematicClear) {
     uint8_t onlineReady = SafeReadByte(reinterpret_cast<uintptr_t>(PC), 0xC69, 0xEE);
 
@@ -9364,7 +9767,6 @@ void TriggerArchonInputActivation(UObject* PC, const char* TriggerLabel, bool Al
     // Same pattern for SetIgnoreLookInput.
     static UFunction* s_ResetIgnoreMoveInputFn = nullptr;
     static UFunction* s_ResetIgnoreLookInputFn = nullptr;
-    static UFunction* s_SetCinematicModeFn    = nullptr;
     if (!s_ResetIgnoreMoveInputFn) {
         s_ResetIgnoreMoveInputFn = PC->Class->GetFunction("Controller", "ResetIgnoreMoveInput");
         MpLog(std::string("[ArchonInputActivate] Resolve ResetIgnoreMoveInput → ")
@@ -9374,11 +9776,6 @@ void TriggerArchonInputActivation(UObject* PC, const char* TriggerLabel, bool Al
         s_ResetIgnoreLookInputFn = PC->Class->GetFunction("Controller", "ResetIgnoreLookInput");
         MpLog(std::string("[ArchonInputActivate] Resolve ResetIgnoreLookInput → ")
             + MpPtr(s_ResetIgnoreLookInputFn));
-    }
-    if (!s_SetCinematicModeFn) {
-        s_SetCinematicModeFn = PC->Class->GetFunction("PlayerController", "SetCinematicMode");
-        MpLog(std::string("[ArchonInputActivate] Resolve SetCinematicMode → ")
-            + MpPtr(s_SetCinematicModeFn));
     }
     if (s_ResetIgnoreMoveInputFn) {
         reinterpret_cast<void(*)(UObject*, UFunction*, void*)>(OrigProcessEventClient)(
@@ -9395,27 +9792,23 @@ void TriggerArchonInputActivation(UObject* PC, const char* TriggerLabel, bool Al
     // survived the travel-settle interval. The timeout fallback may restore input, but it must not
     // tell an unfinished map that its arrival/loading presentation has completed.
     UObject* StableCinematicPawn = nullptr;
+    const bool InArrivalBeam = LocalPawnInArrivalBeam(PC);
     const bool CanClearCinematic = AllowCinematicClear
         && s_NaturalInputModeChangedObserved
         && IsClientRolePumpPossessionStable(PC, &StableCinematicPawn);
-    if (s_SetCinematicModeFn && CanClearCinematic) {
-        struct {
-            bool bInCinematicMode;
-            bool bHidePlayer;
-            bool bAffectsHUD;
-            bool bAffectsMovement;
-            bool bAffectsTurning;
-        } cineParms = { false, false, false, false, false };
-        reinterpret_cast<void(*)(UObject*, UFunction*, void*)>(OrigProcessEventClient)(
-            PC, s_SetCinematicModeFn, &cineParms);
+    if (CanClearCinematic && !InArrivalBeam) {
+        CallSetCinematicModeFalse(PC);
         MpLog("[ArchonInputActivate] Called APlayerController::SetCinematicMode(false, ...) after stable natural input edge");
     }
-    else if (s_SetCinematicModeFn) {
+    else {
+        if (CanClearCinematic) s_CinematicClearAfterArrivalPC = PC;
         MpLog(std::string("[ArchonInputActivate] SKIP SetCinematicMode(false) trigger=")
             + TriggerLabel
             + " allow=" + std::to_string(AllowCinematicClear ? 1 : 0)
             + " naturalInputEdge=" + std::to_string(s_NaturalInputModeChangedObserved ? 1 : 0)
-            + " stablePossession=" + std::to_string(CanClearCinematic ? 1 : 0));
+            + " stablePossession=" + std::to_string(CanClearCinematic ? 1 : 0)
+            + " arrivalBeam=" + std::to_string(InArrivalBeam ? 1 : 0)
+            + (CanClearCinematic ? " (deferred to arrival end)" : ""));
     }
 
     // [1.12 InputConfigCascade — 2026-07-10 — Analysis.md + move.md]
@@ -10810,6 +11203,62 @@ static bool MpIsPhantomThatMayNotRestart(void* Controller) {
         && reinterpret_cast<SDK::UObject*>(Player)->IsA(SDK::ULocalPlayer::StaticClass());
 }
 
+// [1.14.7 PARTY ARRIVAL FIX 2026-10-13] The arrival beam is server-timed per pawn: it starts when the
+// server restarts the player. Measured 13 Oct 21:53 (port 8780, roster of 2): party members connected 12 s
+// apart (load-time difference after a synchronized Go Now) and the first pawn finished its beam before the
+// second one spawned, so neither intro showed the other slayer. Hold every launch-roster player pawn-less
+// (PlayerCanRestart -> false) until the whole roster has asked, then restart them together.
+// ponytail: fixed 40 s cap so a member who never loads cannot strand the party; DISABLE_PARTY_ARRIVAL_HOLD.flag reverts.
+static constexpr uint64_t kPartyArrivalHoldMaxMs = 40000;
+static std::vector<void*> s_PartyHeldControllers;
+static UObject* s_PartyHoldGameMode = nullptr;
+static uint64_t s_PartyHoldStartMs = 0;
+static bool s_PartyHoldDone = false;
+
+static bool MpHoldRestartForParty(UObject* GameMode, void* Controller) {
+    if (s_PartyHoldDone || !Globals::AmServer) return false;
+    if (!Controller || SafeReadPtr(reinterpret_cast<uintptr_t>(Controller), 0x418) == 0) return false;   // remote players only
+    const int Roster = LaunchExpectedPlayerCount();
+    if (Roster < 2 || MpExeRelativeFlagPresent(L"DISABLE_PARTY_ARRIVAL_HOLD.flag")) {
+        s_PartyHoldDone = true;
+        return false;
+    }
+    if (std::find(s_PartyHeldControllers.begin(), s_PartyHeldControllers.end(), Controller) == s_PartyHeldControllers.end()) {
+        s_PartyHeldControllers.push_back(Controller);
+        MpLog("[PartyArrival] player " + std::to_string(s_PartyHeldControllers.size()) + "/" + std::to_string(Roster)
+            + " ready pc=" + MpPtr(Controller));
+    }
+    if (s_PartyHoldStartMs == 0) s_PartyHoldStartMs = GetTickCount64();
+    s_PartyHoldGameMode = GameMode;
+    if (static_cast<int>(s_PartyHeldControllers.size()) >= Roster) {
+        s_PartyHoldDone = true;   // this caller restarts natively; the tick restarts the earlier ones
+        return false;
+    }
+    return true;
+}
+
+// Server game thread (GameEngineTickHook). Restarts the held players once the roster is complete or the cap expires.
+static void MpTickPartyRestartHold() {
+    if (s_PartyHeldControllers.empty()) return;
+    const uint64_t Waited = GetTickCount64() - s_PartyHoldStartMs;
+    if (!s_PartyHoldDone && Waited < kPartyArrivalHoldMaxMs) return;
+    s_PartyHoldDone = true;
+
+    UObject* GameMode = s_PartyHoldGameMode;
+    UFunction* RestartFn = (GameMode && IsRegisteredLiveObject(GameMode))
+        ? GameMode->Class->GetFunction("GameModeBase", "RestartPlayer") : nullptr;
+    MpLog("[PartyArrival] releasing " + std::to_string(s_PartyHeldControllers.size()) + " player(s) after "
+        + std::to_string(Waited) + "ms" + (RestartFn ? "" : " - RestartPlayer NOT resolved"));
+    for (void* Controller : s_PartyHeldControllers) {
+        if (!RestartFn || !IsRegisteredLiveObject(Controller)) continue;
+        if (SafeReadPtr(reinterpret_cast<uintptr_t>(Controller), 0x0250) != 0) continue;   // already has a pawn
+        struct { void* NewPlayer; } Parms = { Controller };
+        const bool Ok = SafeProcessEventRaw(GameMode, RestartFn, &Parms);
+        MpLog("[PartyArrival] RestartPlayer pc=" + MpPtr(Controller) + (Ok ? " ok" : " FAULTED"));
+    }
+    s_PartyHeldControllers.clear();
+}
+
 static bool MpDestroyActorByName(void* Actor) {
     static UFunction* s_fn = nullptr;
     static bool s_tried = false;
@@ -11444,6 +11893,61 @@ static const std::string& CachedFunctionFullName(UFunction* Function) {
     return Slot.Name;
 }
 
+// [1.14.7 2026-10-14 HUNTPASS PROBE] Hunt Pass screen shows "Service not available" (UHuntingPassScreen
+// ::bIsServiceHealthy false?) and Unlock/Claim are dead, with no backend request at all. Read-only: logs which
+// hunt pass UFunctions run, and on a throttle the screen flag, its view model and the player's
+// UHuntPassComponent state. HUNTPASS_PROBE.flag (beside the exe) enables it.
+static void MpHuntPassProbe(UObject* Object, const std::string& FunctionName) {
+    static const bool s_on = MpExeRelativeFlagPresent(L"HUNTPASS_PROBE.flag");
+    if (!s_on) return;
+    // Server: no screen, and the component is filled by native code, so run on any function (throttled)
+    // and log only when a component's state changes.
+    const bool Server = Globals::AmServer;
+    if (!Server && FunctionName.find("HuntingPass") == std::string::npos && FunctionName.find("HuntPass") == std::string::npos) return;
+    static std::unordered_map<std::string, int> s_seen;
+    if (FunctionName.find("HuntPass") != std::string::npos || FunctionName.find("HuntingPass") != std::string::npos) {
+        int& Count = s_seen[FunctionName];
+        if (Count++ < 3) MpLog("[HuntPassProbe] fn=" + FunctionName + " obj=" + MpPtr(Object));
+    }
+    static ULONGLONG s_last = 0;
+    const ULONGLONG Now = GetTickCount64();
+    if (Now - s_last < (Server ? 3000u : 1500u)) return;
+    s_last = Now;
+    static std::unordered_map<const void*, std::string> s_lastComp;
+    for (int i = 0, N = SDK::UObject::GObjects->Num(); i < N; i++) {
+        SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+        if (!Obj || Obj->IsDefaultObject()) continue;
+        if (!Server && Obj->IsA(SDK::UHuntingPassScreen::StaticClass())) {
+            auto* S = static_cast<SDK::UHuntingPassScreen*>(Obj);
+            auto* VM = S->HuntingPassViewModel;
+            std::string Vm = "vm=null";
+            if (VM && IsReadablePointer(VM, 0xEA0)) {
+                Vm = "vm=" + MpPtr(VM) + " levels=" + std::to_string(VM->Levels.Num())
+                    + " level=" + std::to_string(VM->CurrentLevel)
+                    + " hasStoreData=" + std::to_string(VM->bHasStoreData)
+                    + " ownsElite=" + std::to_string(VM->bOwnsElite)
+                    + " locked=" + std::to_string(VM->bIsLocked)
+                    + " isMain=" + std::to_string(VM->bIsMainHuntPass)
+                    + " track='" + VM->ProgressionTrack.ToString() + "'"
+                    + " eliteSku='" + VM->BuyEliteSKU.ToString() + "'"
+                    + " storeTag='" + VM->StoreDataTag.ToString() + "'";
+            }
+            MpLog("[HuntPassProbe] screen=" + MpPtr(S) + " serviceHealthy=" + std::to_string(S->bIsServiceHealthy) + " " + Vm);
+        } else if (Obj->IsA(SDK::UHuntPassComponent::StaticClass())) {
+            auto* C = static_cast<SDK::UHuntPassComponent*>(Obj);
+            const std::string Line = "main='" + C->MainHuntPassId.ToString()
+                + "' selected='" + C->SelectedHuntPassId.ToString()
+                + "' activeData=" + std::to_string(C->ActiveHuntPassData.Num())
+                + " replicated=" + std::to_string(C->bReplicated)
+                + " refresh=" + std::to_string(C->RefreshCount)
+                + " selectedActive=" + std::to_string(C->bSelectedPassActive)
+                + " owner=" + (C->Outer ? C->Outer->GetName() : std::string("?"));
+            std::string& Prev = s_lastComp[C];
+            if (Prev != Line) { Prev = Line; MpLog("[HuntPassProbe] component=" + MpPtr(C) + " " + Line); }
+        }
+    }
+}
+
 void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     g_clientProcessEventCount.fetch_add(1, std::memory_order_relaxed);
     if (g_clientGameThreadId.load(std::memory_order_relaxed) == 0) {
@@ -11502,6 +12006,7 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     */
 
     const std::string& FunctionName = CachedFunctionFullName(Function);
+    MpHuntPassProbe(Object, FunctionName);
 
     // Player-host joins can complete the UE handshake and PostLogin, then be rejected by
     // the client during its first travel/replication frame.  The normal UE diagnostics are
@@ -11893,6 +12398,13 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     if (FunctionName.find("PressStart") != std::string::npos) {
         PressStartBranding::OnPressStartEvent(Object, FunctionName);
     }
+    // Top-level calls on the game thread only (not from inside another ProcessEvent); self-throttles to 10 Hz.
+    // Depth is thread_local, so worker threads (anim/task graph) also see depth 1: crash #5 was the actor scan and
+    // UMG calls running on a task-graph worker while the game thread mutated the same objects.
+    if (s_processEventDepthClient == 1
+        && GetCurrentThreadId() == g_clientGameThreadId.load(std::memory_order_relaxed)) {
+        BehemothHealthBar::Tick();
+    }
 
     if (IsAccessoryUnlockDiagFn) {
         static std::atomic<int> s_accessoryUnlockDiagCount{ 0 };
@@ -12205,6 +12717,18 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
         uint8_t next = SafeReadByte(reinterpret_cast<uintptr_t>(Parms), 1, 0xEE);
         MpLog(std::string("[K2_OnMovementModeChanged] obj=") + (Object ? Object->GetFullName() : "null")
             + " prev=" + std::to_string(prev) + " new=" + std::to_string(next));
+        // Arrival beam over for the local pawn: run the cinematic clear deferred by TriggerArchonInputActivation.
+        UObject* DeferredPC = s_CinematicClearAfterArrivalPC;
+        if (DeferredPC && prev == 6 && next != 6) {
+            if (!IsRegisteredLiveObject(DeferredPC)) {
+                s_CinematicClearAfterArrivalPC = nullptr;
+            }
+            else if (SafeReadPtr(reinterpret_cast<uintptr_t>(DeferredPC), 0x0250) == reinterpret_cast<uintptr_t>(Object)) {
+                s_CinematicClearAfterArrivalPC = nullptr;
+                CallSetCinematicModeFalse(DeferredPC);
+                MpLog("[ArchonInputActivate] Called APlayerController::SetCinematicMode(false, ...) at arrival end");
+            }
+        }
     }
 
     // [1.12 AxisNonZero — 2026-07-10] Diagnostic: log any axis event with non-zero
@@ -13959,6 +14483,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     static UFunction* OnPostMitDealtAnyDamage = nullptr;
 
     std::string FunctionName = Function ? Function->GetFullName() : "null";
+    MpHuntPassProbe(Object, FunctionName);
 
     // [1.14.7 HEADLESS AUDIO 2026-10-03] A dedicated hub must not play sound. Removing the Wwise
     // output device crashes the process (measured: EXCEPTION_ACCESS_VIOLATION writing 0x...a4, round
@@ -15051,6 +15576,11 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
                 return;
             }
 
+            if (MpHoldRestartForParty(Object, PlayerObj)) {
+                *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(Parms) + 0x8) = false;
+                return; // restarted by MpTickPartyRestartHold
+            }
+
             // Always force PlayerCanRestart -> true (safe for all PC types)
             *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(Parms) + 0x8) = true;
 
@@ -15391,6 +15921,71 @@ static void InstallHuntPassClaimGuard() {
     MpLog(std::string("[HuntPassClaimGuard] (+0x1F69E20) create=") + MH_StatusToString(C) + " enable=" + MH_StatusToString(E));
 }
 
+// [1.14.7 FORCED FEATURE FLAGS 2026-10-14] Seasonal Ramsgate dressing (city_01_event_frostfall etc.) is a
+// sublevel gated by a blueprint feature flag (enable_city_event_frostfall_bpff_C), and Features.json is never
+// read by the exe. Every flag query funnels through two natives (located from the FeatureFlagBlueprintLibrary
+// native table): IsFeatureEnabled(ctx, FeatureClass, verbose) +0xE9F090 (BP, WorldContext via +0xE9F520) and
+// IsLocalFeatureEnabled(FeatureClass) +0xE9F530; both read FeatureCDO->vtable[+0x270]. Hooked at init so the
+// answer is right before Ramsgate's BeginPlay. Class names come from FORCE_FEATURE_FLAGS.txt beside the exe,
+// one per line; no file (or an empty one) installs nothing.
+static std::vector<std::string> g_ForcedFeatureFlags;
+static std::unordered_map<void*, bool> g_ForcedFeatureCache;   // FeatureClass -> forced?
+static SRWLOCK g_ForcedFeatureLock = SRWLOCK_INIT;
+static void* OrigIsFeatureEnabled = nullptr;
+static void* OrigIsLocalFeatureEnabled = nullptr;
+
+static bool MpFeatureForced(void* FeatureClass) {
+    if (!FeatureClass) return false;
+    AcquireSRWLockShared(&g_ForcedFeatureLock);
+    auto It = g_ForcedFeatureCache.find(FeatureClass);
+    const bool Known = It != g_ForcedFeatureCache.end();
+    const bool Cached = Known && It->second;
+    ReleaseSRWLockShared(&g_ForcedFeatureLock);
+    if (Known) return Cached;
+    const std::string Name = reinterpret_cast<SDK::UObject*>(FeatureClass)->GetName();
+    const bool Forced = std::find(g_ForcedFeatureFlags.begin(), g_ForcedFeatureFlags.end(), Name) != g_ForcedFeatureFlags.end();
+    AcquireSRWLockExclusive(&g_ForcedFeatureLock);
+    g_ForcedFeatureCache[FeatureClass] = Forced;
+    ReleaseSRWLockExclusive(&g_ForcedFeatureLock);
+    if (Forced) MpLog("[ForceFeature] forcing " + Name + " on");
+    return Forced;
+}
+
+static bool IsFeatureEnabledForceHook(void* Ctx, void* FeatureClass, bool Verbose) {
+    if (MpFeatureForced(FeatureClass)) return true;
+    return reinterpret_cast<bool(*)(void*, void*, bool)>(OrigIsFeatureEnabled)(Ctx, FeatureClass, Verbose);
+}
+
+static bool IsLocalFeatureEnabledForceHook(void* FeatureClass) {
+    if (MpFeatureForced(FeatureClass)) return true;
+    return reinterpret_cast<bool(*)(void*)>(OrigIsLocalFeatureEnabled)(FeatureClass);
+}
+
+static void InstallFeatureFlagForce() {
+    wchar_t ExePath[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, ExePath, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    std::wstring Path(ExePath, n);
+    Path = Path.substr(0, Path.find_last_of(L"\\/") + 1) + L"FORCE_FEATURE_FLAGS.txt";
+    std::ifstream In(Path);
+    for (std::string Line; std::getline(In, Line);) {
+        Line.erase(std::remove_if(Line.begin(), Line.end(), [](unsigned char C) { return std::isspace(C); }), Line.end());
+        if (!Line.empty() && Line[0] != '#') g_ForcedFeatureFlags.push_back(Line);
+    }
+    if (g_ForcedFeatureFlags.empty()) return;
+    struct { uintptr_t Rva; void* Detour; void** Orig; const char* Name; } Hooks[] = {
+        { 0x00E9F090, reinterpret_cast<void*>(IsFeatureEnabledForceHook), &OrigIsFeatureEnabled, "IsFeatureEnabled" },
+        { 0x00E9F530, reinterpret_cast<void*>(IsLocalFeatureEnabledForceHook), &OrigIsLocalFeatureEnabled, "IsLocalFeatureEnabled" },
+    };
+    for (auto& H : Hooks) {
+        void* Target = reinterpret_cast<void*>(Globals::BaseAddress + H.Rva);
+        const MH_STATUS C = MH_CreateHook(Target, H.Detour, H.Orig);
+        const MH_STATUS E = C == MH_OK ? MH_EnableHook(Target) : C;
+        MpLog(std::string("[ForceFeature] ") + H.Name + " create=" + MH_StatusToString(C) + " enable=" + MH_StatusToString(E));
+    }
+    for (const auto& F : g_ForcedFeatureFlags) MpLog("[ForceFeature] listed " + F);
+}
+
 void InitClientHooks() {
     MH_STATUS InitStatus = MH_Initialize();
     MpLog(std::string("[InitClientHooks] MH_Initialize=") + MH_StatusToString(InitStatus));
@@ -15406,6 +16001,7 @@ void InitClientHooks() {
         + MH_StatusToString(ClientCloseCreate) + " enable=" + MH_StatusToString(ClientCloseEnable));
     InstallLoadMapDiagHooks();
     InstallHuntPassClaimGuard();
+    InstallFeatureFlagForce();
 
     // [1.12.0 FIX 2026-07-10] Client-side HasFinishedLoading hook re-enabled.
     // Root cause of frozen initial loading screen despite successful ClientRestart:
@@ -19222,6 +19818,14 @@ static void LoadCompleteProbeHook(void* Component) {
             + " gameInstance+0x6d0=" + std::to_string(SeasonField));
     }
     if (OrigLoadComplete) OrigLoadComplete(Component);
+    // [2026-10-14] State after the game's own LoadComplete: does it fill ActiveHuntPassData?
+    if (Seq < 8 && Component && IsReadablePointer(Component, 0x250)) {
+        auto* C = static_cast<SDK::UHuntPassComponent*>(Component);
+        MpLog("[LoadCompleteProbe] after seq=" + std::to_string(Seq)
+            + " main='" + C->MainHuntPassId.ToString()
+            + "' selected='" + C->SelectedHuntPassId.ToString()
+            + "' activeData=" + std::to_string(C->ActiveHuntPassData.Num()));
+    }
 }
 
 static void InstallLoadCompleteProbe() {
@@ -20922,6 +21526,9 @@ void InitServerHooks() {
 
     // [1.14.7 confirmed Training crash] UInteractionCalloutWidget::OnSetDisabled dereferences a null
     // InteractionHint (widget+0x3A8) on a headless server. Guarded, original preserved when bound.
+    // [2026-10-14] LoadComplete is a void(UHuntPassComponent*) member (its caller ignores a result); only the
+    // diagnostic flag installs it, server role only.
+    if (Globals::AmServer && MpExeRelativeFlagPresent(L"HUNTPASS_PROBE.flag")) InstallLoadCompleteProbe();
     InstallInteractionCalloutSetDisabledGuard();
 
     // [1.14.7 2026-10-08] The rest of the UInteractionCalloutWidget family (8 Oct hunt crash at +0x1E3EB23) and
@@ -20929,6 +21536,7 @@ void InitServerHooks() {
     InstallInteractionCalloutClassGuards();
     InstallServerCrashWaitBound();
     InstallInventoryRefreshGuard();
+    InstallFeatureFlagForce();
 
     // [1.14.7] Old +0x0243A310 lands on the final byte of a CALL instruction; never detour it.
     MpLog("[InitServerHooks] native GetCommandLine hook skipped (1.14.7 target is mid-instruction)");

@@ -187,6 +187,7 @@
     <ClCompile Include="SDK\BP_PlayerCharacter_functions.cpp" />
     <ClCompile Include="SDK\CoreUObject_functions.cpp" />
     <ClCompile Include="SDK\Engine_functions.cpp" />
+    <ClCompile Include="SDK\UMG_functions.cpp" />
     <ClCompile Include="SDK\GameplayAbilities_functions.cpp" />
     <ClCompile Include="SDK\island_arrival_cinematic_trigger_bp_functions.cpp" />
   </ItemGroup>
