@@ -23,7 +23,9 @@ test("staff only act on lower ranks, never themselves or peers", () => {
 test("staff name tag round-trips", () => {
     assert.equal(StaffNameTag(["player", "admin", "owner"]), "[Owner] ");
     assert.equal(StaffNameTag(["admin"]), "[Admin] ");
-    assert.equal(StaffNameTag(["moderator"]), "");
+    assert.equal(StaffNameTag(["moderator"]), "[Mod] ");
+    assert.equal(StaffNameTag(["player", "tester"]), "");
+    assert.equal(StripStaffNameTag("[Mod] Someone"), "Someone");
     assert.equal(StripStaffNameTag("[Owner] Hyjinnx"), "Hyjinnx");
     assert.equal(StripStaffNameTag("Hyjinnx"), "Hyjinnx");
 });

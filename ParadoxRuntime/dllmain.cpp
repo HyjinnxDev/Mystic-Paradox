@@ -5264,20 +5264,26 @@ static void Tick() {
 
 }  // namespace BehemothHealthBar
 
-// [1.14.7 2026-10-15] Staff nameplates. The backend prefixes server owners' and admins' names with "[Owner] " /
-// "[Admin] " (ParadoxBackend security/staffRoles.ts StaffNameTag), which is what chat and the nameplate show. Here
-// the nameplate is styled by that prefix: owners get pulsing gold text with an orange glow and a "Server Owner"
-// title line, with "[Owner] " taken off the plate (chat keeps it); admins plain light-blue text. Client only, game thread, from ProcessEventClientHook like the
-// behemoth bar. DISABLE_STAFF_NAMEPLATES.flag beside the exe turns it off.
+// [1.14.7 2026-10-15] Staff nameplates. The backend prefixes staff names with "[Owner] " / "[Admin] " / "[Mod] "
+// (ParadoxBackend security/staffRoles.ts StaffNameTag), which is what chat and the nameplate show. Here the prefix
+// comes off the nameplate (chat keeps it) and a title line under the name says the role instead: "Server Owner"
+// in legendary orange with the name pulsing gold and glowing; "Server Admin" / "Server Moderator" in the plate's
+// own text style. Client only, game thread, from ProcessEventClientHook like the behemoth bar.
+// DISABLE_STAFF_NAMEPLATES.flag beside the exe turns it off.
 // ponytail: re-reads plate text every kScanMs; hook UNamePlatesWidget::UpdateName instead if that ever costs.
 namespace StaffNameplates {
 
 using BehemothHealthBar::Ref;
-enum class Tier { None, Admin, Owner };
-struct Plate { Ref W; Tier T = Tier::None; std::string Name; };   // Name: owner plate text after stripping
+enum class Tier { None, Mod, Admin, Owner };
+struct TierInfo { Tier T; const char* Prefix; const wchar_t* Title; const char* LogName; };
+static const TierInfo kTiers[] = {
+    { Tier::Owner, "[Owner] ", L"Server Owner", "owner" },
+    { Tier::Admin, "[Admin] ", L"Server Admin", "admin" },
+    { Tier::Mod, "[Mod] ", L"Server Moderator", "moderator" },
+};
+struct Plate { Ref W; const TierInfo* Info = nullptr; std::string Name; };   // Name: plate text after stripping
 
 constexpr ULONGLONG kTickMs = 100, kScanMs = 1000;
-static const SDK::FLinearColor kAdmin{ 0.35f, 0.72f, 1.f, 1.f };
 static const SDK::FLinearColor kOwnerLo{ 1.f, 0.62f, 0.08f, 1.f }, kOwnerHi{ 1.f, 0.9f, 0.45f, 1.f };
 static const SDK::FLinearColor kOwnerGlow{ 0.95f, 0.3f, 0.f, 1.f };
 static const SDK::FLinearColor kOwnerTitle{ 1.f, 0.5f, 0.05f, 1.f };   // legendary orange
@@ -5298,22 +5304,18 @@ static void SetColor(SDK::UTextBlock* Tb, const SDK::FLinearColor& C) {
     Tb->SetColorAndOpacity(S);
 }
 
-// One-time look per plate when its tier is first seen: owner gets the glow outline and the title line.
-static void Decorate(SDK::UNamePlatesWidget* W, Tier T) {
-    SDK::UTextBlock* Name = W->TextBlock_Name;
-    if (!Name) return;
-    if (T == Tier::Owner) {
-        SDK::FSlateFontInfo F = Name->Font;          // copied bitwise; SetFont copies it natively
+// One-time look per plate when its tier is first seen: the title line, plus the owner's glow.
+static void Decorate(SDK::UNamePlatesWidget* W, const TierInfo& Info) {
+    if (Info.T == Tier::Owner) {
+        SDK::FSlateFontInfo F = W->TextBlock_Name->Font;   // copied bitwise; SetFont copies it natively
         F.OutlineSettings.OutlineSize = 2;
         F.OutlineSettings.OutlineColor = kOwnerGlow;
-        Name->SetFont(F);
-        if (SDK::UTextBlock* Title = W->TextBlock_Title) {
-            Title->SetText(SDK::UKismetTextLibrary::Conv_StringToText(SDK::FString(L"Server Owner")));
-            SetColor(Title, kOwnerTitle);
-            Title->SetVisibility(SDK::ESlateVisibility::HitTestInvisible);
-        }
-    } else {
-        SetColor(Name, kAdmin);
+        W->TextBlock_Name->SetFont(F);
+    }
+    if (SDK::UTextBlock* Title = W->TextBlock_Title) {
+        Title->SetText(SDK::UKismetTextLibrary::Conv_StringToText(SDK::FString(Info.Title)));
+        if (Info.T == Tier::Owner) SetColor(Title, kOwnerTitle);
+        Title->SetVisibility(SDK::ESlateVisibility::HitTestInvisible);
     }
 }
 
@@ -5342,26 +5344,29 @@ static void Update() {
             if (!W || !W->TextBlock_Name) continue;
             const std::string Text = SDK::UKismetTextLibrary::Conv_TextToString(W->TextBlock_Name->GetText()).ToString();
             auto Old = std::find_if(s_Plates.begin(), s_Plates.end(), [&](const Plate& P) { return P.W.Get() == W; });
-            Tier T = Tier::None;
+            const TierInfo* Info = nullptr;
             std::string Name;
-            if (Text.rfind("[Owner] ", 0) == 0) {          // new plate, or the game re-set the name: strip again
-                T = Tier::Owner;
-                Name = Text.substr(8);
-                SetName(W->TextBlock_Name, Name);
-            } else if (Old != s_Plates.end() && Old->T == Tier::Owner && Text == Old->Name) {
-                T = Tier::Owner;                             // already stripped
-                Name = Text;
-            } else if (Text.rfind("[Admin]", 0) == 0) {
-                T = Tier::Admin;
+            for (const TierInfo& Ti : kTiers) {
+                const size_t Len = std::strlen(Ti.Prefix);
+                if (Text.compare(0, Len, Ti.Prefix) == 0) {  // new plate, or the game re-set the name: strip again
+                    Info = &Ti;
+                    Name = Text.substr(Len);
+                    SetName(W->TextBlock_Name, Name);
+                    break;
+                }
             }
-            if (T == Tier::None) continue;
-            if (Old == s_Plates.end() || Old->T != T) {
-                Decorate(W, T);
-                Log(std::string(T == Tier::Owner ? "owner" : "admin") + " plate " + W->GetFullName());
+            if (!Info && Old != s_Plates.end() && Text == Old->Name) {   // already stripped
+                Info = Old->Info;
+                Name = Text;
+            }
+            if (!Info) continue;
+            if (Old == s_Plates.end() || Old->Info != Info) {
+                Decorate(W, *Info);
+                Log(std::string(Info->LogName) + " plate " + W->GetFullName());
             }
             Next.push_back(Plate{});
             Next.back().W.Set(W);
-            Next.back().T = T;
+            Next.back().Info = Info;
             Next.back().Name = Name;
         }
         static bool s_LoggedCount = false;
@@ -5372,15 +5377,14 @@ static void Update() {
         s_Plates.swap(Next);
     }
 
-    // Owner pulse, ~2.5 s period. Colours are re-applied every tick: the game recolours names on its own updates.
+    // Owner pulse, ~2.5 s period, re-applied every tick: the game recolours names on its own updates.
     const float Phase = 0.5f + 0.5f * std::sin(static_cast<float>(Now % 2500) / 2500.f * 6.2831853f);
     const SDK::FLinearColor Pulse{
         kOwnerLo.R + (kOwnerHi.R - kOwnerLo.R) * Phase, kOwnerLo.G + (kOwnerHi.G - kOwnerLo.G) * Phase,
         kOwnerLo.B + (kOwnerHi.B - kOwnerLo.B) * Phase, 1.f };
     for (const Plate& P : s_Plates) {
         auto* W = P.W.Get<SDK::UNamePlatesWidget>();
-        if (!W || !W->TextBlock_Name) continue;
-        SetColor(W->TextBlock_Name, P.T == Tier::Owner ? Pulse : kAdmin);
+        if (W && W->TextBlock_Name && P.Info->T == Tier::Owner) SetColor(W->TextBlock_Name, Pulse);
     }
 }
 
