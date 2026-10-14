@@ -426,7 +426,61 @@ export type InventoryTransactionOptions = {
     // [2026-10-10] Lets a season challenge's claim fund a CURRENCY_SEASONAL_COIN grant (controllers/challengeRewards.ts).
     // Set only by POST /inventory for dedicated-server requests; store purchases and every other caller leave it off.
     allowChallengeRewardFunding?: boolean;
+
+    // [2026-10-13] The game's own `source` string for a dedicated-server request (body.source); see BOUNTY_TOKENS_DAILY.
+    source?: string;
 };
+
+// [2026-10-13] Bounties re-enabled with 6 TOKEN_BOUNTY_DRAFT a day that do NOT stack. The game's UBountyComponent grants
+// (first-start num_tokens_hp_start and the daily num_tokens_per_day, both served as this amount by routes/tuning.ts) are
+// rewritten so the stack lands on this amount: nothing is added when 6 or more are already held.
+export const BOUNTY_TOKENS_DAILY = 6;
+
+// The game never grants the daily tokens on 1.14.7 (measured: no grant POST at login), so the backend sets the stack to
+// BOUNTY_TOKENS_DAILY once per UTC day when the inventory is read. The day is kept as a cooldown entry nobody else reads.
+const BOUNTY_REFILL_COOLDOWN_ID = "mp_bounty_token_refill";
+
+async function RefillBountyTokensDaily(UserId: string, CharacterId: string){
+    const Now = new Date().toISOString();
+    const Cooldowns = await GetRepositories().cooldownStates.get(UserId);
+    const Last = Cooldowns?.entries.find((Entry) => Entry.id === BOUNTY_REFILL_COOLDOWN_ID);
+    if(Last != undefined && Last.startedDate.slice(0, 10) === Now.slice(0, 10)){
+        return;
+    }
+
+    const Inventory = await GetRepositories().inventories.findByCharacterId(CharacterId);
+    if(Inventory == undefined){
+        return;
+    }
+    const StackedItems: any[] = JSON.parse(Inventory.stackedItems);
+    const Stack = StackedItems.find((Item) => Item?.catalogId === "TOKEN_BOUNTY_DRAFT");
+    if(Stack == undefined){
+        StackedItems.push({ catalogId: "TOKEN_BOUNTY_DRAFT", quantity: BOUNTY_TOKENS_DAILY });
+    }
+    else{
+        Stack.quantity = BOUNTY_TOKENS_DAILY;
+    }
+    const Updated = await GetRepositories().inventories.updateBothIfRevisionMatches(
+        CharacterId, Inventory.instancedItems, JSON.stringify(StackedItems), Inventory.revision ?? 0);
+    if(Updated == undefined){
+        return; // revision conflict - the next read retries
+    }
+
+    const Entries = (Cooldowns?.entries ?? []).filter((Entry) => Entry.id !== BOUNTY_REFILL_COOLDOWN_ID);
+    Entries.push({ id: BOUNTY_REFILL_COOLDOWN_ID, startedDate: Now, updatedAt: Now });
+    await GetRepositories().cooldownStates.saveIfVersion({
+        userId: UserId,
+        entries: Entries,
+        updateVersion: (Cooldowns?.updateVersion ?? 0) + 1,
+        createdAt: Cooldowns?.createdAt ?? Now,
+        updatedAt: Now,
+    }, Cooldowns?.updateVersion);
+    logger.info(`[BountyTokens] set TOKEN_BOUNTY_DRAFT to ${BOUNTY_TOKENS_DAILY} for userId ${UserId} characterId ${CharacterId}`);
+}
+
+function IsBountyTokenTopUp(catalogId: unknown, source: string | undefined): boolean {
+    return catalogId === "TOKEN_BOUNTY_DRAFT" && typeof source === "string" && source.startsWith("UBountyComponent::");
+}
 
 export type InventoryLedgerAnnotator = (accepted: { createdInstancedItems: any[]; acceptedStackedAdds: any[] }) =>
     Record<string, unknown> | undefined;
@@ -559,6 +613,10 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
         for(let NewStackedItem of EffectiveStackedItemsToAdd){
             if(INVALID_STARTER_CATALOG_IDS.has(NewStackedItem?.catalogId)){
                 continue;
+            }
+            if(IsBountyTokenTopUp(NewStackedItem?.catalogId, Options.source)){
+                const Held = StackedItemsByCatalogId.get(NewStackedItem.catalogId)?.quantity ?? 0;
+                NewStackedItem = { ...NewStackedItem, quantity: Math.max(BOUNTY_TOKENS_DAILY - Held, 0) };
             }
             if (typeof NewStackedItem?.catalogId === "string" && Number.isSafeInteger(NewStackedItem?.quantity) && NewStackedItem.quantity > 0) {
                 AcceptedStackedAdds.push({ catalogId: NewStackedItem.catalogId, quantity: NewStackedItem.quantity });
@@ -819,6 +877,7 @@ export async function GetInventoryForUserIdAndCharacterId(UserId: string, Charac
     // missing starter default weapon parts; after that one-time v1-to-v2 reconciliation, repeated
     // GETs are transactional no-ops and cannot reset progression, equipment, or loadout choices.
     await EnsureStarterBootstrapRecords(UserId, CharacterId);
+    await RefillBountyTokensDaily(UserId, CharacterId);
     const InventoryFromDb = await EnsureInventoryStoragePolicyConsistency(UserId, CharacterId);
 
 

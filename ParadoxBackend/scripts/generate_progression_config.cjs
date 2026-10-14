@@ -84,6 +84,41 @@ for (const Slot of [1, 2, 3]) {
     console.log(`added ${Id} (${LINK_RANKS} ranks x ${LINK_XP_PER_RANK} XP)`);
 }
 
+// Hunt pass rotation slots (src/huntPassRotation.ts): season43..50, 100 levels x 100 XP. The curve must be in the file
+// (rank-confirm and XP grants validate against it); rewards and windows are filled at serve time from hunt_passes.json.
+for (let N = 43; N <= 50; N++) {
+    const Id = "season" + N;
+    const Path = {
+        progression_id: Id,
+        start_date: "2099-01-02T00:00:00+00:00",
+        end_date: "2099-12-31T00:00:00+00:00",
+        requirements: Array.from({ length: 101 }, (_, Rank) => ({ rank_id: Rank, xp_required: Rank === 0 ? 0 : 100 })),
+        free_rewards: [],
+    };
+    const At = Paths.findIndex((P) => P?.progression_id === Id);
+    if (At >= 0) Paths[At] = Path; else Paths.push(Path);
+}
+
+// Mastery: curve and rewards come from the client's own mastery_track_table (CatalogExporter
+// EXPORT_PROGRESSION -> Items_Analysis/progression_1_14_7/mastery-tracks.jsonl). The client draws levels and
+// reward lists from that table, so any other curve here puts the level and the unlocks out of step. The game
+// server grants free_rewards when it confirms a rank, so empty rewards here mean no mastery rewards at all.
+const MasteryExport = path.resolve(__dirname, "../../Items_Analysis/progression_1_14_7/mastery-tracks.jsonl");
+if (!fs.existsSync(MasteryExport)) Fail(`mastery export not found at ${MasteryExport} (CatalogExporter EXPORT_PROGRESSION=1)`);
+for (const Line of fs.readFileSync(MasteryExport, "utf8").split("\n").filter(Boolean)) {
+    const Row = JSON.parse(Line).base;
+    const P = Paths.find((X) => X?.progression_id === Row.progressionTrack);
+    if (!P) continue;
+    P.requirements = [{ rank_id: 0, xp_required: 0 }, ...Row.requirements.map((R) => ({ rank_id: R.rankId, xp_required: R.requiredXP }))];
+    P.free_rewards = Row.freeRewards.map((R) => ({
+        rank_id: R.rankId,
+        entitlements: [],
+        instanced_items: [],
+        stacked_items: R.stackedItems.map((S) => ({ catalog_id: S.catalogId, hidden: false, priority: S.priority, quantity: S.quantity })),
+    }));
+    console.log(`mastery ${P.progression_id}: ${Row.requirements.length} ranks, ${P.free_rewards.length} reward levels (client table)`);
+}
+
 const Output = {
     code: Source.code ?? null,
     message: typeof Source.message === "string" ? Source.message : "OK",

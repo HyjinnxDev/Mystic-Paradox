@@ -26,6 +26,7 @@ import { AssertRuntimeSafety } from "./config/runtimeSafety";
 import { ReadMetagameServiceRole } from "./config/serviceRole";
 import { SetServiceReadiness } from "./observability/serviceReadiness";
 import { GetP2PExtension } from "./extensions/p2p";
+import { DefaultRelayDeps, StartVoiceRelay, VoicePort } from "./voiceRelay";
 
 const PORT = process.env.PORT?.trim() || "3000";
 
@@ -181,6 +182,13 @@ async function Main(): Promise<void> {
         });
     } catch (e) {
         logger.warn(`QoS listener could not start on port ${QOS_PORT}: ${e}`);
+    }
+
+    // Party voice relay (voiceRelay.ts). Like QoS, a bind failure only loses voice, never the API.
+    try {
+        StartVoiceRelay(VoicePort(), DefaultRelayDeps);
+    } catch (e) {
+        logger.warn(`[Voice] relay could not start: ${e}`);
     }
 }
 

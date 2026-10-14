@@ -11,6 +11,7 @@
 
 import { Router } from "express";
 import { logger } from "../logger";
+import { BOUNTY_TOKENS_DAILY } from "../controllers/inventory";
 
 export const tuningRouter = Router();
 
@@ -97,11 +98,7 @@ tuningRouter.get("/game_tuning/bounty_game_data", (req: any, res) => {
         code: null,
         message: "OK",
         payload: {
-            bounty_data: [
-                { bounty_id: "Bounty_Bronze_KillWithFriends", enabled: false },
-                { bounty_id: "Bounty_Silver_KillWithFriends", enabled: false },
-                { bounty_id: "Bounty_Gold_KillWithFriends", enabled: false }
-            ],
+            bounty_data: [],
             bounty_token_grant_hour: 0,
             bounty_token_id: "TOKEN_BOUNTY_DRAFT",
             bronze_count: 9,
@@ -113,8 +110,8 @@ tuningRouter.get("/game_tuning/bounty_game_data", (req: any, res) => {
             new_season_reset_bounties: false,
             num_draft_options: 3,
             num_spicy_options: 1,
-            num_tokens_hp_start: 4,
-            num_tokens_per_day: 0,
+            num_tokens_hp_start: BOUNTY_TOKENS_DAILY,
+            num_tokens_per_day: BOUNTY_TOKENS_DAILY,
             premium_bounty_token_id: "TOKEN_BOUNTY_DRAFT_PREMIUM",
             token_rollover_warning_days: 1000
         }

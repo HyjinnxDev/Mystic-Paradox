@@ -16,12 +16,14 @@ import { loadGameData } from "../gameData/loader";
 const progressionconfig = loadGameData<any>("progression_config.json");
 import { GetEscalationProgress, SaveEscalationProgress } from "../controllers/escalationProgress";
 import { GetEntitlementsForUser } from "../controllers/entitlements";
-import { ACTIVE_HUNTPASS_PROGRESSION_ID } from "../controllers/progression";
+import { BuildHuntPassPath, HUNT_PASS_SLOT_IDS, IsHuntPassSlot } from "../huntPassRotation";
+import { GetServedSlotForUser } from "../controllers/progression";
 import { MonitorBountyLoad, MonitorBountySave, MonitorCooldownLoad, MonitorCooldownSave, MonitorSourceOf } from "../diagnostics/economyMonitor";
 import { CooldownSaveValidationError, IsAuthorizedCooldownReader, IsAuthorizedCooldownWriter } from "../cooldownState";
 import { GetCooldownState, SaveCooldowns } from "../controllers/cooldowns";
 import { BountyGroupCounts, BountySaveValidationError, BountyStatePayload, IsAuthorizedBountyReader, IsAuthorizedBountyWriter } from "../bountyState";
-import { GetBountyState, SaveBountyState } from "../controllers/bounty";
+import { DeleteBounties, GetBountyState, SaveBountyState } from "../controllers/bounty";
+import { BOUNTY_TOKENS_DAILY } from "../controllers/inventory";
 import { EscalationSeasonProgressUpdate, IsAuthorizedEscalationReader, IsAuthorizedEscalationWriter } from "../escalationProgress";
 
 export const systemRouter = Router();
@@ -31,14 +33,14 @@ systemRouter.get("/dauntless-status", (req, res) => {
 
     res.json({
 	    "show-status": true,
-	    "en": "Welcome to Mystic Paradox!",
-	    "fr": "Welcome to Mystic Paradox!",
-	    "it": "Welcome to Mystic Paradox!",
-	    "es": "Welcome to Mystic Paradox!",
-	    "de": "Welcome to Mystic Paradox!",
-	    "pt": "Welcome to Mystic Paradox!",
-	    "ru": "Welcome to Mystic Paradox!",
-	    "ja": "Welcome to Mystic Paradox!"
+	    "en": "Welcome to Dauntless Awakened!",
+	    "fr": "Welcome to Dauntless Awakened!",
+	    "it": "Welcome to Dauntless Awakened!",
+	    "es": "Welcome to Dauntless Awakened!",
+	    "de": "Welcome to Dauntless Awakened!",
+	    "pt": "Welcome to Dauntless Awakened!",
+	    "ru": "Welcome to Dauntless Awakened!",
+	    "ja": "Welcome to Dauntless Awakened!"
     });
 });
 
@@ -319,28 +321,12 @@ const ENDED_PASS_WINDOW_END = "2024-12-03T00:00:00+00:00";      // the live serv
 // per open, a multi-second freeze, and gigabytes that were never returned (the client reached 19 GB after five
 // opens). Live passes ran 84 days starting Thursday 17:00 UTC (season24..26); the cycle is anchored on
 // season27's real start, so the window always covers the present and never spans more than 12 weeks.
-const ACTIVE_SEASON_ANCHOR_MS = Date.parse("2024-09-26T17:00:00+00:00");
-const ACTIVE_SEASON_LENGTH_MS = 84 * 24 * 60 * 60 * 1000;
-
-function IsoUtc(Ms: number): string {
-    return new Date(Ms).toISOString().replace(/\.\d{3}Z$/, "+00:00");
-}
-
-export function ActiveSeasonWindow(NowMs: number): { start: string; end: string } {
-    const Cycle = Math.floor((NowMs - ACTIVE_SEASON_ANCHOR_MS) / ACTIVE_SEASON_LENGTH_MS);
-    const Start = ACTIVE_SEASON_ANCHOR_MS + Cycle * ACTIVE_SEASON_LENGTH_MS;
-    return { start: IsoUtc(Start), end: IsoUtc(Start + ACTIVE_SEASON_LENGTH_MS) };
-}
 const FUTURE_PASS_WINDOW_START = "2099-01-02T00:00:00+00:00";
 const FUTURE_PASS_WINDOW_END = "2099-12-31T00:00:00+00:00";
 
 function IsHuntPassProgressionId(Id: unknown): boolean {
     if (typeof Id !== "string") return false;
     return /^(eventpass_|d24_|season)/i.test(Id);
-}
-
-export function GetServedHuntPassId(): string {
-    return (process.env.GAMESERVER_HUNTPASS_ID ?? ACTIVE_HUNTPASS_PROGRESSION_ID).trim();
 }
 
 // [1.14.7 2026-10-03] MEASURED root cause of the active-hunt-pass failure. The client iterates the game's
@@ -354,23 +340,17 @@ export function GetServedHuntPassId(): string {
 // the id list (comma separated).
 const DEFAULT_RECENT_SEASONS = ["season43", "season44", "season45", "season46", "season47", "season48", "season49", "season50"];
 
-export function WidenHuntPassWindows(Config: any): any {
+// [2026-10-14] ServedSlot: the slot the requesting PLAYER is on. A player's config has only that slot current (several
+// current passes made the client settle on the wrong one); the game server's config (no ServedSlot) has every slot
+// current, because which one is current for a player depends on the player and it resolves each from /huntpass.
+export function WidenHuntPassWindows(Config: any, ServedSlot?: string): any {
     if ((process.env.GAMESERVER_WIDEN_HUNTPASS_WINDOWS ?? "1") === "0") return Config;
     const Paths = Config?.payload?.paths;
     if (!Array.isArray(Paths)) return Config;
-    const ActiveId = GetServedHuntPassId();
     const Now = Date.now();
-    let Opened = 0;
     let Ended = 0;
     for (const Path of Paths) {
-        if (!Path || !IsHuntPassProgressionId(Path.progression_id)) continue;
-        if (Path.progression_id === ActiveId) {
-            const Window = ActiveSeasonWindow(Now);
-            Path.start_date = Window.start;
-            Path.end_date = Window.end;
-            Opened++;
-            continue;
-        }
+        if (!Path || !IsHuntPassProgressionId(Path.progression_id) || IsHuntPassSlot(Path.progression_id)) continue;
         const End = Date.parse(Path.end_date);
         if (!Number.isFinite(End) || End > Now) {
             Path.end_date = ENDED_PASS_WINDOW_END;
@@ -379,16 +359,25 @@ export function WidenHuntPassWindows(Config: any): any {
             Ended++;
         }
     }
-    const Window = ActiveSeasonWindow(Now);
-    logger.info(`Hunt pass windows: '${ActiveId}' ${Window.start}..${Window.end} (${Opened} path), ${Ended} other pass windows clamped to have ended`);
-    if (Opened === 0) logger.warn(`Hunt pass windows: the active pass '${ActiveId}' is not in the progression config`);
+    // Rotation: every slot gets the real pass it carries (rank curve + free/Elite rewards).
+    const Carried: string[] = [];
+    for (const SlotId of HUNT_PASS_SLOT_IDS) {
+        const { pass_name, ...Built } = BuildHuntPassPath(SlotId, Now);
+        Carried.push(`${SlotId}=${pass_name}`);
+        const Slot = ServedSlot === undefined || SlotId === ServedSlot
+            ? Built
+            : { ...Built, start_date: FUTURE_PASS_WINDOW_START, end_date: FUTURE_PASS_WINDOW_END };
+        const At = Paths.findIndex((P: any) => P?.progression_id === SlotId);
+        if (At >= 0) Paths[At] = Slot; else Paths.push(Slot);
+    }
+    logger.info(`Hunt pass slots (${ServedSlot === undefined ? "all current, gameserver" : `only ${ServedSlot} current, player`}): ${Carried.join(", ")}; ${Ended} other pass windows clamped to have ended`);
 
     // Add the newest seasons the game's table exposes (see the block comment) so the window lookup for an
     // ENABLED row can succeed. They copy the active track's shape and get a future window, so they resolve
     // without competing with the active pass.
     const RecentSeasons = (process.env.GAMESERVER_RECENT_SEASONS ?? DEFAULT_RECENT_SEASONS.join(","))
         .split(",").map((s) => s.trim()).filter((s) => s.length > 0);
-    const Template = Paths.find((P: any) => P?.progression_id === ActiveId)
+    const Template = Paths.find((P: any) => P?.progression_id === HUNT_PASS_SLOT_IDS[0])
         ?? Paths.find((P: any) => P && typeof P.progression_id === "string" && /^season/i.test(P.progression_id));
     if (Template) {
         const Existing = new Set(Paths.map((P: any) => P?.progression_id));
@@ -412,11 +401,15 @@ export function WidenHuntPassWindows(Config: any): any {
     return Config;
 }
 
-systemRouter.get("/progression/config", HasParadoxBackendAuth, (req, res) => {
+systemRouter.get("/progression/config", HasParadoxBackendAuth, async (req: any, res) => {
 	logger.info("Progression Config (stubbed)");
 
+	// A player (no gameserver key) gets only their own hunt pass slot current; the gameserver gets every slot current.
+	const IsGameserver = req.headers["x-mysticparadox-gameserver-apikey"] !== undefined;
+	const PlayerId = req.AuthData?.userId;
+	const ServedSlot = !IsGameserver && typeof PlayerId === "string" ? await GetServedSlotForUser(PlayerId) : undefined;
 	res.status(200);
-	res.json(WidenHuntPassWindows(JSON.parse(JSON.stringify(progressionconfig))));
+	res.json(WidenHuntPassWindows(JSON.parse(JSON.stringify(progressionconfig)), ServedSlot));
 });
 
 // [1.14.7 2026-10-03] GET /config on the Gauntlet host.
@@ -517,7 +510,7 @@ systemRouter.get(/^\/leaderboard\/get_leaderboard\//i, HasParadoxBackendAuth, (r
     res.status(200).json(GauntletEnvelope({ entries: [] }));
 });
 
-systemRouter.get("/huntpass/:userId", HasParadoxBackendAuth, (req: any, res) => {
+systemRouter.get("/huntpass/:userId", HasParadoxBackendAuth, async (req: any, res) => {
 	// [1.14.7 2026-10-03] This was the ONLY route in the backend returning a scalar payload
 	// ("payload": "season19") while every other Phoenix response carries an object - exactly the
 	// shape that makes a client log "[LogJson][Error] Json Value of type 'String' used as a
@@ -538,7 +531,8 @@ systemRouter.get("/huntpass/:userId", HasParadoxBackendAuth, (req: any, res) => 
 	// enabled). The row name in the warning is the oracle for whether this id is accepted.
 	// [1.14.7 2026-10-08] Defaults to the active pass (season43) so the client, the XP grants and the
 	// prestige earn gate all name the same track; GAMESERVER_HUNTPASS_ID still overrides.
-	const HuntPassId = GetServedHuntPassId();
+	// The slot THIS player is on: the first cosmetic pass they have not completed, else the currency pass.
+	const HuntPassId = await GetServedSlotForUser(String(req.params.userId));
 
 	logger.info(`Huntpass (stubbed) -> huntpass_id=${HuntPassId}`);
 
@@ -604,6 +598,42 @@ systemRouter.put("/cooldown/batch/:userId", HasParadoxBackendAuth, async (req: a
 	}
 });
 
+// [2026-10-13] Single-id cooldown write. UPlayerGatherableComponent (Ramsgate aethersprouts etc.) PUTs
+// /cooldown/<player>/<trackingId> on every harvest and reads gather times back through GET /cooldown/:userId. This route
+// was missing (404 -> "OnSetGatherableDataRequestComplete - Failed to set back end gatherable data"), so harvests never
+// persisted or counted toward bounties. Stored in the same per-account map as the batch PUT.
+systemRouter.put("/cooldown/:userId/:cooldownId", HasParadoxBackendAuth, async (req: any, res) => {
+	const UserId = String(req.params.userId);
+	if (!IsAuthorizedCooldownWriter(req.AuthData)) {
+		logger.warn(`Rejected cooldown write without gameserver authority actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
+		res.status(403).send();
+		return;
+	}
+	// ponytail: body shape unconfirmed (SAVE-RAW logs it); uses the first date string it carries, else server time.
+	const Body = req.body;
+	const Candidates = typeof Body === "string" ? [Body] : Object.values(Body ?? {});
+	const Started = Candidates.find((Value: any) => typeof Value === "string" && Value.length <= 64 && !Number.isNaN(Date.parse(Value))) ?? new Date().toISOString();
+	const Save = { cooldowns: [{ cooldown_id: String(req.params.cooldownId), cooldown_started_date: Started }] };
+	if (!COOLDOWN_PERSISTENCE || UserId === COOLDOWN_NO_PLAYER) {
+		MonitorCooldownSave(UserId, MonitorSourceOf(req.AuthData), Body, "single-id, not stored");
+		res.status(200).json({ code: null, message: "OK", payload: {} });
+		return;
+	}
+	try {
+		const { payload, record } = await SaveCooldowns(UserId, Save);
+		MonitorCooldownSave(UserId, MonitorSourceOf(req.AuthData), Body, `single-id ${req.params.cooldownId}@${Started} stored -> ${record.entries.length} cooldown(s) version=${record.updateVersion}`);
+		res.status(200).json({ code: null, message: "OK", payload });
+	}
+	catch (Err) {
+		if (Err instanceof CooldownSaveValidationError) {
+			MonitorCooldownSave(UserId, MonitorSourceOf(req.AuthData), Body, `REJECTED ${Err.message}`);
+			res.status(400).json({ code: null, message: "Bad Request", payload: {} });
+			return;
+		}
+		throw Err;
+	}
+});
+
 systemRouter.get("/bounty/game-data", HasParadoxBackendAuth, (req: any, res) => {
 	logger.info("Bounty game data (stubbed)");
 
@@ -617,8 +647,8 @@ systemRouter.get("/bounty/game-data", HasParadoxBackendAuth, (req: any, res) => 
       num_spicy_options: 1,
       bounty_token_id: "TOKEN_BOUNTY_DRAFT",
       premium_bounty_token_id: "TOKEN_BOUNTY_DRAFT_PREMIUM",
-      num_tokens_hp_start: 4,
-      num_tokens_per_day: 0,
+      num_tokens_hp_start: BOUNTY_TOKENS_DAILY,
+      num_tokens_per_day: BOUNTY_TOKENS_DAILY,
       bounty_token_grant_hour: 0,
       history_length: 10,
       bronze_count: 9,
@@ -691,6 +721,32 @@ systemRouter.post("/bounty/:userId", HasParadoxBackendAuth, async (req: any, res
 	}
 });
 
+// [2026-10-14] Claim and abandon: the game server posts { bounty_ids: [...] } and answers the claim only on a 200
+// (unrouted, it logged "OnClaimBountyComplete() - invalid http response": no reward, bounty kept). Same envelope as the save.
+systemRouter.post("/bounty/delete/:userId", HasParadoxBackendAuth, async (req: any, res) => {
+	const UserId = String(req.params.userId);
+	if (!IsAuthorizedBountyWriter(req.AuthData)) {
+		logger.warn(`Rejected bounty delete without gameserver authority actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
+		res.status(403).send();
+		return;
+	}
+	try {
+		const { payload, removed } = BOUNTY_PERSISTENCE && UserId !== BOUNTY_NO_PLAYER
+			? await DeleteBounties(UserId, req.body)
+			: { payload: BountyStatePayload(undefined), removed: [] as string[] };
+		logger.info(`[DraftMon] BOUNTY-DELETE user=${UserId} body=${JSON.stringify(req.body).slice(0, 300)} removed=[${removed.join(", ")}]`);
+		res.status(200).json({ code: null, message: "OK", payload });
+	}
+	catch (Err) {
+		if (Err instanceof BountySaveValidationError) {
+			logger.warn(`[DraftMon] BOUNTY-DELETE REJECTED user=${UserId} ${Err.message} body=${JSON.stringify(req.body).slice(0, 300)}`);
+			res.status(400).json({ code: null, message: "Bad Request", payload: {} });
+			return;
+		}
+		throw Err;
+	}
+});
+
 systemRouter.get("/all/", HasParadoxBackendAuth, (req: any, res) => {
 	logger.info("Mailbox (stubbed)");
 
@@ -716,13 +772,13 @@ systemRouter.get("/patchnotes/:language/:gameversion", (req, res) => {
 		message: "OK",
 		payload: {
 			date: "2026-10-08T00:00:00.000+00:00",
-			description: "Welcome, Slayer! The Shattered Isles are calling again. Gather your party in Ramsgate and return to the hunt.",
+			description: "Dauntless Awakened is a community-run revival of Dauntless. Gather your party in Ramsgate and return to the hunt.",
 			language: req.params.language ?? "en",
 			notes: [
 				{
 					sections: [
 						{
-							description: "Mystic Paradox is a community project that keeps Dauntless alive. Your Slayer, gear and loadouts are kept on Mystic Paradox servers, so you can pick up right where you left off.",
+							description: "Dauntless Awakened is a community project that keeps Dauntless alive. Your Slayer, gear and loadouts are kept on Dauntless Awakened servers, so you can pick up right where you left off.",
 							title: "The hunt continues",
 							type: "featured"
 						},
@@ -740,7 +796,7 @@ systemRouter.get("/patchnotes/:language/:gameversion", (req, res) => {
 							type: "default"
 						}
 					],
-					title: "Welcome to Mystic Paradox",
+					title: "Welcome to Dauntless Awakened",
 					type: "new_to_dauntless"
 				},
 				{
@@ -749,8 +805,8 @@ systemRouter.get("/patchnotes/:language/:gameversion", (req, res) => {
 							changes: [
 								{
 									list: [
-										"Mystic Paradox is still growing, so you may run into the odd bug",
-										"If something goes wrong, tell the Mystic Paradox team what you were doing and roughly when it happened",
+										"Dauntless Awakened is still growing, so you may run into the odd bug",
+										"If something goes wrong, tell the Dauntless Awakened team what you were doing and roughly when it happened",
 										"Thank you for hunting with us!"
 									]
 								}
@@ -765,7 +821,7 @@ systemRouter.get("/patchnotes/:language/:gameversion", (req, res) => {
 			],
 			permalink: "/patch-notes/mysticparadox/",
 			release_version: "",
-			title: "Mystic Paradox"
+			title: "About Dauntless Awakened"
 		}
 	});
 });

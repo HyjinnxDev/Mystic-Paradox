@@ -28,7 +28,8 @@ import { BountyGroup, BountyStateRecord, StoredBounty } from "./persistence/mapp
  *
  * Merge rules (MergeBountyState):
  *   - A save that carries exactly ONE draft-data key is that component's full list: its draft data replaces the
- *     stored one, and its bounties replace the stored bounties of that group. An EMPTY list never deletes anything
+ *     stored one, and its bounties replace the stored bounties of that group (base: only those in the same slot).
+ *     An EMPTY list never deletes anything
  *     (the server sends `bounties: []` with draft data while it is still initialising; deleting there would wipe
  *     the season challenges' progress). A save with no (or several) draft-data keys upserts the bounties it names.
  *   - The same bounty instance (same bounty_id and drafted_timestamp) is merged monotonically: each objective's
@@ -214,10 +215,14 @@ export function MergeBountyState(
         let Removed = 0;
         if (bounties.length > 0) {
             const Incoming = new Set(bounties.map((Bounty) => Bounty.bounty_id as string));
+            // [2026-10-14] The base board sends only the bounty just drafted with its draft data, so absence means
+            // nothing there: a base bounty leaves when claimed/abandoned (POST /bounty/delete) or when a new draft
+            // takes its slot. Treating the save as the full list dropped every other selected bounty.
+            const IncomingSlots = new Set(bounties.map((Bounty) => Bounty.slot_index));
             const Before = List.length;
             List = List.filter((Entry) => {
-                const EntryGroup = Entry.group === "unassigned" ? InferBountyGroup(String(Entry.bounty.bounty_id)) : Entry.group;
-                return EntryGroup !== group || Incoming.has(Entry.bounty.bounty_id);
+                if (GroupOf(Entry) !== group || Incoming.has(Entry.bounty.bounty_id)) return true;
+                return group === "base" && !IncomingSlots.has(Entry.bounty.slot_index);
             });
             Removed = Before - List.length;
             for (const Bounty of bounties) List = Upsert(List, Bounty, group, now);
@@ -241,6 +246,23 @@ export function MergeBountyState(
         },
         summary: Summary,
     };
+}
+
+/** POST /bounty/delete/:userId { bounty_ids }: the game server's claim/abandon. Season challenges are never removed
+ *  (their claim must stay sticky, see below); unknown ids are ignored. Throws BountySaveValidationError. */
+export function DeleteFromBountyState(previous: BountyStateRecord | undefined, body: unknown, now: string = new Date().toISOString()): { record: BountyStateRecord | undefined; removed: string[] } {
+    // ponytail: key spelling from the 1.4.4 backend; the 1.14.7 body was never captured, a 400 logs it.
+    const Ids = IsPlainObject(body) ? body.bounty_ids ?? body.bountyIds : undefined;
+    if (!Array.isArray(Ids) || Ids.length > MAX_BOUNTIES_PER_SAVE) throw new BountySaveValidationError("bounty_ids must be an array");
+    if (!previous) return { record: undefined, removed: [] };
+    const Asked = new Set(Ids.filter((Id) => typeof Id === "string"));
+    const Removed: string[] = [];
+    const Bounties = previous.bounties.filter((Entry) => {
+        if (!Asked.has(Entry.bounty.bounty_id) || GroupOf(Entry) === "weekly") return true;
+        Removed.push(Entry.bounty.bounty_id);
+        return false;
+    });
+    return { record: { ...previous, bounties: Bounties, updateVersion: previous.updateVersion + 1, updatedAt: now }, removed: Removed };
 }
 
 export function BountyStatePayload(record: BountyStateRecord | undefined): Record<string, unknown> {

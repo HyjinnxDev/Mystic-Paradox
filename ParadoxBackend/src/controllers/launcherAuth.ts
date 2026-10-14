@@ -16,6 +16,7 @@ import { GenerateOpaqueToken, HashOpaqueToken, SignLauncherAccessToken } from ".
 import { LauncherApiError } from "../security/launcherErrors";
 import { IsRateLimited } from "../security/rateLimit";
 import { logger } from "../logger";
+import { SignVoiceTicket, VoicePort } from "../voiceRelay";
 import { MongoServerError } from "mongodb";
 import { AssertAccountAdmitted, AssertAccountEligible, EffectiveApprovalStatus } from "../security/accountEligibility";
 import {
@@ -381,7 +382,7 @@ export async function RequestGameExchangeCode(
     runtimeChannel: RuntimeChannel,
     runtimeManifestVersion: unknown,
     runtimeArtifacts: unknown
-): Promise<{ exchangeCode: string; expiresInSeconds: number }> {
+): Promise<{ exchangeCode: string; expiresInSeconds: number; voiceTicket: string; voicePort: number }> {
     if (IsRateLimited(`game-session:${userId}`, 10, 5 * 60 * 1000)) {
         throw new LauncherApiError("AUTH_RATE_LIMITED", "Too many launch attempts. Try again in a few minutes.");
     }
@@ -430,7 +431,9 @@ export async function RequestGameExchangeCode(
         expiresAt: ExpiresAt.toISOString()
     });
 
-    return { exchangeCode: Code, expiresInSeconds: EXCHANGE_CODE_TTL_MS / 1000 };
+    // The game's runtime authenticates to the party voice relay (voiceRelay.ts) with this; the launcher
+    // hands it over in the environment.
+    return { exchangeCode: Code, expiresInSeconds: EXCHANGE_CODE_TTL_MS / 1000, voiceTicket: SignVoiceTicket(userId), voicePort: VoicePort() };
 }
 
 // Registration-time (pre-auth) availability check: is this username valid and free?

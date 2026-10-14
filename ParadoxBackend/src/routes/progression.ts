@@ -17,6 +17,7 @@ import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
 import { AddEncounteredContent, GetBreadcrumbsForCharacterIdAndUserId, GetPlayerJourney, QueryEncounteredContent, SavePlayerJourney, SetBreadcrumbsForCharacterIdAndUserId, GrantProgressionXp, GetPersistedProgressionForUser, CaptureProgressionObjectiveEvent, GetPersistedObjectivesForUser, ConfirmPublicProgressionRank, IsAuthorizedProgressionReader, IsAuthorizedProgressionReporter, IsApprovedXpProgressionTrack, IsValidProgressionGrantId, ProgressionGrantConflictError, IsCharacterOwnedByUser, GetTrackCurve } from "../controllers/progression";
 import { GetUnlockedNodeIds, GrantSlayersPathRewards } from "../controllers/slayersPath";
+import { HUNT_PASS_SLOT_IDS } from "../huntPassRotation";
 import { IsPrestigeSourceTrack } from "../controllers/wallet";
 import { MonitorProgressionReport, MonitorProgressionServed, MonitorSourceOf } from "../diagnostics/economyMonitor";
 
@@ -57,7 +58,7 @@ const DEFAULT_PROGRESSION_IDS = [
     "PrestigeTrack_Weapon_Sword",
     "PrestigeTrack_Weapon_Spear",
     "PrestigeTrack_Weapon_Strikers",
-    "season43",   // the active hunt pass (ACTIVE_HUNTPASS_PROGRESSION_ID); season19 on 1.12
+    ...HUNT_PASS_SLOT_IDS,
 ];
 
 function EmptyEncounteredContentResponse(contentTypes: number[]){
@@ -500,7 +501,7 @@ progressionRouter.post("/progression/:userId", HasParadoxBackendAuth, async (req
         // silently discard the body entirely, which is why mastery/hunt-pass XP never
         // accumulated even though the server returned 200 OK for these calls.
         try{
-            await CaptureProgressionObjectiveEvent(RequestorAccountId, req.body);
+            await CaptureProgressionObjectiveEvent(RequestorAccountId, req.body, undefined, req.AuthData?.IsGameserver === true);
         }
         catch(error){
             if(error instanceof Error && error.name === "ProgressionEventValidationError"){

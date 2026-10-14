@@ -15,9 +15,10 @@ import { GetRepositories, RepositoryProvider } from "../persistence";
 import { GetBalance, InsufficientBalanceError } from "./wallet";
 import { RunInventoryTransaction, InventoryTransactionConflictError, InventoryTransactionMismatchError } from "./inventory";
 import { GrantEntitlementsInTransaction } from "./entitlements";
-import { GetTrackCurve, ResolveProgressionTrackId } from "./progression";
+import { GetServedSlotForUser, GetTrackCurve, ProgressionStorageId, ResolveProgressionTrackId } from "./progression";
 import { ResolveProgressionGrant } from "../skuProgression";
 import { logger } from "../logger";
+import { HUNT_PASS_SLOT_IDS, HuntPassPassSkuTag, HuntPassSkus } from "../huntPassRotation";
 import { loadGameData } from "../gameData/loader";
 
 // [2026-07-24] Lady Luck's Store (the Trials/Arena reward shop). Confirmed real endpoint contract:
@@ -46,6 +47,8 @@ export type StoreSku = {
     displayPriority: number;
     prices: { currencyId: string; price: number }[];
     maxAllowed: number | null;
+    /** Identity a one-time purchase is recorded under when the SKU id alone is not unique over time (hunt pass Elite: the id is a client row, the pass behind it rotates). */
+    ownershipKey?: string;
     images?: Record<string, string>;
     tags: string[];
     items: StoreSkuItem[];
@@ -101,9 +104,11 @@ function ExchangeSlotSku(Slot: 2 | 3): StoreSku {
         duplicateInstancedItems: [],
     };
 }
+const HUNT_PASS_SKUS = Object.fromEntries(HUNT_PASS_SLOT_IDS.map((Slot) => [HuntPassPassSkuTag(Slot), HuntPassSkus(Slot)]));
 const EXCHANGE_SLOT_SKUS = { slot2: [ExchangeSlotSku(2)], slot3: [ExchangeSlotSku(3)] };
 
 const STORE_SKUS: Record<string, StoreSku[]> = {
+    ...HUNT_PASS_SKUS,
     exchange_vendor_slot_2: EXCHANGE_SLOT_SKUS.slot2,
     exchange_vendor_slot_3: EXCHANGE_SLOT_SKUS.slot3,
     ladyluckstore: LADYLUCK_SKUS,
@@ -125,6 +130,7 @@ const CURRENCY_ID_MAP: Record<string, string> = {
     // [1.14.7 2026-10-08] The Reward Cache is priced in the 1.14.7 seasonal coin (the HUD's blue-star "Cache Coins").
     id_currency_seasonal_coin: "CURRENCY_SEASONAL_COIN",
     id_currency_rewardcache: "CURRENCY_REWARDCACHE",
+    id_currency_notes: "CURRENCY_NOTES",
     // [2026-07-30] Platinum resolves to the AGGREGATE id; ApplyCurrencyDeltas splits the debit across
     // the real per-storefront buckets (platinumWallet.ts). Without this entry the fallback below
     // produced "ID_CURRENCY_PLATINUM", which fails the CURRENCY_ prefix test in ApplyCurrencyDeltas and
@@ -207,13 +213,16 @@ async function GrantSkuProgressionInTransaction(repos: RepositoryProvider, userI
     if (sku.skuProgression == undefined) return;
 
     const RawTrackId = sku.skuProgression.progressionId;
-    const TrackId = typeof RawTrackId === "string" ? ResolveProgressionTrackId(RawTrackId) : undefined;
-    const Existing = TrackId ? await repos.progressionTracks.get(userId, TrackId, session) : undefined;
+    // "selected_huntpass" means the slot this player is on; hunt pass progress is stored per pass (ProgressionStorageId).
+    const ServedSlot = await GetServedSlotForUser(userId, repos);
+    const Resolve = (Id: string) => ResolveProgressionTrackId(Id, ServedSlot);
+    const TrackId = typeof RawTrackId === "string" ? Resolve(RawTrackId) : undefined;
+    const Existing = TrackId ? await repos.progressionTracks.get(userId, ProgressionStorageId(TrackId), session) : undefined;
 
     const Plan = ResolveProgressionGrant(
         sku.skuProgression,
         Existing?.progress ?? 0,
-        ResolveProgressionTrackId,
+        Resolve,
         GetTrackCurve
     );
 
@@ -222,7 +231,7 @@ async function GrantSkuProgressionInTransaction(repos: RepositoryProvider, userI
         return;
     }
 
-    const After = await repos.progressionTracks.increment(userId, Plan.progressionId, Plan.xp, session);
+    const After = await repos.progressionTracks.increment(userId, ProgressionStorageId(Plan.progressionId), Plan.xp, session);
     if (Plan.kind === "ranks") {
         logger.info(`[StoreProgression] ${userId} sku=${sku.id} track=${Plan.progressionId} rank ${Plan.fromRank}->${Plan.toRank} (+${Plan.xp} xp, total ${After.progress})`);
     } else {
@@ -260,7 +269,7 @@ export async function PurchaseStoreSku(userId: string, characterId: string, stor
     // section of the SAME store shares one scope - see TransactionScopeFor.
     const { transaction: TransactionScope, instance: InstanceScope } = TransactionScopeFor(storeTag);
     const TransactionId = IsOneTime
-        ? crypto.createHash("sha256").update(`${TransactionScope}:${userId}:${skuId}`).digest("hex").slice(0, 32).toUpperCase()
+        ? crypto.createHash("sha256").update(`${TransactionScope}:${userId}:${Sku.ownershipKey ?? skuId}`).digest("hex").slice(0, 32).toUpperCase()
         : crypto.randomBytes(16).toString("hex").toUpperCase();
 
     const StackedItemsToRemove = Sku.prices.map((p) => ({

@@ -6,7 +6,7 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-import { BountyMergeSummary, BountyStatePayload, MergeBountyState } from "../bountyState";
+import { BountyMergeSummary, BountyStatePayload, DeleteFromBountyState, MergeBountyState } from "../bountyState";
 import { BountyStateRecord, GetRepositories } from "../persistence";
 import { PerAccountQueue } from "./perAccountQueue";
 
@@ -33,5 +33,19 @@ export function SaveBountyState(userId: string, body: unknown): Promise<{ payloa
             }
         }
         throw new Error(`Bounty state save remained contended for ${userId}`);
+    });
+}
+
+export function DeleteBounties(userId: string, body: unknown): Promise<{ payload: Record<string, unknown>; removed: string[] }> {
+    return SaveQueue.run(userId, async () => {
+        const Repository = GetRepositories().bountyStates;
+        for (let Attempt = 0; Attempt < MAX_SAVE_ATTEMPTS; Attempt++) {
+            const Previous = await Repository.get(userId);
+            const { record, removed } = DeleteFromBountyState(Previous, body);
+            if (record === undefined || removed.length === 0) return { payload: BountyStatePayload(Previous), removed };
+            const Saved = await Repository.saveIfVersion(record, Previous?.updateVersion);
+            if (Saved !== undefined) return { payload: BountyStatePayload(Saved), removed };
+        }
+        throw new Error(`Bounty state delete remained contended for ${userId}`);
     });
 }

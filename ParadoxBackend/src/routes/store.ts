@@ -113,6 +113,48 @@ storeRouter.get("/balance", HasParadoxBackendAuth, async (req: any, res) => {
     res.status(200).json(ProjectBalances(Wallet, Balance));
 });
 
+const PublicSku = (Sku: ReturnType<typeof GetStoreSkus>[number]) => ({
+    id: Sku.id,
+    displayName: Sku.displayName,
+    displayDescription: Sku.displayDescription,
+    displayPriority: Sku.displayPriority,
+    prices: Sku.prices.map((p) => ({ currencyId: p.currencyId, price: p.price, salesPrice: null, multiPrice: null })),
+    maxAllowed: Sku.maxAllowed,
+    remaining: Sku.maxAllowed ?? 999,
+    duplicateInstancedItems: Sku.duplicateInstancedItems,
+    images: Sku.images ?? {},
+    tags: Sku.tags,
+    scheduledTags: null,
+    items: Sku.items.map((i) => ({ catalogId: i.catalogId, quantity: i.quantity })),
+    // [2026-07-30] Previously hardcoded empty/null. The client needs the real values: an
+    // entitlement-payload SKU has `items: null` in the captures and is described entirely by
+    // `entitlements`, and the Hunt Pass screens read `skuProgression` to label a rank skip. Both
+    // are served in the captured shape - `entitlements` as {name, duration}, skuProgression as
+    // {progressionId, ranks, xp}.
+    entitlements: (Sku.entitlements ?? []).map((e) => ({ name: e.name, duration: e.duration })),
+    skuProgression: Sku.skuProgression
+        ? { progressionId: Sku.skuProgression.progressionId, ranks: Sku.skuProgression.ranks, xp: Sku.skuProgression.xp }
+        : null,
+    loadoutSlots: null,
+    availableFrom: null,
+    availableTo: null,
+    timeAvailabilityReason: null,
+    platformOfferId: null,
+    missingEntitlementNames: null,
+});
+
+// Single-SKU lookup the Hunt Pass purchase window makes (GET /product/sku/{id}); without it the window opens blank.
+storeRouter.get("/product/sku/:id", HasParadoxBackendAuth, (req: any, res) => {
+    const Located = FindStoreSkuByIdOrCatalogId(req.params.id);
+    if (!Located) {
+        res.status(404);
+        res.json({ code: "404", message: "unknown_sku" });
+        return;
+    }
+    res.status(200);
+    res.json(PublicSku(Located.sku));
+});
+
 // [2026-07-24] Confirmed real endpoint contract (DauntlessEndpointDocumentation/Store/Product/Skus/
 // SearchPublic.md, captured 2.1.1): GET /product/skus/public?requiredTags={tag} - one tag value per
 // store section (ladyluckstore/huntpass_store/gauntlet_store/dyes/loadout_slots/mailbox/webstore/...).
@@ -141,35 +183,7 @@ storeRouter.get("/product/skus/public", HasParadoxBackendAuth, async (req: any, 
     // ownership of one-time SKUs - the purchase endpoint below is the actual gate (a repeat purchase
     // of an already-owned one-time SKU is idempotently safe, not double-charged), this listing just
     // doesn't grey it out yet. See controllers/store.ts's header comment for the full provenance.
-    const Skus = StoreSkus.map((Sku) => ({
-        id: Sku.id,
-        displayName: Sku.displayName,
-        displayDescription: Sku.displayDescription,
-        displayPriority: Sku.displayPriority,
-        prices: Sku.prices.map((p) => ({ currencyId: p.currencyId, price: p.price, salesPrice: null, multiPrice: null })),
-        maxAllowed: Sku.maxAllowed,
-        remaining: Sku.maxAllowed ?? 999,
-        duplicateInstancedItems: Sku.duplicateInstancedItems,
-        images: Sku.images ?? {},
-        tags: Sku.tags,
-        scheduledTags: null,
-        items: Sku.items.map((i) => ({ catalogId: i.catalogId, quantity: i.quantity })),
-        // [2026-07-30] Previously hardcoded empty/null. The client needs the real values: an
-        // entitlement-payload SKU has `items: null` in the captures and is described entirely by
-        // `entitlements`, and the Hunt Pass screens read `skuProgression` to label a rank skip. Both
-        // are served in the captured shape - `entitlements` as {name, duration}, skuProgression as
-        // {progressionId, ranks, xp}.
-        entitlements: (Sku.entitlements ?? []).map((e) => ({ name: e.name, duration: e.duration })),
-        skuProgression: Sku.skuProgression
-            ? { progressionId: Sku.skuProgression.progressionId, ranks: Sku.skuProgression.ranks, xp: Sku.skuProgression.xp }
-            : null,
-        loadoutSlots: null,
-        availableFrom: null,
-        availableTo: null,
-        timeAvailabilityReason: null,
-        platformOfferId: null,
-        missingEntitlementNames: null,
-    }));
+    const Skus = StoreSkus.map(PublicSku);
 
     logger.info(`Store SKUs: ${RequiredTags} -> ${Skus.length} SKUs`);
     res.status(200);

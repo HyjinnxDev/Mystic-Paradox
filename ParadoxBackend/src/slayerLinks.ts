@@ -85,6 +85,10 @@ const PendingOf = (rows: SlayerLinkRow[], me: string, now: number) => rows.filte
 const LinksOf = (rows: SlayerLinkRow[], me: string, now: number) => rows.filter((r) => Involves(r, me) && IsLinked(r, now));
 const LinkedWith = (rows: SlayerLinkRow[], a: string, b: string, now: number) => LinksOf(rows, a, now).some((r) => Other(r, a) === b);
 
+// My active link slots whose partner is in my party: a hunt's XP counts for a link only when hunted together.
+export const HuntedTogetherSlots = (rows: SlayerLinkRow[], me: string, partyMembers: string[], now: number) =>
+    LinksOf(rows, me, now).filter((r) => partyMembers.includes(Other(r, me))).map((r) => LinkSlot(r, me)).filter((s) => s >= 1);
+
 function FreeSlots(rows: SlayerLinkRow[], me: string, now: number): number[] {
     const used = new Set(LinksOf(rows, me, now).map((r) => LinkSlot(r, me)));
     return ALL_SLOTS.filter((s) => !used.has(s));

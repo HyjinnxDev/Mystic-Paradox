@@ -280,7 +280,7 @@ inventoryRouter.post("/inventory", HasParadoxBackendAuth, async (req: any, res) 
     try {
         ExtensionTransaction?.report?.("applying");
         TransactionResult = await RunInventoryTransaction(UserId, CharacterId, TransactionId, InstancedItemsToAdd, StackedItemsToAdd, InstancedItemsToRemove, StackedItemsToRemove, InstancedItemsToSave,
-            { ...(ExtensionTransaction?.options ?? {}), allowChallengeRewardFunding: IsDedicatedServer });
+            { ...(ExtensionTransaction?.options ?? {}), allowChallengeRewardFunding: IsDedicatedServer, source: IsDedicatedServer ? req.body.source : undefined });
     } catch (Err) {
         CaptureInventoryTransaction({
             phase: "error",

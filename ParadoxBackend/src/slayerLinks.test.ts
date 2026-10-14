@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Answer, Availability, DeleteInvites, DeleteLink, Invite, LinksList, RewardsGrant, SaveRewards, SlayerLinkResult, SlayerLinkRow, Status } from "./slayerLinks";
+import { Answer, Availability, DeleteInvites, DeleteLink, HuntedTogetherSlots, Invite, LinksList, RewardsGrant, SaveRewards, SlayerLinkResult, SlayerLinkRow, Status } from "./slayerLinks";
 
 const H = 60 * 60 * 1000;
 const payload = (r: { body: unknown }) => (r.body as any).payload;
@@ -61,6 +61,19 @@ test("invite, accept, list, remove: full Slayer Link round trip", () => {
     s.apply(DeleteLink(s.rows, "B", { slot: 3 }, {}, 5));
     assert.equal(payload(Status(s.rows, "A", 5)).links.length, 0, "removed for both");
     assert.deepEqual(payload(Availability(s.rows, "A", aFriends, ["B"], 5)).availability, [{ account_id: "B", available: true }]);
+});
+
+test("link XP only for links whose partner is in the party", () => {
+    const s = Store();
+    const f = new Set(["A", "B", "C"]);
+    s.apply(Invite(s.rows, "A", f, { account_id: "B", slot: 2 }, 0, "L1"));
+    s.apply(Answer(s.rows, "B", f, { account_id: "A", action: "accept", slot: 3 }, 1));
+    s.apply(Invite(s.rows, "A", f, { account_id: "C", slot: 1 }, 1, "L2"));
+    s.apply(Answer(s.rows, "C", f, { account_id: "A", action: "accept", slot: 1 }, 2));
+    assert.deepEqual(HuntedTogetherSlots(s.rows, "A", ["A", "B"], 3), [2]);
+    assert.deepEqual(HuntedTogetherSlots(s.rows, "B", ["A", "B"], 3), [3]);
+    assert.deepEqual(HuntedTogetherSlots(s.rows, "A", ["A"], 3), [], "solo hunt gives no link XP");
+    assert.deepEqual(HuntedTogetherSlots(s.rows, "A", ["A", "B"], 169 * H), [], "ended link gets no XP");
 });
 
 test("reject, cancel, expiry, delete-all", () => {

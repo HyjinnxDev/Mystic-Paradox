@@ -14,6 +14,11 @@ import { logger } from "../logger";
 import { loadGameData } from "../gameData/loader";
 import { ComputeNewlyUnlockedNodeIds } from "./slayersPath";
 import crypto from "node:crypto";
+import { HUNT_PASS_SLOT_IDS, HuntPassCurve, HuntPassStorageId, IsHuntPassSlot, ServedSlotFor } from "../huntPassRotation";
+import { GetPartyForPlayer } from "./party";
+import { GetMongoDb } from "../persistence/mongo/client";
+import { Collections } from "../persistence/mongo/collections";
+import { HuntedTogetherSlots, LINK_TRACK_PREFIX, SlayerLinkRow } from "../slayerLinks";
 
 // [WP-1 stage 4 — security fix] Per-track rank curves, indexed once (on first use) from the
 // same file GET /progression/config serves. Used to validate confirm/public requests instead of
@@ -56,22 +61,28 @@ function TrackCurves(): Map<string, TrackCurve> {
 // convert "skip N ranks" into an XP delta using the SAME curve this module already validates
 // rank-confirm requests against - not a second, divergent copy of the rank maths.
 export function GetTrackCurve(progressionId: string) {
-    return TrackCurves().get(progressionId);
+    return IsHuntPassSlot(progressionId) ? HuntPassCurve(progressionId) : TrackCurves().get(progressionId);
+}
+
+// Hunt pass progress is stored per PASS ("season43:frostfall"), not per slot, so a slot changing hands at a rotation
+// never mixes progress. Everything else is stored under its own id.
+export const ProgressionStorageId = (progressionId: string) => IsHuntPassSlot(progressionId) ? HuntPassStorageId(progressionId) : progressionId;
+
+// The hunt pass slot this player is on (first cosmetic pass not yet completed, else the currency slot).
+export async function GetServedSlotForUser(userId: string, repos: Pick<RepositoryProvider, "progressionTracks"> = GetRepositories()): Promise<string> {
+    return ServedSlotFor(await repos.progressionTracks.getAllForUser(userId));
 }
 
 // `selected_huntpass` is the symbolic track id the rank-skip SKUs carry; it means "whichever Hunt
-// Pass is currently selected", which for this server is the active season already reported by
-// GET /huntpass/:userId (routes/system.ts) and confirmed in Progress/22_HUNT_PASS.md.
-// [1.14.7 2026-10-08] season43: the 1.14.7 client only enables hunt_pass_season_table rows season43..50
-// (1.12 used season19). The vendored season43 path is a clone of the season19 track whose prestige pays the
-// 1.14.7 seasonal coin (CURRENCY_SEASONAL_COIN, 5/20, as the live season21..27). Progress banked on season19
-// stays stored under season19.
-export const ACTIVE_HUNTPASS_PROGRESSION_ID = "season43";
+// Pass the player is on", i.e. the slot GET /huntpass/:userId (routes/system.ts) answers for them - the caller
+// resolves that (GetServedSlotForUser) and passes it in.
+// [1.14.7] The client only enables hunt_pass_season_table rows season43..50, so those are the hunt pass slots
+// (src/huntPassRotation.ts); what a slot carries rotates.
 export const SELECTED_HUNTPASS_TRACK_ALIAS = "selected_huntpass";
 
-export function ResolveProgressionTrackId(progressionId: string): string | undefined {
-    if (progressionId === SELECTED_HUNTPASS_TRACK_ALIAS) return ACTIVE_HUNTPASS_PROGRESSION_ID;
-    return TrackCurves().has(progressionId) ? progressionId : undefined;
+export function ResolveProgressionTrackId(progressionId: string, servedSlot?: string): string | undefined {
+    if (progressionId === SELECTED_HUNTPASS_TRACK_ALIAS) return servedSlot;
+    return IsHuntPassSlot(progressionId) || TrackCurves().has(progressionId) ? progressionId : undefined;
 }
 
 // [WP-1] Persistent XP (Plans/PROGRESSION_XP_COMBAT_DATA_IMPLEMENTATION_PLAN.md section 16).
@@ -103,7 +114,7 @@ export const APPROVED_XP_PROGRESSION_TRACK_IDS = Object.freeze([
     "PrestigeTrack_Weapon_Spear",
     "PrestigeTrack_Weapon_Sword",
     "PrestigeTrack_Weapon_Strikers",
-    ACTIVE_HUNTPASS_PROGRESSION_ID,
+    ...HUNT_PASS_SLOT_IDS,
     // Slayer Link progress, one per link slot (routes/slayerLinks.ts resets them when a link starts)
     "Linked_Slayer_Slot_1",
     "Linked_Slayer_Slot_2",
@@ -113,7 +124,7 @@ export const APPROVED_XP_PROGRESSION_TRACK_IDS = Object.freeze([
 const ApprovedXpTracks = new Set<string>(APPROVED_XP_PROGRESSION_TRACK_IDS);
 
 export function IsApprovedXpProgressionTrack(progressionId: string): boolean {
-    return ApprovedXpTracks.has(progressionId) && TrackCurves().has(progressionId);
+    return ApprovedXpTracks.has(progressionId) && (IsHuntPassSlot(progressionId) || TrackCurves().has(progressionId));
 }
 
 export function BuildProgressionGrantRequestHash(userId: string, progressionId: string, amount: number): string {
@@ -145,6 +156,24 @@ function IsDuplicateKeyError(ErrorValue: unknown): boolean {
  * ledger are committed in one Mongo transaction. A duplicate-key race aborts that transaction;
  * the bounded retry starts a fresh transaction and returns the committed result instead.
  */
+const LINK_HUNT_PASS_XP_RATIO = 0.1;
+
+// The 1.14.7 game server never grants Slayer Link XP; the live service did it. Hunt pass XP also goes to every
+// active link whose partner is in the player's party (hunted together). A failed lookup must not block the grant.
+async function HuntedTogetherLinkSlots(userId: string): Promise<number[]> {
+    try {
+        const Party = await GetPartyForPlayer(userId);
+        if (!Party || Party.members.length < 2) return [];
+        const Db = await GetMongoDb();
+        const Rows = await Db.collection<SlayerLinkRow>(Collections.SlayerLinks)
+            .find({ $or: [{ senderId: userId }, { targetId: userId }] }).toArray();
+        return HuntedTogetherSlots(Rows, userId, Party.members, Date.now());
+    } catch (ErrorValue) {
+        logger.warn(`[ProgressionGrant] link lookup failed for user=${userId}: ${ErrorValue}`);
+        return [];
+    }
+}
+
 export async function GrantProgressionXp(
     userId: string,
     progressionId: string,
@@ -160,6 +189,7 @@ export async function GrantProgressionXp(
     }
     const requestHash = BuildProgressionGrantRequestHash(userId, progressionId, amount);
     const maxAttempts = 4;
+    const LinkSlots = IsHuntPassSlot(progressionId) ? await HuntedTogetherLinkSlots(userId) : [];
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
@@ -173,8 +203,22 @@ export async function GrantProgressionXp(
                     return { record: Existing.result, replayed: true };
                 }
 
-                const Before = await repos.progressionTracks.get(userId, progressionId, session);
-                const After = await repos.progressionTracks.increment(userId, progressionId, amount, session);
+                const StorageId = ProgressionStorageId(progressionId);
+                const Before = await repos.progressionTracks.get(userId, StorageId, session);
+                const After = await repos.progressionTracks.increment(userId, StorageId, amount, session);
+                // Slayer Link XP also feeds the player's hunt pass (a tenth, at least 1), in the same transaction.
+                if (progressionId.startsWith("Linked_Slayer_Slot_")) {
+                    const PassSlot = await GetServedSlotForUser(userId, repos);
+                    if (IsHuntPassSlot(PassSlot)) {
+                        const PassXp = Math.max(1, Math.round(amount * LINK_HUNT_PASS_XP_RATIO));
+                        const PassAfter = await repos.progressionTracks.increment(userId, ProgressionStorageId(PassSlot), PassXp, session);
+                        logger.info(`[ProgressionGrant] grant=${grantId} link xp +${PassXp} -> hunt pass ${PassSlot} total=${PassAfter.progress}`);
+                    }
+                }
+                for (const Slot of LinkSlots) {
+                    const LinkAfter = await repos.progressionTracks.increment(userId, `${LINK_TRACK_PREFIX}${Slot}`, amount, session);
+                    logger.info(`[ProgressionGrant] grant=${grantId} hunted together -> track=${LINK_TRACK_PREFIX}${Slot} +${amount} total=${LinkAfter.progress}`);
+                }
                 const Ledger: ProgressionGrantRecord = {
                     grantId,
                     userId,
@@ -202,6 +246,13 @@ export async function GrantProgressionXp(
 export async function GetPersistedProgressionForUser(userId: string, knownTrackIds: string[]){
     const Persisted = await GetRepositories().progressionTracks.getAllForUser(userId);
     const PersistedById = new Map(Persisted.map((Row) => [Row.progressionId, Row]));
+    // Hunt pass rows are stored per pass ("season43:frostfall"); each slot is answered with the row of the pass it
+    // carries now, and the other passes' rows (not the client's business) are left out.
+    for (const Slot of HUNT_PASS_SLOT_IDS) {
+        const Row = PersistedById.get(HuntPassStorageId(Slot));
+        if (Row) PersistedById.set(Slot, Row); else PersistedById.delete(Slot);
+    }
+    for (const Id of [...PersistedById.keys()]) if (/^seasond+:/.test(Id)) PersistedById.delete(Id);
 
     const Rows: any[] = [];
 
@@ -224,10 +275,10 @@ export async function GetPersistedProgressionForUser(userId: string, knownTrackI
     // Anything persisted that ISN'T in the known-tracks list is a track ID the client/server
     // referenced that we didn't anticipate — surfaced anyway rather than dropped (plan section
     // 6.2: "preserve unknown runtime track IDs instead of discarding them").
-    for(const Row of PersistedById.values()){
+    for(const [Id, Row] of PersistedById){
         Rows.push({
             phx_account_id: userId,
-            progression_id: Row.progressionId,
+            progression_id: Id,
             progress: Row.progress,
             confirmed_fremium_rank: Row.confirmedFremiumRank,
             confirmed_premium_rank: Row.confirmedPremiumRank,
@@ -250,7 +301,8 @@ export async function GetPersistedProgressionForUser(userId: string, knownTrackI
 export async function CaptureProgressionObjectiveEvent(
     userId: string,
     rawBody: unknown,
-    diagnosticsRepository: Pick<ProgressionTrackRepository, "appendObjectiveEvent"> = GetRepositories().progressionTracks
+    diagnosticsRepository: Pick<ProgressionTrackRepository, "appendObjectiveEvent"> = GetRepositories().progressionTracks,
+    fromGameserver = false
 ){
     const BodyJson = JSON.stringify(rawBody ?? {});
 
@@ -299,7 +351,50 @@ export async function CaptureProgressionObjectiveEvent(
         logger.warn(`[ProgressionObjective] user=${userId} UNRECOGNIZED top-level key(s) [${UnrecognizedKeys.join(", ")}] in a progression report - possible unhandled reward/grant payload, not applied. Raw: ${BodyJson.slice(0, 2000)}`);
     }
 
-    logger.info(`[ProgressionObjective] user=${userId} mode=diagnostics-only tracksReceived=${TracksReceived} objectivesReceived=${ObjectivesReceived} authoritativeMutation=0 rawBytes=${BodyJson.length}`);
+    // [1.14.7 mastery] Only the game server's report is authoritative (all real traffic is gsKey=Y).
+    // Objectives are absolute running totals (max-guard). The report's MasteryTrack_* progress is a
+    // per-report delta (+1 PlayerLevel and +1 category track per objective completed in it), but the
+    // server re-completes objectives it already reported (Weapon_Sword_Embermane_Craft came in ~25
+    // times in one day), so trusting those deltas inflated levels. Points are instead derived here
+    // from objectives whose completed_count actually rose past what is stored.
+    // ponytail: read-then-max-guard is not atomic; one game server reports a player at a time, so
+    // concurrent reports for the same objective are not expected. Use a conditional update if they are.
+    let MasteryPointsApplied = 0;
+    if(fromGameserver){
+        const Repo = GetRepositories().progressionTracks;
+        const Stored = new Map((await Repo.getAllObjectivesForUser(userId)).map((Row) => [Row.objectiveId, Row.completedCount]));
+        const Points = new Map<string, number>();
+        for(const Objective of (Body.objectives ?? [])){
+            const Completed = Number(Objective.completed_count ?? 0);
+            await Repo.setObjectiveIfGreater(userId, Objective.objective_id, Number(Objective.value), Completed);
+            const Track = MasteryTrackForObjective(Objective.objective_id);
+            const Gained = Completed - (Stored.get(Objective.objective_id) ?? 0);
+            if(!Track || !Number.isInteger(Gained) || Gained <= 0) continue;
+            Points.set(Track, (Points.get(Track) ?? 0) + Gained);
+            Points.set("MasteryTrack_PlayerLevel", (Points.get("MasteryTrack_PlayerLevel") ?? 0) + Gained);
+        }
+        for(const [TrackId, Gained] of Points){
+            await Repo.increment(userId, TrackId, Gained);
+            if(TrackId === "MasteryTrack_PlayerLevel") MasteryPointsApplied = Gained;
+        }
+    }
+
+    logger.info(`[ProgressionObjective] user=${userId} mode=${fromGameserver ? "gameserver-applied" : "diagnostics-only"} tracksReceived=${TracksReceived} objectivesReceived=${ObjectivesReceived} masteryPointsApplied=${MasteryPointsApplied} rawBytes=${BodyJson.length}`);
+}
+
+// Objective id code -> mastery track. Weapon codes are the ones present in the 1.14.7 paks
+// (MasteryObjective_Weapon_<code>_*).
+const MASTERY_WEAPON_TRACKS: Record<string, string> = {
+    Axe: "MasteryTrack_Weapon_Axe", CB: "MasteryTrack_Weapon_ChainBlades", DP: "MasteryTrack_Weapon_Repeaters",
+    Hammer: "MasteryTrack_Weapon_Hammer", Pike: "MasteryTrack_Weapon_Spear", Strikers: "MasteryTrack_Weapon_Strikers",
+    Sword: "MasteryTrack_Weapon_Sword",
+};
+
+export function MasteryTrackForObjective(objectiveId: string): string | undefined {
+    const [Prefix, Kind, Code] = objectiveId.split("_");
+    if(Prefix !== "MasteryObjective") return undefined;
+    if(Kind === "Behemoth") return "MasteryTrack_Behemoth";
+    return Kind === "Weapon" ? MASTERY_WEAPON_TRACKS[Code] : undefined;
 }
 
 export function IsAuthorizedProgressionReporter(authData: any, targetUserId: string): boolean {
@@ -320,8 +415,14 @@ export async function GetPersistedObjectivesForUser(userId: string){
 
     return Rows.map((Row) => ({
         objective_id: Row.objectiveId,
+        // Captured live contract (GetObjectiveProgression) names this `progress`; without it the game
+        // server reads 0 and re-completes every objective each session. `value` kept for older readers.
+        progress: Row.value,
         value: Row.value,
         completed_count: Row.completedCount,
+        phx_account_id: userId,
+        created_date: Row.updatedAt,
+        last_modified_date: Row.updatedAt,
     }));
 }
 
@@ -345,7 +446,7 @@ export type ConfirmRankResult =
     | { ok: false; reason: "unknown_track" | "rank_out_of_range" | "insufficient_xp" };
 
 export async function ConfirmPublicProgressionRank(userId: string, progressionId: string, rank: number): Promise<ConfirmRankResult> {
-    const Curve = TrackCurves().get(progressionId);
+    const Curve = GetTrackCurve(progressionId);
     if (Curve === undefined) {
         logger.warn(`Rejected rank confirm: unknown track '${progressionId}' has no rank curve (user=${userId})`);
         return { ok: false, reason: "unknown_track" };
@@ -359,7 +460,7 @@ export async function ConfirmPublicProgressionRank(userId: string, progressionId
     // Rank 0/1 (pre-first-requirement) never needs an XP check — every track's floor.
     const RequiredCumulativeXp = Curve.cumulativeXpForRank.get(rank) ?? 0;
     if (RequiredCumulativeXp > 0) {
-        const ExistingTrack = await GetRepositories().progressionTracks.get(userId, progressionId);
+        const ExistingTrack = await GetRepositories().progressionTracks.get(userId, ProgressionStorageId(progressionId));
         const PersistedProgress = ExistingTrack?.progress ?? 0;
 
         if (PersistedProgress < RequiredCumulativeXp) {
@@ -368,7 +469,7 @@ export async function ConfirmPublicProgressionRank(userId: string, progressionId
         }
     }
 
-    const Record = await GetRepositories().progressionTracks.setConfirmedFremiumRank(userId, progressionId, rank);
+    const Record = await GetRepositories().progressionTracks.setConfirmedFremiumRank(userId, ProgressionStorageId(progressionId), rank);
     return { ok: true, record: Record };
 }
 

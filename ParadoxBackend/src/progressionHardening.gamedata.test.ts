@@ -13,7 +13,8 @@ import {
     IsAuthorizedProgressionReporter,
     IsCharacterOwnedByUser
 } from "./controllers/progression";
-import { CaptureProgressionObjectiveEvent } from "./controllers/progression";
+import { CaptureProgressionObjectiveEvent, MasteryTrackForObjective } from "./controllers/progression";
+import { HuntPassMaxXp, HuntPassStorageId } from "./huntPassRotation";
 
 const Track = {
     userId: "user-1",
@@ -164,6 +165,34 @@ test("same authoritative grant replays its recorded result and never increments 
     assert.equal(Sessions.every((CurrentSession) => CurrentSession === Session), true);
 });
 
+test("hunt pass XP is stored per pass, and Slayer Link XP feeds the pass the player is on", async () => {
+    const Stored = new Map<string, number>();
+    const Row = (Id: string) => ({ ...Track, progressionId: Id, progress: Stored.get(Id) ?? 0 });
+    const Repositories: any = {
+        progressionGrants: { findByGrantId: async () => undefined, insertApplied: async () => undefined },
+        progressionTracks: {
+            get: async (_U: string, Id: string) => Stored.has(Id) ? Row(Id) : undefined,
+            increment: async (_U: string, Id: string, Amount: number) => { Stored.set(Id, (Stored.get(Id) ?? 0) + Amount); return Row(Id); },
+            getAllForUser: async () => [...Stored.keys()].map(Row)
+        }
+    };
+    const UnitOfWork: any = { withTransaction: async (Action: any) => Action(Repositories, {}) };
+    const Frost = HuntPassStorageId("season43");
+    assert.match(Frost, /^season43:/);
+
+    await GrantProgressionXp("user-1", "season43", 300, "hp-1", UnitOfWork);
+    assert.equal(Stored.get(Frost), 300);
+    assert.equal(Stored.has("season43"), false);                       // never under the bare slot id
+
+    await GrantProgressionXp("user-1", "Linked_Slayer_Slot_1", 500, "link-1", UnitOfWork);
+    assert.equal(Stored.get(Frost), 350);                              // a tenth of 500 reached the pass
+
+    Stored.set(Frost, HuntPassMaxXp("season43"));                      // season43's pass completed ...
+    await GrantProgressionXp("user-1", "Linked_Slayer_Slot_1", 500, "link-2", UnitOfWork);
+    assert.equal(Stored.get(HuntPassStorageId("season44")), 50);       // ... so the link feeds the next one
+    assert.equal(Stored.get(Frost), HuntPassMaxXp("season43"));
+});
+
 test("grant request mismatch is rejected before a second mutation", async () => {
     const Ledger = new Map<string, any>();
     let IncrementCount = 0;
@@ -220,4 +249,11 @@ test("a duplicate-key transaction race retries outside the aborted session", asy
     assert.equal(Attempts, 2);
     assert.equal(Increments, 1);
     assert.equal(Result.replayed, true);
+});
+
+test("mastery objectives map to their category track", () => {
+    assert.equal(MasteryTrackForObjective("MasteryObjective_Behemoth_Embermane_Kill"), "MasteryTrack_Behemoth");
+    assert.equal(MasteryTrackForObjective("MasteryObjective_Weapon_DP_Quillshot_Craft"), "MasteryTrack_Weapon_Repeaters");
+    assert.equal(MasteryTrackForObjective("MasteryObjective_Weapon_Pike_Generic_Kills1"), "MasteryTrack_Weapon_Spear");
+    assert.equal(MasteryTrackForObjective("AchievementObjective_Discover_Collectables"), undefined);
 });

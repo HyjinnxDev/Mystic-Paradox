@@ -103,7 +103,18 @@ slayerLinksRouter.delete("/slayerlink/invites/:accountId", HasParadoxBackendAuth
     Send(res, Result.reply);
 });
 
-slayerLinksRouter.delete("/slayerlink/links", HasParadoxBackendAuth, async (req, res) => {
+// Unlink comes from the game server: {links:[{account_id, slot, delete_pair}]}, account_id = the link's owner.
+// A link is one row shared by both players, so removing it always unlinks the pair (delete_pair is not needed).
+slayerLinksRouter.delete("/slayerlink/links", HasParadoxBackendAuth, async (req: any, res) => {
+    if (req.AuthData?.IsGameserver) {
+        const Entries = req.body?.links;
+        if (!Array.isArray(Entries) || Entries.length === 0 || Entries.length > 3) return res.status(400).send();
+        for (const E of Entries) {
+            const Owner = RewardOwner(req, res, E?.account_id); if (!Owner) return;
+            await Apply(DeleteLink(await RowsOf([Owner]), Owner, { slot: E?.slot }, {}, Date.now()));
+        }
+        return res.status(200).json({});
+    }
     const Me = Player(req, res); if (!Me) return;
     const Result = DeleteLink(await RowsOf([Me]), Me, req.body, req.query, Date.now());
     await Apply(Result);

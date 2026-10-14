@@ -13,6 +13,7 @@ import {
     BountySaveValidationError,
     BountyStatePayload,
     DefaultDraftData,
+    DeleteFromBountyState,
     FindFundableSeasonClaim,
     InferBountyGroup,
     IsAuthorizedBountyReader,
@@ -119,6 +120,24 @@ test("a daily draft replaces the previous daily bounty and leaves the season cha
     assert.deepEqual(Ids, ["43_2_1_Challenge_Season_GatherablesAny-season43-1", "Challenge_Daily_Bronze_KillBlazeWeapon"]);
     assert.equal(Record.bounties.find((Entry) => Entry.group === "weekly")!.bounty.objectives[0].progress, 5);
     assert.deepEqual((Record.draftData.daily as any).previous_draft_selections.length, 2);
+});
+
+test("drafting a base bounty keeps the other selected bounties and only replaces its own slot", () => {
+    const Base = (id: string, slot: number) => ({ ...Daily(id, `2026-10-13T14:3${slot}:00.000Z`), slot_index: slot });
+    let Record = Apply(undefined, { bounties: [Base("Bounty_Bronze_A", 0)], draft_data: DefaultDraftData() });
+    Record = Apply(Record, { bounties: [Base("Bounty_Silver_B", 1)], draft_data: DefaultDraftData() });
+    Record = Apply(Record, { bounties: [Base("Bounty_Gold_C", 0)], draft_data: DefaultDraftData() });
+    assert.deepEqual(Record.bounties.map((Entry) => Entry.bounty.bounty_id).sort(), ["Bounty_Gold_C", "Bounty_Silver_B"]);
+});
+
+test("a claim deletes the base bounty but never a season challenge", () => {
+    const SeasonId = "43_2_1_Challenge_Season_GatherablesAny-season43-1";
+    let Record = Apply(undefined, { bounties: [Season(SeasonId, 5, true)], draft_data_weekly: DefaultDraftData() });
+    Record = Apply(Record, { bounties: [Daily("Bounty_Bronze_A", NOW, 3)], draft_data: DefaultDraftData() });
+    const { record, removed } = DeleteFromBountyState(Record, { bounty_ids: ["Bounty_Bronze_A", SeasonId, "unknown"] }, NOW);
+    assert.deepEqual(removed, ["Bounty_Bronze_A"]);
+    assert.deepEqual(record!.bounties.map((Entry) => Entry.bounty.bounty_id), [SeasonId]);
+    assert.throws(() => DeleteFromBountyState(Record, {}), BountySaveValidationError);
 });
 
 test("a single-bounty save updates progress; a new drafted_timestamp is a new instance", () => {
