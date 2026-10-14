@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CanActOn, HasStaffPermission, StaffRank } from "./staffRoles";
+import { CanActOn, HasStaffPermission, StaffNameTag, StaffRank, StripStaffNameTag } from "./staffRoles";
 
 test("staff tiers gate permissions", () => {
     assert.equal(StaffRank(["player"]), 0);
@@ -18,4 +18,12 @@ test("staff only act on lower ranks, never themselves or peers", () => {
     assert.equal(CanActOn(["moderator"], ["admin"]), false);
     assert.equal(CanActOn(["admin"], ["moderator"]), true);
     assert.equal(CanActOn(["admin", "owner"], ["admin", "owner"]), false);
+});
+
+test("staff name tag round-trips", () => {
+    assert.equal(StaffNameTag(["player", "admin", "owner"]), "[Owner] ");
+    assert.equal(StaffNameTag(["admin"]), "[Admin] ");
+    assert.equal(StaffNameTag(["moderator"]), "");
+    assert.equal(StripStaffNameTag("[Owner] Hyjinnx"), "Hyjinnx");
+    assert.equal(StripStaffNameTag("Hyjinnx"), "Hyjinnx");
 });

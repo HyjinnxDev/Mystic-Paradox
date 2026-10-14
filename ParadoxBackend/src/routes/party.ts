@@ -12,7 +12,7 @@
 import { Router } from "express";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
-import { GetUsernameForUserId } from "../controllers/login";
+import { GetDisplayNameForUserId } from "../controllers/login";
 import {
     GetOrCreateParty,
     InviteToParty,
@@ -48,7 +48,7 @@ partyRouter.post("/party", HasParadoxBackendAuth, async (req: any, res) => {
 
     const PlayerStates = await Promise.all(Party.members.map(async (Member) => ({
         consoleSessionId: null,
-        displayName: await GetUsernameForUserId(Member),
+        displayName: await GetDisplayNameForUserId(Member),
         isMemberOfCandidate: InHunt ? true : Member === Party.leaderPlayerId,
         platform: PLATFORM,
         playerId: Member
@@ -72,7 +72,7 @@ partyRouter.put("/party/invite", HasParadoxBackendAuth, async (req: any, res) =>
     const BuildId: string = req.body?.buildId ?? "";
 
     if (typeof RecipientId === "string" && RecipientId.length > 0) {
-        const SenderName = await GetUsernameForUserId(UserId);
+        const SenderName = await GetDisplayNameForUserId(UserId);
         await InviteToParty(UserId, RecipientId, BuildId, SenderName, PLATFORM);
         logger.info(`${UserId} invited ${RecipientId} to their party`);
     }

@@ -5264,6 +5264,136 @@ static void Tick() {
 
 }  // namespace BehemothHealthBar
 
+// [1.14.7 2026-10-15] Staff nameplates. The backend prefixes server owners' and admins' names with "[Owner] " /
+// "[Admin] " (ParadoxBackend security/staffRoles.ts StaffNameTag), which is what chat and the nameplate show. Here
+// the nameplate is styled by that prefix: owners get pulsing gold text with an orange glow and a "Server Owner"
+// title line, admins plain light-blue text. Client only, game thread, from ProcessEventClientHook like the
+// behemoth bar. DISABLE_STAFF_NAMEPLATES.flag beside the exe turns it off.
+// ponytail: re-reads plate text every kScanMs; hook UNamePlatesWidget::UpdateName instead if that ever costs.
+namespace StaffNameplates {
+
+using BehemothHealthBar::Ref;
+enum class Tier { None, Admin, Owner };
+struct Plate { Ref W; Tier T = Tier::None; };
+
+constexpr ULONGLONG kTickMs = 100, kScanMs = 1000;
+static const SDK::FLinearColor kAdmin{ 0.35f, 0.72f, 1.f, 1.f };
+static const SDK::FLinearColor kOwnerLo{ 1.f, 0.62f, 0.08f, 1.f }, kOwnerHi{ 1.f, 0.9f, 0.45f, 1.f };
+static const SDK::FLinearColor kOwnerGlow{ 0.95f, 0.3f, 0.f, 1.f };
+static const SDK::FLinearColor kOwnerTitle{ 1.f, 0.5f, 0.05f, 1.f };   // legendary orange
+
+static std::vector<Plate> s_Plates;
+static ULONGLONG s_NextTick = 0, s_NextScan = 0;
+static int s_Logs = 0;
+static volatile bool s_Faulted = false;
+
+static void Log(const std::string& Msg) {
+    if (s_Logs++ < 40) MpLog("[StaffNameplate] " + Msg);
+}
+
+static void SetColor(SDK::UTextBlock* Tb, const SDK::FLinearColor& C) {
+    SDK::FSlateColor S{};
+    S.SpecifiedColor = C;
+    S.ColorUseRule = SDK::ESlateColorStylingMode::UseColor_Specified;
+    Tb->SetColorAndOpacity(S);
+}
+
+// One-time look per plate when its tier is first seen: owner gets the glow outline and the title line.
+static void Decorate(SDK::UNamePlatesWidget* W, Tier T) {
+    SDK::UTextBlock* Name = W->TextBlock_Name;
+    if (!Name) return;
+    if (T == Tier::Owner) {
+        SDK::FSlateFontInfo F = Name->Font;          // copied bitwise; SetFont copies it natively
+        F.OutlineSettings.OutlineSize = 2;
+        F.OutlineSettings.OutlineColor = kOwnerGlow;
+        Name->SetFont(F);
+        if (SDK::UTextBlock* Title = W->TextBlock_Title) {
+            Title->SetText(SDK::UKismetTextLibrary::Conv_StringToText(SDK::FString(L"Server Owner")));
+            SetColor(Title, kOwnerTitle);
+            Title->SetVisibility(SDK::ESlateVisibility::HitTestInvisible);
+        }
+    } else {
+        SetColor(Name, kAdmin);
+    }
+}
+
+static Tier TierOf(SDK::UNamePlatesWidget* W) {
+    if (!W->TextBlock_Name) return Tier::None;
+    const std::string Text = SDK::UKismetTextLibrary::Conv_TextToString(W->TextBlock_Name->GetText()).ToString();
+    if (Text.rfind("[Owner]", 0) == 0) return Tier::Owner;
+    if (Text.rfind("[Admin]", 0) == 0) return Tier::Admin;
+    return Tier::None;
+}
+
+static void Update() {
+    static const bool s_Disabled = MpExeRelativeFlagPresent(L"DISABLE_STAFF_NAMEPLATES.flag");
+    if (s_Disabled) return;
+    const ULONGLONG Now = GetTickCount64();
+    if (Now < s_NextTick) return;
+    s_NextTick = Now + kTickMs;
+
+    if (Now >= s_NextScan) {
+        s_NextScan = Now + kScanMs;
+        SDK::UWorld* World = SDK::UWorld::GetWorld();
+        if (!World) return;
+        static auto* s_Found = new SDK::TArray<SDK::UUserWidget*>();   // engine-allocated, never freed (exit-safe)
+        SDK::UWidgetBlueprintLibrary::GetAllWidgetsOfClass(World, s_Found, SDK::UNamePlatesWidget::StaticClass(), false);
+        std::vector<Plate> Next;
+        for (int32_t i = 0; i < s_Found->Num(); ++i) {
+            auto* W = static_cast<SDK::UNamePlatesWidget*>((*s_Found)[i]);
+            if (!W) continue;
+            const Tier T = TierOf(W);
+            if (T == Tier::None) continue;
+            auto Old = std::find_if(s_Plates.begin(), s_Plates.end(), [&](const Plate& P) { return P.W.Get() == W; });
+            if (Old == s_Plates.end() || Old->T != T) {
+                Decorate(W, T);
+                Log(std::string(T == Tier::Owner ? "owner" : "admin") + " plate " + W->GetFullName());
+            }
+            Next.push_back(Plate{});
+            Next.back().W.Set(W);
+            Next.back().T = T;
+        }
+        static bool s_LoggedCount = false;
+        if (!s_LoggedCount && s_Found->Num() > 0) {
+            s_LoggedCount = true;
+            Log("first scan: " + std::to_string(s_Found->Num()) + " nameplates, " + std::to_string(Next.size()) + " staff");
+        }
+        s_Plates.swap(Next);
+    }
+
+    // Owner pulse, ~2.5 s period. Colours are re-applied every tick: the game recolours names on its own updates.
+    const float Phase = 0.5f + 0.5f * std::sin(static_cast<float>(Now % 2500) / 2500.f * 6.2831853f);
+    const SDK::FLinearColor Pulse{
+        kOwnerLo.R + (kOwnerHi.R - kOwnerLo.R) * Phase, kOwnerLo.G + (kOwnerHi.G - kOwnerLo.G) * Phase,
+        kOwnerLo.B + (kOwnerHi.B - kOwnerLo.B) * Phase, 1.f };
+    for (const Plate& P : s_Plates) {
+        auto* W = P.W.Get<SDK::UNamePlatesWidget>();
+        if (!W || !W->TextBlock_Name) continue;
+        SetColor(W->TextBlock_Name, P.T == Tier::Owner ? Pulse : kAdmin);
+    }
+}
+
+static void UpdateGuarded() {
+    if (s_Faulted) return;
+    __try {
+        Update();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        s_Faulted = true;
+    }
+}
+
+static void Tick() {
+    if (Globals::AmServer) return;
+    UpdateGuarded();
+    static bool s_FaultLogged = false;
+    if (s_Faulted && !s_FaultLogged) {
+        s_FaultLogged = true;
+        MpLog("[StaffNameplate] fault in update - off for this session");
+    }
+}
+
+}  // namespace StaffNameplates
+
 void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender) {
     if (GameEngine != nullptr && g_GameEnginePtr == nullptr) {
         g_GameEnginePtr = GameEngine;
@@ -12501,6 +12631,7 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     if (s_processEventDepthClient == 1
         && GetCurrentThreadId() == g_clientGameThreadId.load(std::memory_order_relaxed)) {
         BehemothHealthBar::Tick();
+        StaffNameplates::Tick();
         VoiceSettings::Tick();
     }
 

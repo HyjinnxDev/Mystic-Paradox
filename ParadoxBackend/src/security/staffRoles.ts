@@ -30,6 +30,16 @@ export function HasStaffPermission(roles: readonly string[], permission: StaffPe
     return StaffRank(roles) >= MIN_RANK[permission];
 }
 
+/** Prefix the game shows before staff names (nameplate, chat, party). The client DLL styles
+ *  nameplates by it (MysticParadox.dll, StaffNameplates), so keep the two in step. */
+export function StaffNameTag(roles: readonly string[]): string {
+    const Rank = StaffRank(roles);
+    return Rank === 3 ? "[Owner] " : Rank === 2 ? "[Admin] " : "";
+}
+
+/** Strips a StaffNameTag so a name the game echoes back still finds the account. */
+export const StripStaffNameTag = (name: string): string => name.replace(/^\[(Owner|Admin)\]\s*/i, "");
+
 /** Staff may only act on accounts ranked strictly below them (a moderator can't ban an admin). */
 export function CanActOn(actorRoles: readonly string[], targetRoles: readonly string[]): boolean {
     return StaffRank(actorRoles) > StaffRank(targetRoles);

@@ -13,7 +13,7 @@ import { Router } from "express";
 import { logger } from "../logger";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { GetRepositories } from "../persistence";
-import { GetUsernameForUserId } from "../controllers/login";
+import { GetDisplayNameForUserId } from "../controllers/login";
 
 export const loginRouter = Router();
 
@@ -77,7 +77,7 @@ loginRouter.post("/login", HasParadoxBackendAuth, async (req: any, res) => {
 loginRouter.get("/accountinfo", HasParadoxBackendAuth, async (req: any, res) => {
     logger.info("Account info")
 
-    const Username = await GetUsernameForUserId(req.AuthData.userId);
+    const Username = await GetDisplayNameForUserId(req.AuthData.userId);
 
     res.json({
         "accountId" : req.AuthData.userId,
@@ -147,7 +147,7 @@ loginRouter.post("/accountinfo/public", HasParadoxBackendAuth, async (req: any, 
         AuthenticatedUserId !== AccountIdToLookupFromRequest
         ? AuthenticatedUserId
         : AccountIdToLookupFromRequest;
-    const Username = await GetUsernameForUserId(NameLookupUserId);
+    const Username = await GetDisplayNameForUserId(NameLookupUserId);
 
     // We allow anybody to look up anybody's account from their account id.
     // IMPORTANT: echo the LOOKED-UP accountId (not the requestor's own). Returning the

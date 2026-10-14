@@ -15,6 +15,7 @@ import { logger } from "../logger";
 import { GetUserIDForAPIKey, SignMetagameJWTForUid, ValidateMetagameJWTAndGetPayload } from "../controllers/auth";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { GetUsernameForUserId } from "../controllers/login";
+import { StaffNameTag, StripStaffNameTag } from "../security/staffRoles";
 import { GetRepositories } from "../persistence";
 import { HashOpaqueToken } from "../security/launcherTokens";
 import { IsAccountEligible } from "../security/accountEligibility";
@@ -342,7 +343,9 @@ async function LookupEpicPublicAccount(accountId: string, displayNameOverride?: 
 
     return {
         id: accountId,
-        displayName: displayNameOverride ?? LauncherAccount?.displayName ?? Account?.name ?? accountId,
+        displayName: displayNameOverride
+            ?? (LauncherAccount?.displayName ? StaffNameTag(LauncherAccount.roles) + LauncherAccount.displayName : undefined)
+            ?? Account?.name ?? accountId,
         // The Epic account is the core profile above. This map is only for linked
         // external platforms (PSN/XBL/etc.), so do not fabricate an "epic" entry.
         externalAuths: {}
@@ -360,7 +363,7 @@ eosRouter.get("/account/api/public/account/:AccId", async (req, res) => {
     const RequesterAccount = IsLegacySelfAlias
         ? await GetRepositories().launcherAccounts.findByUserId(RequesterId)
         : undefined;
-    const Account = await LookupEpicPublicAccount(req.params.AccId, IsLegacySelfAlias ? RequesterAccount?.displayName : undefined);
+    const Account = await LookupEpicPublicAccount(req.params.AccId, IsLegacySelfAlias && RequesterAccount ? StaffNameTag(RequesterAccount.roles) + RequesterAccount.displayName : undefined);
     if (Account === undefined) {
         res.status(404).send();
         return;
@@ -386,7 +389,7 @@ eosRouter.get("/account/api/public/account/:AccId/externalAuths", async (req, re
 // (real registered players). Returns 404 if no such display name exists.
 eosRouter.get("/account/api/public/account/displayName/:displayName", async (req, res) => {
     const DisplayName = typeof req.params.displayName === "string" ? req.params.displayName.trim() : "";
-    const Account = await GetRepositories().launcherAccounts.findByDisplayNameNormalized(DisplayName.toLowerCase());
+    const Account = await GetRepositories().launcherAccounts.findByDisplayNameNormalized(StripStaffNameTag(DisplayName).toLowerCase());
 
     if (Account === undefined) {
         logger.info(`Display-name lookup miss: ${DisplayName}`);
@@ -397,7 +400,7 @@ eosRouter.get("/account/api/public/account/displayName/:displayName", async (req
     logger.info(`Display-name lookup: ${DisplayName} -> ${Account.userId}`);
     res.json({
         id: Account.userId,
-        displayName: Account.displayName,
+        displayName: StaffNameTag(Account.roles) + Account.displayName,
         externalAuths: {}
     });
 });
@@ -441,7 +444,7 @@ eosRouter.get("/account/api/public/account", HasParadoxBackendAuth, async (req: 
     const AuthenticatedLauncherAccount = await GetRepositories().launcherAccounts.findByUserId(req.AuthData.userId);
     const Accounts = (await Promise.all(RequestedIds.map((RequestedId) => {
         const IsLegacySelfAlias = RequestedId === DEV_USER_ID && req.AuthData.userId !== DEV_USER_ID;
-        return LookupEpicPublicAccount(RequestedId, IsLegacySelfAlias ? AuthenticatedLauncherAccount?.displayName : undefined);
+        return LookupEpicPublicAccount(RequestedId, IsLegacySelfAlias && AuthenticatedLauncherAccount ? StaffNameTag(AuthenticatedLauncherAccount.roles) + AuthenticatedLauncherAccount.displayName : undefined);
     })))
         .filter((Account): Account is EpicPublicAccount => Account !== undefined);
 
