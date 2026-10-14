@@ -165,6 +165,7 @@
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="CrashReporter.cpp" />
+    <ClCompile Include="Voice.cpp" />
     <ClCompile Include="..\tools\CatalogExporter\StoreRuntimeExporter.cpp">
       <ObjectFileName>$(IntDir)StoreRuntimeExporter.obj</ObjectFileName>
     </ClCompile>

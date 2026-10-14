@@ -4852,6 +4852,103 @@ static constexpr uint64_t kClientRolePumpStableChainMs = 750;
 //     ManualTickDispatchSEH code=0xC0000005 params=0x0,0x88 regs{rax=0x0 ...}
 // 0x88 is UNetDriver::ServerConnection, which Networking::Listen deliberately nulls - i.e. the code was
 // following a client-style path off a garbage base. Calling it with the real engine is the correct fix.
+// [1.14.7 2026-10-14] In-game voice (Voice.cpp) follows the game's own Audio settings: the "Voice chat" toggle
+// (UArchonGameUserSettings::bVoiceChatEnabled +0x244) turns it on/off and the voice chat volume slider
+// (VoiceChatVolume +0x248) sets playback gain. Client game thread, 1 Hz.
+// Also a one-off discovery log [VoipMenu] for adding a push-to-talk keybind and a PTT/open-mic option to the
+// options menu: the keybinding DataTable rows (OptionsKeybindingData), voice-ish input action names, and the
+// widget tree around the Audio tab's Voice chat toggle. Read-only.
+namespace VoiceSettings {
+    static void LogKeybindTables() {
+        static std::set<void*> s_seen;
+        for (int i = 0; i < SDK::UObject::GObjects->Num(); i++) {
+            SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+            if (!Obj || Obj->IsDefaultObject() || !Obj->IsA(SDK::UDataTable::StaticClass())) continue;
+            auto* Dt = static_cast<SDK::UDataTable*>(Obj);
+            if (!Dt->RowStruct || Dt->RowStruct->GetName() != "OptionsKeybindingData" || s_seen.count(Dt)) continue;
+            s_seen.insert(Dt);
+            MpLog("[VoipMenu] keybind table " + Dt->GetFullName() + " rows=" + std::to_string(Dt->RowMap.Num()));
+            for (auto& Pair : Dt->RowMap) {
+                auto* Row = reinterpret_cast<SDK::FOptionsKeybindingData*>(Pair.Value());
+                if (!Row || !IsReadablePointer(Row, sizeof(SDK::FOptionsKeybindingData))) continue;
+                MpLog("[VoipMenu]   row=" + Pair.Key().GetRawString() + " action=" + Row->Action.GetRawString()
+                    + " group=" + std::to_string(static_cast<int>(Row->GroupCategory))
+                    + " ctx=" + std::to_string(static_cast<int>(Row->InputContext))
+                    + " press=" + std::to_string(static_cast<int>(Row->KeyPress))
+                    + " uiAction=" + std::to_string(static_cast<int>(Row->InputAction))
+                    + " axis=" + std::to_string(Row->bIsAxisMapping) + " hidden=" + std::to_string(Row->bHidden)
+                    + " name=\"" + SafeFTextToString(&Row->ActionDisplayName) + "\"");
+            }
+        }
+    }
+
+    static void LogVoiceActionMappings() {
+        static bool s_done = false;
+        if (s_done) return;
+        SDK::UInputSettings* In = SDK::UInputSettings::GetInputSettings();
+        if (!In) return;
+        s_done = true;
+        // UInputSettings::ActionMappings (private) +0x80; FInputActionKeyMapping is 0x28 with FKey.KeyName at +0x10.
+        auto& Arr = *reinterpret_cast<SDK::TArray<uint8_t>*>(reinterpret_cast<uintptr_t>(In) + 0x80);
+        const uint8_t* Data = *reinterpret_cast<uint8_t* const*>(&Arr);
+        const int Num = Arr.Num();
+        std::string All;
+        for (int i = 0; i < Num && Data; ++i) {
+            const auto& Action = *reinterpret_cast<const SDK::FName*>(Data + i * 0x28);
+            const auto& Key = *reinterpret_cast<const SDK::FName*>(Data + i * 0x28 + 0x10);
+            All += " " + Action.GetRawString() + "=" + Key.GetRawString();
+        }
+        MpLog("[VoipMenu] input action mappings (" + std::to_string(Num) + "):" + All);
+    }
+
+    static void LogAudioTab() {
+        static std::set<void*> s_seen;
+        for (int i = 0; i < SDK::UObject::GObjects->Num(); i++) {
+            SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+            if (!Obj || Obj->IsDefaultObject() || !Obj->IsA(SDK::UOptionsCatAudio::StaticClass()) || s_seen.count(Obj)) continue;
+            auto* Cat = static_cast<SDK::UOptionsCatAudio*>(Obj);
+            SDK::UWidget* Toggle = reinterpret_cast<SDK::UWidget*>(Cat->AdvancedVoiceChatToggle);
+            if (!Toggle || !IsReadablePointer(Toggle, 0x40)) continue;
+            s_seen.insert(Obj);
+            MpLog("[VoipMenu] audio tab " + Cat->GetFullName() + " voiceToggle=" + Toggle->Class->GetName()
+                + " carousel=" + (Cat->AdvancedDynamicRangeCarousel ? Cat->AdvancedDynamicRangeCarousel->Class->GetName() : std::string("null")));
+            SDK::UWidget* W = Toggle;
+            for (int Depth = 0; Depth < 4 && W && W->Slot && IsReadablePointer(W->Slot, 0x40); ++Depth) {
+                SDK::UPanelWidget* Parent = W->Slot->Parent;
+                if (!Parent || !IsReadablePointer(Parent, 0x180)) break;
+                auto& Slots = *reinterpret_cast<SDK::TArray<SDK::UPanelSlot*>*>(reinterpret_cast<uintptr_t>(Parent) + 0x170);
+                std::string Kids;
+                for (int k = 0; k < Slots.Num(); ++k) {
+                    SDK::UPanelSlot* S = Slots[k];
+                    if (S && IsReadablePointer(S, 0x40) && S->Content) Kids += " " + S->Content->GetName() + ":" + S->Content->Class->GetName();
+                }
+                MpLog("[VoipMenu]   parent[" + std::to_string(Depth) + "] " + Parent->GetName() + ":" + Parent->Class->GetName()
+                    + " slot=" + W->Slot->Class->GetName() + " children=" + std::to_string(Slots.Num()) + Kids);
+                W = Parent;
+            }
+        }
+    }
+
+    static void Tick() {
+        static uint64_t s_nextMs = 0;
+        const uint64_t Now = GetTickCount64();
+        if (Now < s_nextMs) return;
+        s_nextMs = Now + 1000;
+        static SDK::UArchonGameUserSettings* s_settings = nullptr;
+        if (!s_settings) s_settings = SDK::UArchonGameplayStatics::GetArchonGameUserSettings();
+        if (s_settings && IsReadablePointer(s_settings, 0x250)) {
+            MpVoiceApplySettings(s_settings->bVoiceChatEnabled, s_settings->VoiceChatVolume);
+        }
+        if (!SDK::UObject::GObjects) return;
+        static int s_scan = 0;
+        if (s_scan++ % 5 == 0) {                          // discovery every 5 s (tables/widgets load lazily)
+            LogKeybindTables();
+            LogVoiceActionMappings();
+            LogAudioTab();
+        }
+    }
+}
+
 // [1.14.7 2026-10-14] Behemoth health bar: the old-style fixed bar with the HP number ("12,345/15,654") at the
 // bottom middle of the screen, as the 1.4.4 UE4SS BehemothHealthBars mod drew it. Done here because UE4SS cannot
 // call UFunctions on this build: it takes ProcessEvent from a vtable slot this game customises, gets a stub, and
@@ -12404,6 +12501,7 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     if (s_processEventDepthClient == 1
         && GetCurrentThreadId() == g_clientGameThreadId.load(std::memory_order_relaxed)) {
         BehemothHealthBar::Tick();
+        VoiceSettings::Tick();
     }
 
     if (IsAccessoryUnlockDiagFn) {
@@ -16259,6 +16357,7 @@ void InitClientHooks() {
         MpLog("[ExceptionTrace] (client) AddVectoredExceptionHandler handle=" + MpPtr(VectoredExceptionHandle));
     }
     MpCrashReporterInstall();
+    MpVoiceStart();
     // [1.14.7] +0x02657770 is an exception-text formatter, not the UE unhandled-exception
     // filter. Its ABI differs from UEUnhandledExceptionFilterHook, so do not detour it.
     MpLog("[ExitTrace] (client) UEUnhandledExceptionFilter hook skipped (1.14.7 target ABI mismatch)");

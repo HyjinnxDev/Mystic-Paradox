@@ -44,5 +44,10 @@ void MpCrashReporterInstall();
 // Backend base URL the runtime talks to (scheme://host:port), including the launcher relay override.
 std::wstring MpApiBaseForCrashReports();
 
+// Voice.cpp: in-game party voice chat (client only; off without the launcher's voice relay env).
+void MpVoiceStart();
+// Game thread -> voice threads: the game's Audio "Voice chat" toggle and voice chat volume (0..1).
+void MpVoiceApplySettings(bool enabled, float volume);
+
 // Game thread: UKismetSystemLibrary::QuitGame on the current world.
 void MpQuitGame();

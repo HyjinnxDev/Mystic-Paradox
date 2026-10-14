@@ -16,6 +16,8 @@ build/
 *.dll
 *.exe
 *.lib
+# vendored prebuilt libopus (see opus/README.txt)
+!opus/lib/opus.lib
 *.obj
 *.pdb
 *.ilk
