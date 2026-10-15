@@ -17,6 +17,8 @@ import { directChatService } from "./DirectChatService";
 import { onResourceAvailable, onResourceUnavailable } from "./PresenceService";
 import { roomService } from "./RoomService";
 import { sessionRegistry } from "./SessionRegistry";
+import { GetMongoDb } from "../persistence/mongo/client";
+import { Collections } from "../persistence/mongo/collections";
 import { summarizeFrame } from "./XMPPProtocol";
 import { XMPPSession } from "./XMPPSession";
 import { ConnectionInfo, RealtimeConfig, XmppState } from "./types";
@@ -152,6 +154,11 @@ export class XMPPConnection {
                 if (displaced && displaced !== this) {
                     displaced.close(1001, "replaced by a newer resource");
                 }
+                // Staff dashboard: "online since", last seen and same-IP lookups (controllers/adminServers.ts).
+                const accountId = this.accountId;
+                void GetMongoDb()
+                    .then((db) => db.collection(Collections.Accounts).updateOne({ _id: accountId as any }, { $set: { lastSeenAt: new Date().toISOString(), lastSeenIp: this.remoteIp } }))
+                    .catch((error) => logger.warn(`[XMPP] lastSeen update failed: ${(error as Error).message}`));
             }
         }
         if (action.authFailed) recordAuthFailure(this.remoteIp);

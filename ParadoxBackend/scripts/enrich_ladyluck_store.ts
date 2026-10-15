@@ -127,7 +127,10 @@ for (const LiveOffer of Live) {
         items: KeepPrevious
             ? Previous!.items.map((Item) => ({ ...Item }))
             : LiveOffer.items.map((Item) => ({ catalogId: Item.catalogId, quantity: Item.quantity, instanced: Catalog.get(Item.catalogId)!.isStackable !== true })),
-        duplicateInstancedItems: KeepPrevious ? [...Previous!.duplicateInstancedItems] : [...(LiveOffer.duplicateInstancedItems ?? [])],
+        // A capture without the field (the 1.4.4 one) gets the live rule: cosmetics previewed; PART_, cells, tonics and LT_TRIALS_00 not.
+        duplicateInstancedItems: KeepPrevious && Previous!.duplicateInstancedItems.length > 0
+            ? [...Previous!.duplicateInstancedItems]
+            : LiveOffer.duplicateInstancedItems ?? LiveOffer.items.map((Item) => Item.catalogId).filter((Id) => /^(WP|AR|DYE|BNC|EJ|EM|AC|TITLE|LT)_/.test(Id) && Id !== "LT_TRIALS_00"),
     });
 }
 

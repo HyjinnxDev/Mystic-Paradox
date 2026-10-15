@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Answer, Availability, DeleteInvites, DeleteLink, HuntedTogetherSlots, Invite, LinksList, RewardsGrant, SaveRewards, SlayerLinkResult, SlayerLinkRow, Status } from "./slayerLinks";
+import { Answer, Availability, ChestsReached, DeleteInvites, DeleteLink, DrawPrizePool, HuntedTogether, Invite, LINK_CROWN, LinksList, PRIZE_POOL_SIZE, RewardsGrant, SaveRewards, SettleLink, SlayerLinkResult, SlayerLinkRow, Status } from "./slayerLinks";
 
 const H = 60 * 60 * 1000;
 const payload = (r: { body: unknown }) => (r.body as any).payload;
@@ -70,10 +70,50 @@ test("link XP only for links whose partner is in the party", () => {
     s.apply(Answer(s.rows, "B", f, { account_id: "A", action: "accept", slot: 3 }, 1));
     s.apply(Invite(s.rows, "A", f, { account_id: "C", slot: 1 }, 1, "L2"));
     s.apply(Answer(s.rows, "C", f, { account_id: "A", action: "accept", slot: 1 }, 2));
-    assert.deepEqual(HuntedTogetherSlots(s.rows, "A", ["A", "B"], 3), [2]);
-    assert.deepEqual(HuntedTogetherSlots(s.rows, "B", ["A", "B"], 3), [3]);
-    assert.deepEqual(HuntedTogetherSlots(s.rows, "A", ["A"], 3), [], "solo hunt gives no link XP");
-    assert.deepEqual(HuntedTogetherSlots(s.rows, "A", ["A", "B"], 169 * H), [], "ended link gets no XP");
+    assert.deepEqual(HuntedTogether(s.rows, "A", ["A", "B"], 3), [{ slot: 2, partnerId: "B", partnerSlot: 3 }]);
+    assert.deepEqual(HuntedTogether(s.rows, "B", ["A", "B"], 3), [{ slot: 3, partnerId: "A", partnerSlot: 2 }]);
+    assert.deepEqual(HuntedTogether(s.rows, "A", ["A"], 3), [], "solo hunt gives no link XP");
+    assert.deepEqual(HuntedTogether(s.rows, "A", ["A", "B"], 169 * H), [], "ended link gets no XP");
+});
+
+test("unlink is refused once the link has XP", () => {
+    const s = Store();
+    s.apply(Invite(s.rows, "A", new Set(["B"]), { account_id: "B", slot: 1 }, 0, "L1"));
+    s.apply(Answer(s.rows, "B", new Set(["A"]), { account_id: "A", action: "accept" }, 1));
+    assert.equal(DeleteLink(s.rows, "A", { slot: 1 }, {}, 2, new Set(["L1"])).reply.status, 409);
+    assert.equal(DeleteLink(s.rows, "A", { slot: 1 }, {}, 2).remove, "L1", "no XP yet: breakable");
+});
+
+test("chests: wiki curve, pool draw, hidden unlocks, grant at the end", () => {
+    assert.deepEqual([0, 4, 5, 404, 405, 1204, 1205, 2804, 2805, 99999].map(ChestsReached), [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]);
+
+    let seed = 1;
+    const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    const pool = DrawPrizePool(rand, new Set([LINK_CROWN]));
+    assert.equal(pool.length, PRIZE_POOL_SIZE);
+    assert.equal(new Set(pool.map((p) => `${p.catalog_id}x${p.quantity}`)).size, PRIZE_POOL_SIZE, "no repeats");
+    assert.ok(pool.every((p) => p.catalog_id !== LINK_CROWN && p.received_for_level === 0), "owned crown left out, nothing unlocked");
+
+    const s = Store();
+    s.apply(Invite(s.rows, "A", new Set(["B"]), { account_id: "B", slot: 1 }, 0, "L1"));
+    s.apply(Answer(s.rows, "B", new Set(["A"]), { account_id: "A", action: "accept" }, 0));
+    const row = () => s.rows[0];
+
+    const first = SettleLink(row(), "A", 0, 1, rand, new Set());
+    assert.equal(first.put?.prizePools?.A.length, PRIZE_POOL_SIZE, "pool drawn on first read");
+    assert.equal(first.grant, undefined);
+    s.apply({ reply: { status: 200, body: null }, put: [first.put!], log: "" });
+    assert.equal(SettleLink(row(), "A", 0, 2, rand, new Set()).put, undefined, "nothing new: no write");
+
+    const two = SettleLink(row(), "A", 405, 3, rand, new Set());
+    s.apply({ reply: { status: 200, body: null }, put: [two.put!], log: "" });
+    assert.deepEqual(row().prizePools!.A.map((p) => p.received_for_level).filter((l) => l > 0).sort(), [1, 2]);
+    assert.ok(payload(LinksList(s.rows, "A", 4)).links[0].prize_pool.every((p: any) => p.received_for_level === 0), "unlocked prizes hidden");
+
+    const ended = SettleLink(row(), "A", 2805, 169 * H, rand, new Set());
+    assert.deepEqual(ended.grant!.map((p) => p.received_for_level).sort(), [1, 2, 3, 4], "4 chests, 4 prizes at the end");
+    s.apply({ reply: { status: 200, body: null }, put: [{ ...ended.put!, rewardsGranted: ["A"] }], log: "" });
+    assert.deepEqual(SettleLink(row(), "A", 2805, 169 * H, rand, new Set()), {}, "granted once");
 });
 
 test("reject, cancel, expiry, delete-all", () => {
@@ -97,7 +137,7 @@ test("reject, cancel, expiry, delete-all", () => {
     assert.equal(payload(Status(s.rows, "A", 102)).invites.length, 0);
 });
 
-test("rewards: accept resets both slot tracks, pool is stored per player, grant answers once", () => {
+test("rewards: accept resets both slot tracks, a saved pool is stored per player, the backend grants", () => {
     const s = Store();
     s.apply(Invite(s.rows, "A", new Set(["B"]), { account_id: "B", slot: 2 }, 0, "L1"));
     const acc = s.apply(Answer(s.rows, "B", new Set(["A"]), { account_id: "A", action: "accept", slot: 3 }, 1));
@@ -107,14 +147,11 @@ test("rewards: accept resets both slot tracks, pool is stored per player, grant 
     assert.equal(SaveRewards(s.rows, "A", { slot: 1, prize_pool: pool }, 2).reply.status, 404, "no link in slot 1");
     assert.equal(SaveRewards(s.rows, "A", { slot: 2, prize_pool: [{ catalog_id: "", quantity: 1, received_for_level: 1 }] }, 2).reply.status, 400);
     s.apply(SaveRewards(s.rows, "A", { slot: 2, prize_pool: pool }, 2));
-    assert.deepEqual(payload(LinksList(s.rows, "A", 3)).links[0].prize_pool, pool);
+    assert.deepEqual(payload(LinksList(s.rows, "A", 3)).links[0].prize_pool, [{ ...pool[0], received_for_level: 0 }], "unlocks hidden");
     assert.deepEqual(payload(LinksList(s.rows, "B", 3)).links[0].prize_pool, [], "B's pool is its own");
 
-    // after the week ends the grant still works once, then 409; after the grace period 404
+    // after the week the game server is told the backend grants; after the grace period 404
     const ended = 1 + 168 * H + 1;
-    const g = s.apply(RewardsGrant(s.rows, "A", "2", ended));
-    assert.deepEqual(payload(g.reply), { is_service_granting: false });
-    assert.equal(RewardsGrant(s.rows, "A", 2, ended).reply.status, 409);
-    assert.equal(s.apply(RewardsGrant(s.rows, "B", 3, ended)).reply.status, 200);
+    assert.deepEqual(payload(RewardsGrant(s.rows, "A", "2", ended).reply), { is_service_granting: true });
     assert.equal(RewardsGrant(s.rows, "A", 2, 1 + 2 * 168 * H + 1).reply.status, 404);
 });

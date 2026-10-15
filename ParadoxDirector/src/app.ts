@@ -12,6 +12,7 @@
 
 import express from "express";
 import { matchmakingRouter } from "./routes/matchmaker.js";
+import { adminRouter } from "./routes/admin.js";
 import { GetPersistentHubStatus } from "./controllers/gameservers.js";
 import { logger } from "./logger.js";
 import { GetRequestId, RequestContextMiddleware } from "./observability/requestContext.js";
@@ -33,6 +34,9 @@ app.get('/health/ready', (_req, res) => {
 app.get('/api/hub-status', (_req, res) => {
     res.status(200).json(GetPersistentHubStatus());
 });
+
+// Staff dashboard reads (polled every few seconds), so ahead of the per-request logging below.
+app.use("/api/admin", adminRouter);
 
 app.use(RequestContextMiddleware);
 

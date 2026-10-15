@@ -13,9 +13,12 @@ import { GetRepositories } from "../persistence";
 import { GetMongoDb } from "../persistence/mongo/client";
 import { Collections } from "../persistence/mongo/collections";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
+import { GetCharactersForUid } from "../controllers/character";
+import { GetInventoryForUserIdAndCharacterId, RunInventoryTransaction } from "../controllers/inventory";
 import {
-    Answer, Availability, AvailabilityIds, DeleteInvites, DeleteLink, Invite, InvitesList, LinksList, REWARD_GRACE_HOURS,
-    RewardsGrant, SaveRewards, SlayerLinkReply, SlayerLinkResult, SlayerLinkRow, Status
+    Answer, Availability, AvailabilityIds, DeleteInvites, DeleteLink, Invite, InvitesList, LINK_CROWN, LINK_TRACK_PREFIX,
+    LinkPrize, LinksList, REWARD_GRACE_HOURS, RewardsGrant, SaveRewards, SettleLink, SlayerLinkReply, SlayerLinkResult,
+    SlayerLinkRow, Status
 } from "../slayerLinks";
 
 // Slayer Links routes (social-prod.steelyard.ca/slayerlink/*). Rules and shapes: src/slayerLinks.ts.
@@ -36,7 +39,7 @@ async function FriendsOf(me: string): Promise<Set<string>> {
     return new Set(Edges.filter((e) => e.status === "ACCEPTED").map((e) => e.otherId));
 }
 
-async function Apply(Result: SlayerLinkResult) {
+async function Apply(Result: Omit<SlayerLinkResult, "reply">) {
     const Db = await GetMongoDb();
     const Coll = Db.collection<SlayerLinkRow & { purgeAt: Date }>(Collections.SlayerLinks);
     for (const Row of Result.put ?? []) {
@@ -49,6 +52,65 @@ async function Apply(Result: SlayerLinkResult) {
         await Db.collection(Collections.ProgressionTracks).deleteOne({ _id: `${UserId}::${TrackId}` as any });
     }
     logger.info(`slayerlink: ${Result.log}`);
+}
+
+const SlotOf = (Row: SlayerLinkRow, Id: string) => (Row.senderId === Id ? Row.senderSlot : Row.targetSlot ?? 0);
+const LinkXp = async (Id: string, Slot: number) =>
+    (await GetRepositories().progressionTracks.get(Id, `${LINK_TRACK_PREFIX}${Slot}`))?.progress ?? 0;
+
+async function CharacterOf(Me: string): Promise<string | undefined> {
+    const Characters: any = await GetCharactersForUid(Me);
+    const Character = Array.isArray(Characters) ? Characters[0] : undefined;
+    return Character?.id ?? Character?.characterId;
+}
+
+async function OwnsCrown(Me: string): Promise<boolean> {
+    const CharacterId = await CharacterOf(Me);
+    if (!CharacterId) return false;
+    const Inventory: any = await GetInventoryForUserIdAndCharacterId(Me, CharacterId);
+    const Items = (Raw: unknown): any[] => { try { return typeof Raw === "string" ? JSON.parse(Raw) : Array.isArray(Raw) ? Raw : []; } catch { return []; } };
+    return [...Items(Inventory?.stackedItems), ...Items(Inventory?.instancedItems)].some((I) => I?.catalogId === LINK_CROWN);
+}
+
+// One transaction per link and player; the id is stable so a retry replays instead of granting twice.
+async function GrantPrizes(Me: string, Row: SlayerLinkRow, Prizes: LinkPrize[]): Promise<boolean> {
+    try {
+        const CharacterId = await CharacterOf(Me);
+        if (!CharacterId) { logger.warn(`slayerlink: reward grant for=${Me} id=${Row._id} waits: no character`); return false; }
+        const TransactionId = crypto.createHash("sha256").update(`slayerlink-reward:${Row._id}:${Me}`).digest("hex").slice(0, 32).toUpperCase();
+        const Stacked = Prizes.map((P) => ({ catalogId: P.catalog_id, quantity: P.quantity }));
+        return !!await RunInventoryTransaction(Me, CharacterId, TransactionId, [], Stacked, [], [], []);
+    } catch (Err) {
+        logger.error(`slayerlink: reward grant for=${Me} id=${Row._id} failed, retried on the next read: ${String(Err)}`);
+        return false;
+    }
+}
+
+// Before answering a read of my links: draw missing pools, unlock reached chests, grant ended links (SettleLink).
+async function Settle(Me: string) {
+    const Now = Date.now();
+    for (const Row of await RowsOf([Me])) {
+        if (Row.status !== "LINKED" || (Row.endsAt ?? 0) + REWARD_GRACE_HOURS * 60 * 60 * 1000 <= Now || Row.rewardsGranted?.includes(Me)) continue;
+        const Xp = await LinkXp(Me, SlotOf(Row, Me));
+        const Skip = new Set<string>(!Row.prizePools?.[Me] && await OwnsCrown(Me) ? [LINK_CROWN] : []);
+        let { put, grant } = SettleLink(Row, Me, Xp, Now, Math.random, Skip);
+        let Log = `settle for=${Me} id=${Row._id} xp=${Xp}`;
+        if (grant && (grant.length === 0 || await GrantPrizes(Me, Row, grant))) {
+            put = { ...(put ?? Row), rewardsGranted: [...(Row.rewardsGranted ?? []), Me] };
+            Log += ` -> granted [${grant.map((P) => `${P.catalog_id}x${P.quantity}@${P.received_for_level}`).join(",")}]`;
+        }
+        if (put) await Apply({ put: [put], log: Log });
+    }
+}
+
+// Links that earned XP (on either side) cannot be broken until their week ends.
+async function LockedLinks(Rows: SlayerLinkRow[]): Promise<Set<string>> {
+    const Locked = new Set<string>();
+    for (const Row of Rows) {
+        if (Row.status !== "LINKED") continue;
+        if (await LinkXp(Row.senderId, Row.senderSlot) > 0 || (Row.targetSlot && await LinkXp(Row.targetId, Row.targetSlot) > 0)) Locked.add(Row._id);
+    }
+    return Locked;
 }
 
 function Send(res: express.Response, Reply: SlayerLinkReply) {
@@ -67,6 +129,7 @@ function Player(req: any, res: express.Response): string | undefined {
 
 slayerLinksRouter.get("/slayerlink/status_good", HasParadoxBackendAuth, async (req, res) => {
     const Me = Player(req, res); if (!Me) return;
+    await Settle(Me);
     Send(res, Status(await RowsOf([Me]), Me, Date.now()));
 });
 
@@ -77,6 +140,7 @@ slayerLinksRouter.get("/slayerlink/invites", HasParadoxBackendAuth, async (req, 
 
 slayerLinksRouter.get("/slayerlink/links", HasParadoxBackendAuth, async (req, res) => {
     const Me = Player(req, res); if (!Me) return;
+    await Settle(Me);
     Send(res, LinksList(await RowsOf([Me]), Me, Date.now()));
 });
 
@@ -111,12 +175,16 @@ slayerLinksRouter.delete("/slayerlink/links", HasParadoxBackendAuth, async (req:
         if (!Array.isArray(Entries) || Entries.length === 0 || Entries.length > 3) return res.status(400).send();
         for (const E of Entries) {
             const Owner = RewardOwner(req, res, E?.account_id); if (!Owner) return;
-            await Apply(DeleteLink(await RowsOf([Owner]), Owner, { slot: E?.slot }, {}, Date.now()));
+            const Rows = await RowsOf([Owner]);
+            const Result = DeleteLink(Rows, Owner, { slot: E?.slot }, {}, Date.now(), await LockedLinks(Rows));
+            await Apply(Result);
+            if (Result.reply.status !== 200) return Send(res, Result.reply);
         }
         return res.status(200).json({});
     }
     const Me = Player(req, res); if (!Me) return;
-    const Result = DeleteLink(await RowsOf([Me]), Me, req.body, req.query, Date.now());
+    const Rows = await RowsOf([Me]);
+    const Result = DeleteLink(Rows, Me, req.body, req.query, Date.now(), await LockedLinks(Rows));
     await Apply(Result);
     Send(res, Result.reply);
 });

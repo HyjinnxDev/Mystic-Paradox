@@ -487,3 +487,13 @@ test("instanced items created with a placeholder id get a minted 26-character id
     assert.equal(NeedsMintedInstanceId({ catalogId: "WP_EB_HOST", instanceId: "" }), true);
     assert.equal(NeedsMintedInstanceId({ catalogId: "WP_EB_FROSTFALL_L1", instanceId: "RHLDQHG6UNBG3KROD7MWHKZSKU" }), false);
 });
+
+test("fountain coin toss serves one free daily bonus container keyed on the UTC day", () => {
+    const [Sku, ...Rest] = GetStoreSkus("fountain_daily_free_bundle");
+    assert.equal(Rest.length, 0);
+    assert.deepEqual(Sku.items, [{ catalogId: "CONTAINER_CORE_REWARD_DAILY_01", quantity: 1, instanced: false }]);
+    assert.ok(Sku.prices.every((Price) => Price.price === 0));
+    assert.equal(Sku.maxAllowed, 1);
+    assert.equal(Sku.ownershipKey, `fountain_daily_free_bundle_01:${new Date().toISOString().slice(0, 10)}`);
+    assert.equal(FindStoreSkuByIdOrCatalogId(Sku.id)?.storeTag, "fountain_daily_free_bundle");
+});

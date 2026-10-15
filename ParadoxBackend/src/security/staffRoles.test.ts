@@ -29,3 +29,10 @@ test("staff name tag round-trips", () => {
     assert.equal(StripStaffNameTag("[Owner] Hyjinnx"), "Hyjinnx");
     assert.equal(StripStaffNameTag("Hyjinnx"), "Hyjinnx");
 });
+
+test("moderators can watch servers but only admins control them", () => {
+    assert.equal(HasStaffPermission(["moderator"], "servers.read"), true);
+    assert.equal(HasStaffPermission(["moderator"], "servers.control"), false);
+    assert.equal(HasStaffPermission(["admin"], "servers.control"), true);
+    assert.equal(HasStaffPermission(["player"], "servers.read"), false);
+});

@@ -9,7 +9,9 @@ export type StaffPermission =
     | "players.access"      // permanent ban, disable, unban, approve/reject sign-ups
     | "players.roles"       // grant/revoke moderator, admin, tester
     | "players.delete"
-    | "operations";
+    | "operations"
+    | "servers.read"        // host/process metrics, game server list
+    | "servers.control"     // stop game servers, restart Director/stack, read logs;
 
 const MIN_RANK: Record<StaffPermission, number> = {
     "players.read": 1,
@@ -17,7 +19,9 @@ const MIN_RANK: Record<StaffPermission, number> = {
     "players.access": 2,
     "players.roles": 3,
     "players.delete": 3,
-    "operations": 3
+    "operations": 3,
+    "servers.read": 1,
+    "servers.control": 2
 };
 
 export const MODERATOR_MAX_BAN_HOURS = 7 * 24;

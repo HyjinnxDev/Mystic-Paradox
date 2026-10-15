@@ -9,7 +9,7 @@
 import { Router } from "express";
 import { logger } from "../logger";
 import { HasAdminAuth, RequireStaff } from "../middleware/HasAdminAuth";
-import { AdminLogin, AdminLogout, AdminMe, DeletePlayer, ListAudit, ListOnlinePlayers, ListPlayers, UpdatePlayerAccess, UpdatePlayerRoles } from "../controllers/admin";
+import { AdminLogin, AdminLogout, AdminMe, DeletePlayer, ListAudit, ListPlayers, UpdatePlayerAccess, UpdatePlayerRoles } from "../controllers/admin";
 import {
     ADMIN_DISCORD_BINDING_COOKIE_NAME,
     AdminDiscordBindingCookie,
@@ -17,6 +17,10 @@ import {
     HandleAdminDiscordCallback
 } from "../controllers/adminDiscordAuth";
 import { GetOperationsOverview, UpdateOperationsPolicy } from "../controllers/adminOperations";
+import {
+    GetGameserverLog, GetLog, GetPlayerDetail, GetServersHistory, GetServersOverview,
+    ListOnlinePlayersDetailed, RestartStack, StopGameserver
+} from "../controllers/adminServers";
 
 export const adminRouter = Router();
 
@@ -111,8 +115,9 @@ adminRouter.get("/admin/v1/auth/discord/callback", async (req, res) => {
 });
 
 adminRouter.get("/admin/v1/me", HasAdminAuth, AdminMe);
-adminRouter.get("/admin/v1/online-players", HasAdminAuth, RequireStaff("players.read"), ListOnlinePlayers);
+adminRouter.get("/admin/v1/online-players", HasAdminAuth, RequireStaff("players.read"), ListOnlinePlayersDetailed);
 adminRouter.get("/admin/v1/players", HasAdminAuth, RequireStaff("players.read"), ListPlayers);
+adminRouter.get("/admin/v1/players/:userId/detail", HasAdminAuth, RequireStaff("players.read"), GetPlayerDetail);
 // Per-change permission (timed ban vs. permanent/approval) is checked inside the controller.
 adminRouter.patch("/admin/v1/players/:userId/access", HasAdminAuth, UpdatePlayerAccess);
 adminRouter.patch("/admin/v1/players/:userId/roles", HasAdminAuth, RequireStaff("players.roles"), UpdatePlayerRoles);
@@ -120,3 +125,9 @@ adminRouter.delete("/admin/v1/players/:userId", HasAdminAuth, RequireStaff("play
 adminRouter.get("/admin/v1/audit", HasAdminAuth, RequireStaff("players.read"), ListAudit);
 adminRouter.get("/admin/v1/operations/overview", HasAdminAuth, RequireStaff("operations"), GetOperationsOverview);
 adminRouter.patch("/admin/v1/operations/policy", HasAdminAuth, RequireStaff("operations"), UpdateOperationsPolicy);
+adminRouter.get("/admin/v1/servers/overview", HasAdminAuth, RequireStaff("servers.read"), GetServersOverview);
+adminRouter.get("/admin/v1/servers/history", HasAdminAuth, RequireStaff("servers.read"), GetServersHistory);
+adminRouter.post("/admin/v1/servers/gameservers/:id/stop", HasAdminAuth, RequireStaff("servers.control"), StopGameserver);
+adminRouter.get("/admin/v1/servers/gameservers/:id/log", HasAdminAuth, RequireStaff("servers.control"), GetGameserverLog);
+adminRouter.post("/admin/v1/servers/restart", HasAdminAuth, RequireStaff("servers.control"), RestartStack);
+adminRouter.get("/admin/v1/servers/logs/:name", HasAdminAuth, RequireStaff("servers.control"), GetLog);

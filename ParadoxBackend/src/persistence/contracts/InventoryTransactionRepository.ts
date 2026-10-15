@@ -45,4 +45,7 @@ export interface InventoryTransactionRepository {
      *  an onGrant annotator) are stored on the same row; they never replace the core ledger fields. */
     complete(transactionId: string, userId: string, characterId: string, result: unknown, session: ClientSession,
         extraFields?: Record<string, unknown>): Promise<void>;
+
+    /** True when this (userId, characterId, transactionId) tuple has a completed ledger row. */
+    isCompleted(transactionId: string, userId: string, characterId: string): Promise<boolean>;
 }

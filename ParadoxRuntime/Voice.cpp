@@ -182,6 +182,8 @@ void MixFrame(int16_t* out) {
 
 std::atomic<int> g_pttVk{ VK_XBUTTON1 };       // Mouse4 until the game's binding is read
 std::atomic<bool> g_openMic{ false };
+std::atomic<bool> g_selfMuted{ false };
+std::atomic<bool> g_selfSending{ false };       // frames going out right now (talking indicator)
 constexpr int OPEN_MIC_GATE_RMS = 400;          // ~-38 dBFS; quieter frames are not sent in open-mic mode
 
 int FrameRms(const int16_t* pcm) {
@@ -311,10 +313,12 @@ DWORD WINAPI AudioThread(LPVOID) {
             }
             while (micFifo.size() >= FRAME) {
                 const int vk = g_pttVk.load();
-                const bool talking = g_openMic.load()
+                const bool muted = g_selfMuted.load();
+                const bool talking = !muted && (g_openMic.load()
                     ? FrameRms(micFifo.data()) >= OPEN_MIC_GATE_RMS
-                    : vk && (GetAsyncKeyState(vk) & 0x8000) && GameInFront();
-                tail = talking ? TAIL_FRAMES : (tail > 0 ? tail - 1 : 0);
+                    : vk && (GetAsyncKeyState(vk) & 0x8000) && GameInFront());
+                tail = talking ? TAIL_FRAMES : (tail > 0 && !muted ? tail - 1 : 0);
+                g_selfSending.store(tail > 0 && g_acked.load() && g_enabled.load());
                 if (tail > 0 && g_acked.load() && g_enabled.load()) {
                     unsigned char pkt[3 + 400];
                     int len = opus_encode(enc, micFifo.data(), FRAME, pkt + 3, 400);
@@ -452,6 +456,28 @@ void MpVoiceSetPttKey(int vk) { g_pttVk.store(vk); }
 
 void MpVoiceSetOpenMic(bool open) {
     if (g_openMic.exchange(open) != open) MpLog(std::string("[Voip] mode ") + (open ? "open mic" : "push to talk"));
+}
+
+void MpVoiceSetSelfMuted(bool muted) {
+    if (g_selfMuted.exchange(muted) != muted) MpLog(std::string("[Voip] mic ") + (muted ? "muted" : "unmuted") + " (social menu)");
+}
+
+int MpVoiceSelfState() {
+    if (g_sock == INVALID_SOCKET || !g_enabled.load()) return 0;
+    return g_selfMuted.load() ? 2 : g_selfSending.load() ? 1 : 0;
+}
+
+// Same as the relay's SenderKey: the first 4 bytes (big-endian) of sha256(account id).
+uint32_t MpVoiceKeyForId(const std::string& id) {
+    unsigned char h[32]{};
+    BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, (PUCHAR)id.data(), static_cast<ULONG>(id.size()), h, 32);
+    return ReadU32(h);
+}
+
+bool MpVoiceKeyTalking(uint32_t key) {
+    std::lock_guard<std::mutex> lock(g_speakersLock);
+    auto it = g_speakers.find(key);
+    return it != g_speakers.end() && it->second.started && GetTickCount64() - it->second.lastRx < 400;
 }
 
 void MpVoiceStart() {

@@ -56,6 +56,8 @@ export interface LauncherAccountRecord {
     rolesUpdatedBy?: string;
     createdAt: string;
     lastLoginAt?: string;
+    /** Last chat (XMPP) connect; written by XMPPConnection for the staff dashboard. */
+    lastSeenAt?: string;
     /** False for a freshly Discord-created account that hasn't chosen its unique username
      *  yet (the launcher forces a set-username step). Absent/true once a username is set —
      *  email/password accounts set it at registration. */

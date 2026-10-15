@@ -42,6 +42,7 @@ function ToRecord(Doc: any): LauncherAccountRecord {
         rolesUpdatedBy: Doc.rolesUpdatedBy ?? undefined,
         createdAt: Doc.createdAt,
         lastLoginAt: Doc.lastLoginAt ?? undefined,
+        lastSeenAt: Doc.lastSeenAt ?? undefined,
         usernameSet: Doc.usernameSet ?? undefined
     };
 }

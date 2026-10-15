@@ -53,3 +53,18 @@ test("completion without extra fields stores only the ledger fields", async () =
 
     assert.deepEqual(Object.keys(update.$set).sort(), ["completedAt", "result", "status"]);
 });
+
+test("isCompleted finds only the completed row complete() wrote", async () => {
+    const rows = new Map<string, any>();
+    const repository = new MongoInventoryTransactionRepository(async () => ({
+        collection: () => ({
+            updateOne: async (filter: any, next: any) => { rows.set(filter._id, next.$set); },
+            findOne: async (filter: any) => rows.get(filter._id)?.status === filter.status ? { _id: filter._id } : null,
+        })
+    } as any));
+
+    assert.equal(await repository.isCompleted("tx-3", "user-1", "character-1"), false);
+    await repository.complete("tx-3", "user-1", "character-1", {}, {} as any);
+    assert.equal(await repository.isCompleted("tx-3", "user-1", "character-1"), true);
+    assert.equal(await repository.isCompleted("tx-3", "user-2", "character-1"), false);
+});

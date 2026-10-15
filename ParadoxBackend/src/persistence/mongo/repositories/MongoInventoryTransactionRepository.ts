@@ -102,6 +102,15 @@ export class MongoInventoryTransactionRepository implements InventoryTransaction
             { session }
         );
     }
+
+    async isCompleted(transactionId: string, userId: string, characterId: string): Promise<boolean> {
+        const Db = await this.getDb();
+        const Row = await Db.collection(Collections.InventoryTransactions).findOne(
+            { _id: LedgerId(userId, characterId, transactionId) as any, status: "completed" },
+            { projection: { _id: 1 } }
+        );
+        return Row != undefined;
+    }
 }
 
 // [hardening] Thrown by tryBegin instead of returning a value, specifically so the caller is

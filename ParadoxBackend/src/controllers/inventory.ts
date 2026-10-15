@@ -431,10 +431,11 @@ export type InventoryTransactionOptions = {
     source?: string;
 };
 
-// [2026-10-13] Bounties re-enabled with 6 TOKEN_BOUNTY_DRAFT a day that do NOT stack. The game's UBountyComponent grants
-// (first-start num_tokens_hp_start and the daily num_tokens_per_day, both served as this amount by routes/tuning.ts) are
-// rewritten so the stack lands on this amount: nothing is added when 6 or more are already held.
-export const BOUNTY_TOKENS_DAILY = 6;
+// [2026-10-13] Bounties re-enabled with a daily TOKEN_BOUNTY_DRAFT stack that does NOT stack across days.
+// [2026-10-15] 10 a day, and the backend refill below is now the ONLY source: every UBountyComponent grant of a bounty
+// token is dropped (see IsGameBountyTokenGrant), including the TOKEN_BOUNTY_DRAFT_PREMIUM x1 that each claimed bounty
+// paid out through item_grant_data.
+export const BOUNTY_TOKENS_DAILY = 10;
 
 // The game never grants the daily tokens on 1.14.7 (measured: no grant POST at login), so the backend sets the stack to
 // BOUNTY_TOKENS_DAILY once per UTC day when the inventory is read. The day is kept as a cooldown entry nobody else reads.
@@ -478,8 +479,9 @@ async function RefillBountyTokensDaily(UserId: string, CharacterId: string){
     logger.info(`[BountyTokens] set TOKEN_BOUNTY_DRAFT to ${BOUNTY_TOKENS_DAILY} for userId ${UserId} characterId ${CharacterId}`);
 }
 
-function IsBountyTokenTopUp(catalogId: unknown, source: string | undefined): boolean {
-    return catalogId === "TOKEN_BOUNTY_DRAFT" && typeof source === "string" && source.startsWith("UBountyComponent::");
+export function IsGameBountyTokenGrant(catalogId: unknown, source: string | undefined): boolean {
+    return (catalogId === "TOKEN_BOUNTY_DRAFT" || catalogId === "TOKEN_BOUNTY_DRAFT_PREMIUM")
+        && typeof source === "string" && source.startsWith("UBountyComponent::");
 }
 
 export type InventoryLedgerAnnotator = (accepted: { createdInstancedItems: any[]; acceptedStackedAdds: any[] }) =>
@@ -614,9 +616,8 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
             if(INVALID_STARTER_CATALOG_IDS.has(NewStackedItem?.catalogId)){
                 continue;
             }
-            if(IsBountyTokenTopUp(NewStackedItem?.catalogId, Options.source)){
-                const Held = StackedItemsByCatalogId.get(NewStackedItem.catalogId)?.quantity ?? 0;
-                NewStackedItem = { ...NewStackedItem, quantity: Math.max(BOUNTY_TOKENS_DAILY - Held, 0) };
+            if(IsGameBountyTokenGrant(NewStackedItem?.catalogId, Options.source)){
+                continue;
             }
             if (typeof NewStackedItem?.catalogId === "string" && Number.isSafeInteger(NewStackedItem?.quantity) && NewStackedItem.quantity > 0) {
                 AcceptedStackedAdds.push({ catalogId: NewStackedItem.catalogId, quantity: NewStackedItem.quantity });

@@ -3,83 +3,198 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Server Staff</title>
+<title>Staff Console</title>
 <style>
-  :root { --bg:#121417; --panel:#1b1f24; --line:#2c323a; --text:#e6e8eb; --dim:#8b949e; --accent:#e0a33a; --bad:#e5534b; --ok:#57ab5a; }
+  :root {
+    --bg: #10161f; --rail: #0d131b; --panel: #172030; --panel-2: #1d2839; --line: #26334a; --line-2: #33435e;
+    --text: #e7ecf3; --dim: #8e9db3; --faint: #5d6c83;
+    --aether: #5cd2c2; --aether-ink: #0b2a27; --lantern: #f2b65a; --bad: #f06a5f; --info: #8fb4ff;
+    --r-sm: 6px; --r: 10px;
+    color-scheme: dark;
+  }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; }
-  header { display:flex; align-items:center; gap:16px; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
-  header h1 { font-size:16px; margin:0; color:var(--accent); }
-  header .me { margin-left:auto; color:var(--dim); }
-  nav button { background:none; border:0; color:var(--dim); padding:6px 10px; cursor:pointer; font:inherit; border-radius:4px; }
-  nav button.on { color:var(--text); background:var(--line); }
-  main { padding:20px; max-width:1200px; margin:0 auto; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:16px; margin-bottom:16px; }
-  input, select, textarea { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px; padding:6px 8px; font:inherit; }
-  button.btn { background:var(--line); color:var(--text); border:1px solid #3a414a; border-radius:4px; padding:6px 12px; cursor:pointer; font:inherit; }
-  button.btn:hover { border-color:var(--accent); }
-  button.danger { border-color:var(--bad); color:#ffb3ae; }
-  button:disabled { opacity:.4; cursor:not-allowed; }
-  table { width:100%; border-collapse:collapse; }
-  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th { color:var(--dim); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
-  tr.pick { cursor:pointer; } tr.pick:hover td { background:#22272e; }
-  .tag { display:inline-block; padding:1px 6px; border-radius:3px; font-size:12px; background:var(--line); margin-right:4px; }
-  .tag.bad { background:#4a1f1d; color:#ffb3ae; } .tag.ok { background:#1d3a20; color:#b4f0b6; } .tag.warn { background:#4a3a1a; color:#f5d08a; }
-  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
-  .dim { color:var(--dim); }
-  .err { color:#ffb3ae; min-height:1.4em; }
-  .login { max-width:340px; margin:80px auto; }
-  .login input { width:100%; margin-bottom:10px; }
-  #actions h2 { margin:0 0 4px; font-size:18px; }
-  #actions h3 { font-size:13px; color:var(--dim); text-transform:uppercase; letter-spacing:.04em; margin:18px 0 6px; }
-  textarea { width:100%; min-height:54px; }
-  .hidden { display:none !important; }
-  @media (max-width: 700px) { main { padding:12px; } .hide-sm { display:none; } }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; font-variant-numeric: tabular-nums; }
+  h1, h2, h3 { font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif; margin: 0; letter-spacing: -.01em; }
+  h1 { font-size: 24px; font-weight: 600; }
+  h2 { font-size: 16px; font-weight: 600; }
+  h3 { font-size: 13px; font-weight: 600; color: var(--dim); margin: 22px 0 8px; }
+  a { color: var(--aether); }
+  :focus-visible { outline: 2px solid var(--aether); outline-offset: 2px; }
+  .hidden { display: none !important; }
+  .dim { color: var(--dim); } .faint { color: var(--faint); }
+  .err { color: #ffb4ad; }
+  .err:not(:empty) { margin: 0 0 12px; }
+
+  /* shell */
+  #app { display: grid; grid-template-columns: 220px 1fr; min-height: 100%; }
+  .rail { background: var(--rail); border-right: 1px solid var(--line); padding: 20px 12px; display: flex; flex-direction: column; gap: 4px; position: sticky; top: 0; height: 100vh; }
+  .brand { padding: 0 10px 18px; }
+  .brand b { display: block; font-size: 15px; }
+  .brand span { color: var(--faint); font-size: 12px; }
+  .rail nav { display: flex; flex-direction: column; gap: 2px; }
+  .rail nav button { all: unset; cursor: pointer; padding: 8px 10px; border-radius: var(--r-sm); color: var(--dim); display: flex; justify-content: space-between; align-items: center; }
+  .rail nav button:hover { color: var(--text); background: var(--panel); }
+  .rail nav button:focus-visible { outline: 2px solid var(--aether); }
+  .rail nav button.on { color: var(--text); background: var(--panel-2); box-shadow: inset 2px 0 0 var(--aether); }
+  .rail nav .count { font-size: 12px; color: var(--aether); }
+  .rail .me { margin-top: auto; padding: 12px 10px 0; border-top: 1px solid var(--line); font-size: 13px; }
+  .rail .me .role { color: var(--lantern); }
+  main { padding: 28px 32px 60px; max-width: 1280px; width: 100%; }
+  .page-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .page-head .grow { flex: 1; }
+
+  /* controls */
+  input, select, textarea { background: var(--bg); color: var(--text); border: 1px solid var(--line-2); border-radius: var(--r-sm); padding: 7px 10px; font: inherit; }
+  input:focus, select:focus, textarea:focus { border-color: var(--aether); outline: none; }
+  textarea { width: 100%; min-height: 60px; resize: vertical; }
+  .btn { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: var(--r-sm); padding: 7px 14px; cursor: pointer; font: inherit; white-space: nowrap; }
+  .btn:hover:not(:disabled) { border-color: var(--aether); }
+  .btn.primary { background: var(--aether); color: var(--aether-ink); border-color: var(--aether); font-weight: 600; }
+  .btn.danger { color: #ffc2bc; border-color: #7a3632; }
+  .btn.danger:hover:not(:disabled) { border-color: var(--bad); background: #3a1d1d; }
+  .btn.small { padding: 3px 10px; font-size: 13px; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--r-sm); overflow: hidden; }
+  .seg button { all: unset; cursor: pointer; padding: 5px 12px; color: var(--dim); font-size: 13px; }
+  .seg button.on { background: var(--panel-2); color: var(--text); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+
+  /* surfaces */
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; }
+  .stack > * + * { margin-top: 16px; }
+  .panel > h2 { margin-bottom: 12px; }
+  .grid { display: grid; gap: 16px; }
+  .g4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+  /* service strip: the one loud thing */
+  .strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+  .svc { padding: 16px; background: var(--panel); border-right: 1px solid var(--line); position: relative; }
+  .svc:last-child { border-right: 0; }
+  .svc .name { font-weight: 600; }
+  .svc .state { font-size: 13px; display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+  .svc .meta { font-size: 12px; color: var(--faint); margin-top: 6px; }
+  .svc::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; background: var(--faint); }
+  .svc.up::before { background: var(--aether); } .svc.warn::before { background: var(--lantern); } .svc.down::before { background: var(--bad); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; display: inline-block; }
+  .up .dot, .dot.up { background: var(--aether); box-shadow: 0 0 0 3px rgba(92,210,194,.18); }
+  .warn .dot, .dot.warn { background: var(--lantern); }
+  .down .dot, .dot.down { background: var(--bad); }
+
+  .stat .v { font-size: 30px; font-weight: 600; line-height: 1.1; font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif; }
+  .stat .l { color: var(--dim); font-size: 13px; }
+  .stat .s { color: var(--faint); font-size: 12px; margin-top: 4px; }
+  .meter { height: 6px; background: var(--bg); border-radius: 3px; margin-top: 10px; overflow: hidden; }
+  .meter i { display: block; height: 100%; background: var(--aether); border-radius: 3px; transition: width .4s; }
+  .meter i.warn { background: var(--lantern); } .meter i.bad { background: var(--bad); }
+
+  /* charts */
+  .chart { position: relative; }
+  .chart svg { display: block; width: 100%; height: 150px; }
+  .chart .cap { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+  .chart .tip { position: absolute; top: 0; pointer-events: none; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: var(--r-sm); padding: 4px 8px; font-size: 12px; white-space: nowrap; transform: translate(-50%, -4px); }
+  .chart .gl { stroke: var(--line); stroke-width: 1; }
+  .chart .ax { fill: var(--faint); font-size: 11px; }
+  .chart .area { fill: rgba(92,210,194,.12); }
+  .chart .ln { fill: none; stroke: var(--aether); stroke-width: 2; stroke-linejoin: round; }
+  .chart .cross { stroke: var(--line-2); stroke-width: 1; }
+  .chart .mk { fill: var(--aether); stroke: var(--panel); stroke-width: 2; }
+
+  /* tables */
+  .table-wrap { overflow-x: auto; }
+  .panel.flush { padding: 0; overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--faint); font-weight: 500; font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  td.r, th.r { text-align: right; }
+  tr.pick { cursor: pointer; } tr.pick:hover td { background: var(--panel-2); }
+  .empty { padding: 28px; text-align: center; color: var(--dim); }
+
+  .tag { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: var(--panel-2); border: 1px solid var(--line-2); margin: 1px 4px 1px 0; white-space: nowrap; }
+  .tag.ok { color: #a5eee3; border-color: #2b5d57; } .tag.bad { color: #ffb4ad; border-color: #6e302c; }
+  .tag.warn, .tag.owner { color: #f8d59c; border-color: #6b5025; } .tag.admin { color: var(--info); border-color: #34497a; }
+
+  /* drawer */
+  .scrim { position: fixed; inset: 0; background: rgba(5,9,14,.55); z-index: 10; }
+  .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(640px, 100%); background: var(--bg); border-left: 1px solid var(--line-2); z-index: 11; overflow-y: auto; padding: 24px 26px 48px; animation: slide .18s ease-out; }
+  @keyframes slide { from { transform: translateX(24px); opacity: 0; } }
+  .drawer .close { position: absolute; top: 18px; right: 18px; }
+  .drawer h1 { padding-right: 70px; }
+  .facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; font-size: 13px; margin: 0; }
+  .facts dt { color: var(--dim); } .facts dd { margin: 0; }
+  .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 6px; }
+  .kv div { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 6px 10px; font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
+  .kv span { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .zone { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; margin-top: 12px; }
+  .zone.danger { border-color: #5a2c2a; }
+  .zone h2 { font-size: 14px; margin-bottom: 4px; }
+  .history div { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+
+  /* logs */
+  .log { background: #0a0f15; border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; height: calc(100vh - 210px); min-height: 300px; overflow: auto;
+    font: 12px/1.55 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-all; color: #c9d3e0; margin: 0; }
+  .log .e { color: #ff9d94; } .log .w { color: var(--lantern); }
+
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line-2); border-radius: var(--r); padding: 22px; width: min(460px, calc(100% - 32px)); }
+  dialog::backdrop { background: rgba(5,9,14,.65); }
+  dialog p { color: var(--dim); margin: 8px 0 14px; }
+
+  .login { max-width: 360px; margin: 12vh auto; padding: 28px; }
+  .login h1 { margin-bottom: 4px; }
+  .login input { width: 100%; margin-bottom: 10px; }
+
+  @media (max-width: 1000px) { .g4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .g3 { grid-template-columns: 1fr; } .strip { grid-template-columns: repeat(2, 1fr); } .svc { border-bottom: 1px solid var(--line); } }
+  @media (max-width: 760px) {
+    #app { grid-template-columns: minmax(0, 1fr); }
+    .rail, main { min-width: 0; }
+    .rail { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; padding: 10px 16px; gap: 8px; }
+    .brand { padding: 0; } .brand span { display: none; }
+    .rail nav { flex-direction: row; overflow-x: auto; order: 3; width: 100%; }
+    .rail .me { margin: 0 0 0 auto; border: 0; padding: 0; display: flex; gap: 8px; align-items: center; }
+    .rail .me button { margin: 0 !important; }
+    main { padding: 16px; }
+    .g2 { grid-template-columns: 1fr; }
+    .hide-sm { display: none; }
+  }
+  @media (max-width: 520px) { .g4, .strip { grid-template-columns: 1fr; } .svc { border-right: 0; } }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
 </head>
 <body>
-<div id="login" class="card login hidden">
-  <h1 style="margin-top:0;font-size:18px">Staff sign-in</h1>
+<div id="login" class="panel login hidden">
+  <h1>Staff sign-in</h1>
+  <p class="dim" style="margin:0 0 18px">Use your launcher account. Only staff can sign in.</p>
   <input id="l-user" placeholder="Username or email" autocomplete="username">
   <input id="l-pass" type="password" placeholder="Password" autocomplete="current-password">
-  <input id="l-totp" placeholder="Authenticator code (if enabled)" inputmode="numeric" autocomplete="one-time-code">
-  <div class="row"><button class="btn" id="l-go">Sign in</button><a class="dim" href="/admin/v1/auth/discord/start">Sign in with Discord (allow-listed)</a></div>
+  <input id="l-totp" placeholder="Authenticator code, if set up" inputmode="numeric" autocomplete="one-time-code">
+  <div class="row"><button class="btn primary" id="l-go">Sign in</button><a href="/admin/v1/auth/discord/start">Sign in with Discord</a></div>
   <div class="err" id="l-err"></div>
 </div>
 
 <div id="app" class="hidden">
-  <header>
-    <h1>Server Staff</h1>
-    <nav><button data-tab="players" class="on">Players</button><button data-tab="online">Online</button><button data-tab="audit">Audit log</button></nav>
-    <span class="me" id="me"></span>
-    <button class="btn" id="logout">Sign out</button>
-  </header>
+  <aside class="rail">
+    <div class="brand"><b>Staff console</b><span>Mystic Paradox 1.14.7</span></div>
+    <nav id="nav"></nav>
+    <div class="me"><div id="me-name"></div><div class="role" id="me-role"></div><button class="btn small" id="logout" style="margin-top:8px">Sign out</button></div>
+  </aside>
   <main>
     <div class="err" id="err"></div>
-    <section id="tab-players">
-      <div class="row">
-        <input id="p-search" placeholder="Search name or email">
-        <select id="p-status"><option value="">Any status</option><option>active</option><option>banned</option><option>disabled</option></select>
-        <select id="p-approval"><option value="">Any approval</option><option>pending</option><option>approved</option><option>rejected</option></select>
-        <button class="btn" id="p-go">Search</button>
-        <span class="dim" id="p-count"></span>
-      </div>
-      <div class="card" style="padding:0"><table><thead><tr><th>Name</th><th>Status</th><th>Roles</th><th class="hide-sm">Last login</th></tr></thead><tbody id="p-rows"></tbody></table></div>
-      <div class="row"><button class="btn" id="p-prev">Prev</button><button class="btn" id="p-next">Next</button></div>
-    </section>
-    <section id="tab-online" class="hidden">
-      <div class="row"><button class="btn" id="o-go">Refresh</button><span class="dim" id="o-count"></span></div>
-      <div class="card" style="padding:0"><table><thead><tr><th>Name</th></tr></thead><tbody id="o-rows"></tbody></table></div>
-    </section>
-    <section id="tab-audit" class="hidden">
-      <div class="row"><button class="btn" id="a-go">Refresh</button><button class="btn" id="a-prev">Prev</button><button class="btn" id="a-next">Next</button></div>
-      <div class="card" style="padding:0"><table><thead><tr><th>When (UTC)</th><th>Staff</th><th>Player</th><th>Action</th><th>Reason</th></tr></thead><tbody id="a-rows"></tbody></table></div>
-    </section>
-
-    <div id="actions" class="card hidden"></div>
+    <div id="page"></div>
   </main>
 </div>
+
+<dialog id="confirm">
+  <h2 id="c-title"></h2>
+  <p id="c-body"></p>
+  <textarea id="c-reason" placeholder="Reason (goes in the audit log)"></textarea>
+  <input id="c-type" style="width:100%;margin-top:8px" class="hidden">
+  <div class="err" id="c-err"></div>
+  <div class="row" style="justify-content:flex-end"><button class="btn" id="c-cancel">Cancel</button><button class="btn danger" id="c-ok"></button></div>
+</dialog>
 <script src="admin.js"></script>
 </body>
 </html>

@@ -14,11 +14,12 @@ import { logger } from "../logger";
 import { loadGameData } from "../gameData/loader";
 import { ComputeNewlyUnlockedNodeIds } from "./slayersPath";
 import crypto from "node:crypto";
-import { HUNT_PASS_SLOT_IDS, HuntPassCurve, HuntPassStorageId, IsHuntPassSlot, ServedSlotFor } from "../huntPassRotation";
+import { HUNT_PASS_SLOT_IDS, HuntPassCurve, HuntPassEntitlement, HuntPassStorageId, IsHuntPassSlot, ServedSlotFor } from "../huntPassRotation";
+import { DoesUserHoldEntitlement } from "./entitlements";
 import { GetPartyForPlayer } from "./party";
 import { GetMongoDb } from "../persistence/mongo/client";
 import { Collections } from "../persistence/mongo/collections";
-import { HuntedTogetherSlots, LINK_TRACK_PREFIX, SlayerLinkRow } from "../slayerLinks";
+import { HuntedTogether, LINK_TRACK_PREFIX, SlayerLinkRow } from "../slayerLinks";
 
 // [WP-1 stage 4 — security fix] Per-track rank curves, indexed once (on first use) from the
 // same file GET /progression/config serves. Used to validate confirm/public requests instead of
@@ -159,15 +160,16 @@ function IsDuplicateKeyError(ErrorValue: unknown): boolean {
 const LINK_HUNT_PASS_XP_RATIO = 0.1;
 
 // The 1.14.7 game server never grants Slayer Link XP; the live service did it. Hunt pass XP also goes to every
-// active link whose partner is in the player's party (hunted together). A failed lookup must not block the grant.
-async function HuntedTogetherLinkSlots(userId: string): Promise<number[]> {
+// active link whose partner is in the player's party (hunted together), on both players' slot tracks: the link is one
+// bar both of them fill. A failed lookup must not block the grant.
+async function HuntedTogetherLinkSlots(userId: string): Promise<ReturnType<typeof HuntedTogether>> {
     try {
         const Party = await GetPartyForPlayer(userId);
         if (!Party || Party.members.length < 2) return [];
         const Db = await GetMongoDb();
         const Rows = await Db.collection<SlayerLinkRow>(Collections.SlayerLinks)
             .find({ $or: [{ senderId: userId }, { targetId: userId }] }).toArray();
-        return HuntedTogetherSlots(Rows, userId, Party.members, Date.now());
+        return HuntedTogether(Rows, userId, Party.members, Date.now());
     } catch (ErrorValue) {
         logger.warn(`[ProgressionGrant] link lookup failed for user=${userId}: ${ErrorValue}`);
         return [];
@@ -215,9 +217,11 @@ export async function GrantProgressionXp(
                         logger.info(`[ProgressionGrant] grant=${grantId} link xp +${PassXp} -> hunt pass ${PassSlot} total=${PassAfter.progress}`);
                     }
                 }
-                for (const Slot of LinkSlots) {
-                    const LinkAfter = await repos.progressionTracks.increment(userId, `${LINK_TRACK_PREFIX}${Slot}`, amount, session);
-                    logger.info(`[ProgressionGrant] grant=${grantId} hunted together -> track=${LINK_TRACK_PREFIX}${Slot} +${amount} total=${LinkAfter.progress}`);
+                for (const Link of LinkSlots) {
+                    for (const [Id, Slot] of [[userId, Link.slot], [Link.partnerId, Link.partnerSlot]] as const) {
+                        const LinkAfter = await repos.progressionTracks.increment(Id, `${LINK_TRACK_PREFIX}${Slot}`, amount, session);
+                        logger.info(`[ProgressionGrant] grant=${grantId} hunted together -> user=${Id} track=${LINK_TRACK_PREFIX}${Slot} +${amount} total=${LinkAfter.progress}`);
+                    }
                 }
                 const Ledger: ProgressionGrantRecord = {
                     grantId,
@@ -443,9 +447,15 @@ export async function GetPersistedObjectivesForUser(userId: string){
 //      so a stale/replayed confirm can never LOWER an already-higher confirmed rank either.
 export type ConfirmRankResult =
     | { ok: true; record: ProgressionTrackRecord }
-    | { ok: false; reason: "unknown_track" | "rank_out_of_range" | "insufficient_xp" };
+    | { ok: false; reason: "unknown_track" | "rank_out_of_range" | "insufficient_xp" | "not_entitled" };
 
-export async function ConfirmPublicProgressionRank(userId: string, progressionId: string, rank: number): Promise<ConfirmRankResult> {
+// Elite (premium) ranks: same checks, plus the player must own the served pass's Elite entitlement.
+export async function ConfirmPublicProgressionRank(userId: string, progressionId: string, rank: number, premium = false): Promise<ConfirmRankResult> {
+    if (premium && !(IsHuntPassSlot(progressionId) && await DoesUserHoldEntitlement(userId, HuntPassEntitlement(progressionId)))) {
+        logger.warn(`Rejected premium rank confirm: user=${userId} lacks Elite entitlement for track ${progressionId}`);
+        return { ok: false, reason: "not_entitled" };
+    }
+
     const Curve = GetTrackCurve(progressionId);
     if (Curve === undefined) {
         logger.warn(`Rejected rank confirm: unknown track '${progressionId}' has no rank curve (user=${userId})`);
@@ -469,7 +479,7 @@ export async function ConfirmPublicProgressionRank(userId: string, progressionId
         }
     }
 
-    const Record = await GetRepositories().progressionTracks.setConfirmedFremiumRank(userId, ProgressionStorageId(progressionId), rank);
+    const Record = await GetRepositories().progressionTracks.setConfirmedRank(userId, ProgressionStorageId(progressionId), rank, premium);
     return { ok: true, record: Record };
 }
 

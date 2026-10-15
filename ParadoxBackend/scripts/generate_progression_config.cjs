@@ -65,23 +65,22 @@ if(!Array.isArray(Paths)) Fail("source has no payload.paths[] array — refusing
 // Slayer Link tracks (1.14.7). No capture has them, but the game server's prize pool generator refuses to run
 // without the config track Linked_Slayer_Slot_1 ("Unable to get progression configuration track",
 // ULinkedSlayerComponent::GeneratePrizePoolInternal 0x19ff90e) and the client reads Linked_Slayer_Slot_<slot>.
-// Added only when the source lacks them. Prizes carry received_for_level, so a rank beyond the last prize is harmless.
-// ponytail: LINK_RANKS/LINK_XP_PER_RANK are guesses (the real curve was server-side); set them from the
-// received_for_level values and XP grants the backend logs ("rewards save", "[ProgressionGrant] ... Linked_Slayer").
-const LINK_RANKS = 10;
-const LINK_XP_PER_RANK = 1000;
+// Added only when the source lacks them. One rank per chest; the circle the client draws is
+// (rank + rank progress / next rank's XP) / ranks (USlayerLinkViewModel::UpdateProgress 0x21ca6df), so the 4 chests
+// sit at quarter turns. XP per chest from the wiki (5/400/800/1600, 2,805 total), = LINK_CHEST_XP in src/slayerLinks.ts.
+const LINK_CHEST_XP = [5, 400, 800, 1600];
 for (const Slot of [1, 2, 3]) {
     const Id = `Linked_Slayer_Slot_${Slot}`;
     if (Paths.some((P) => P?.progression_id === Id)) continue;
-    const Ranks = Array.from({ length: LINK_RANKS + 1 }, (_, Rank) => Rank);
+    const Ranks = Array.from({ length: LINK_CHEST_XP.length + 1 }, (_, Rank) => Rank);
     Paths.push({
         progression_id: Id,
         start_date: "2020-01-01T00:00:00+00:00",
         end_date: "2099-12-31T00:00:00+00:00",
-        requirements: Ranks.map((Rank) => ({ rank_id: Rank, xp_required: Rank === 0 ? 0 : LINK_XP_PER_RANK })),
+        requirements: Ranks.map((Rank) => ({ rank_id: Rank, xp_required: Rank === 0 ? 0 : LINK_CHEST_XP[Rank - 1] })),
         free_rewards: Ranks.map((Rank) => ({ rank_id: Rank, entitlements: [], instanced_items: [], stacked_items: [] })),
     });
-    console.log(`added ${Id} (${LINK_RANKS} ranks x ${LINK_XP_PER_RANK} XP)`);
+    console.log(`added ${Id} (chests at ${LINK_CHEST_XP.join("/")} XP)`);
 }
 
 // Hunt pass rotation slots (src/huntPassRotation.ts): season43..50, 100 levels x 100 XP. The curve must be in the file

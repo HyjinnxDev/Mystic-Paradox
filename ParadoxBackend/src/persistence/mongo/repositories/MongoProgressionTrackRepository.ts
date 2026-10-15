@@ -150,7 +150,8 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
         };
     }
 
-    async setConfirmedFremiumRank(userId: string, progressionId: string, rank: number): Promise<ProgressionTrackRecord> {
+    async setConfirmedRank(userId: string, progressionId: string, rank: number, premium = false): Promise<ProgressionTrackRecord> {
+        const [RankField, OtherField] = premium ? ["confirmedPremiumRank", "confirmedFremiumRank"] : ["confirmedFremiumRank", "confirmedPremiumRank"];
         const Db = await GetMongoDb();
         const Now = new Date().toISOString();
         const Id = this.TrackId(userId, progressionId);
@@ -163,12 +164,12 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
         const Result = await Db.collection(Collections.ProgressionTracks).findOneAndUpdate(
             { _id: Id as any },
             {
-                $max: { confirmedFremiumRank: rank },
+                $max: { [RankField]: rank },
                 $set: { userId, progressionId, updatedAt: Now },
                 $inc: { updateVersion: 1 },
                 $setOnInsert: {
                     progress: 0,
-                    confirmedPremiumRank: 0,
+                    [OtherField]: 0,
                     createdAt: Now
                 }
             },
@@ -177,7 +178,7 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
 
         const Doc = Result as any;
         if (Doc == undefined) {
-            throw new Error(`ProgressionTrack setConfirmedFremiumRank upsert for ${Id} unexpectedly returned no document.`);
+            throw new Error(`ProgressionTrack setConfirmedRank upsert for ${Id} unexpectedly returned no document.`);
         }
 
         return {

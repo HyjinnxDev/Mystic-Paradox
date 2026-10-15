@@ -12,7 +12,7 @@
 import { Router } from "express";
 import { logger } from "../logger";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
-import { GetNotesForUser, GetStoreSkus, PurchaseStoreSku, FindStoreSkuByIdOrCatalogId } from "../controllers/store";
+import { GetNotesForUser, GetStoreSkus, PurchaseStoreSku, FindStoreSkuByIdOrCatalogId, FountainClaimedToday } from "../controllers/store";
 import { GetWallet, BuildBalanceDict } from "../controllers/wallet";
 import { ProjectBalances } from "../platinumWallet";
 import { GetCharactersForUid } from "../controllers/character";
@@ -170,7 +170,13 @@ storeRouter.get("/product/skus/public", HasParadoxBackendAuth, async (req: any, 
         return;
     }
 
-    const StoreSkus = GetStoreSkus(RequiredTags);
+    let StoreSkus = GetStoreSkus(RequiredTags);
+
+    // Coin toss: no offer once today's claim is done, so the client doesn't offer the toss again until the UTC day rolls.
+    if (RequiredTags === "fountain_daily_free_bundle") {
+        const CharacterId = (await GetCharactersForUid(req.AuthData.userId))[0]?.id;
+        if (CharacterId && await FountainClaimedToday(req.AuthData.userId, CharacterId)) StoreSkus = [];
+    }
 
     if (StoreSkus.length === 0) {
         logger.info(`Store SKUs requested for unimplemented tag '${RequiredTags}' - returning empty`);

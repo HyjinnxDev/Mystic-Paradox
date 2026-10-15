@@ -536,7 +536,10 @@ progressionRouter.post("/progression/:userId", HasParadoxBackendAuth, async (req
 // the trusted gameserver on a player's behalf, exactly like the grant endpoint — never a player's
 // own bearer token), a validated integer rank, and ConfirmPublicProgressionRank enforcing the
 // rank is in-range for the track and the account's persisted XP actually qualifies for it.
-progressionRouter.post("/progression/:userId/:progressionId/:rank/confirm/public", HasParadoxBackendAuth, async (req: any, res) => {
+progressionRouter.post("/progression/:userId/:progressionId/:rank/confirm/:track", HasParadoxBackendAuth, async (req: any, res, next) => {
+    // public = free track, premium = Elite track (hunt pass only, entitlement-gated).
+    const Premium = req.params.track === "premium";
+    if(!Premium && req.params.track !== "public") return next();
     if(req.AuthData?.IsGameserver !== true){
         logger.warn(`Rejected rank confirm attempt without gameserver auth (userId=${req.params.userId}, track=${req.params.progressionId})`);
         res.status(403);
@@ -563,17 +566,17 @@ progressionRouter.post("/progression/:userId/:progressionId/:rank/confirm/public
         return;
     }
 
-    const Result = await ConfirmPublicProgressionRank(RequestedUserId, ProgressionId, Rank);
+    const Result = await ConfirmPublicProgressionRank(RequestedUserId, ProgressionId, Rank, Premium);
 
     if(!Result.ok){
-        const StatusByReason = { unknown_track: 400, rank_out_of_range: 400, insufficient_xp: 409 } as const;
+        const StatusByReason = { unknown_track: 400, rank_out_of_range: 400, insufficient_xp: 409, not_entitled: 403 } as const;
         res.status(StatusByReason[Result.reason]);
         res.json({ code: null, message: `Rejected: ${Result.reason}`, payload: {} });
         return;
     }
 
     const Updated = Result.record;
-    logger.info(`Confirm public progression rank ${Rank} for userId ${RequestedUserId} track ${ProgressionId} - progress preserved at ${Updated.progress}`);
+    logger.info(`Confirm ${Premium ? "premium" : "public"} progression rank ${Rank} for userId ${RequestedUserId} track ${ProgressionId} - progress preserved at ${Updated.progress}`);
 
     res.status(200);
     res.json({

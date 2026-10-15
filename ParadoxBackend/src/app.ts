@@ -33,6 +33,7 @@ import { launcherUpdatesRouter } from "./routes/launcherUpdates.js";
 import { contentRouter } from "./routes/content.js";
 import { newsRouter } from "./routes/news.js";
 import { launcherCardRouter } from "./routes/launcherCard.js";
+import { sessionRegistry } from "./realtime/SessionRegistry.js";
 import { launcherLogsRouter } from "./routes/launcherLogs.js";
 import { adminLauncherLogsRouter } from "./routes/adminLauncherLogs.js";
 import { crashReportsRouter } from "./routes/crashReports.js";
@@ -206,7 +207,9 @@ app.get("/health/ready", async (_req, res) => {
         service: "paradox-backend",
         role: state.role,
         reason: ready ? "READY" : state.reason,
-        persistence: persistenceHealthy ? "ready" : "unavailable"
+        persistence: persistenceHealthy ? "ready" : "unavailable",
+        // [forever-discord] count only (no ids) for the Discord status channel (statusWatch.ts).
+        players: sessionRegistry.onlineAccountCount()
     });
 });
 

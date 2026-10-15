@@ -52,6 +52,13 @@ void MpVoiceApplySettings(bool enabled, float volume);
 // Game thread -> voice threads: the Bindings "Push to Talk" key (a VK code, 0 = unusable) and the Audio Open Mic toggle.
 void MpVoiceSetPttKey(int vk);
 void MpVoiceSetOpenMic(bool open);
+// Game thread -> voice threads: the social (O) menu's mic mute button; muted = nothing sent in either mode.
+void MpVoiceSetSelfMuted(bool muted);
+// Voice threads -> game thread, for the talking icons: this player 0 = silent/voice off, 1 = sending, 2 = muted;
+// another player's relay sender key (from their account id) and whether their voice is arriving right now.
+int MpVoiceSelfState();
+uint32_t MpVoiceKeyForId(const std::string& id);
+bool MpVoiceKeyTalking(uint32_t key);
 // Game thread -> voice threads: this player's pawn location (UE units) and camera yaw (degrees), for proximity pan/fade.
 void MpVoiceSetListener(bool valid, float x, float y, float z, float yawDegrees);
 // Hub server only: report every connected player's backend account id and location to the voice relay, which

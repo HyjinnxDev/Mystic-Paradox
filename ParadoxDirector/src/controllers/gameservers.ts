@@ -52,6 +52,7 @@ export type Gameserver = {
     // to the client until the injected server has emitted the matching ready marker.
     state: "starting" | "ready" | "failed",
     launchId: string,
+    logPath: string,
     readyTime?: Date
 };
 
@@ -202,7 +203,7 @@ function GetCurrentTrialsWeek(NowMs: number = Date.now()): string {
 // NOTE: empty/abandoned hunts are reclaimed by the gameserver DLL self-terminating when it has had no
 // client connections for a grace period (accurate: never kills a hunt while anyone is still fighting).
 // We deliberately do NOT reap by wall-clock lifetime — big maps + long hunts must not be cut short.
-const MAX_CONCURRENT_HUNT_SERVERS = Number(process.env.MAX_CONCURRENT_HUNT_SERVERS ?? "3");
+export const MAX_CONCURRENT_HUNT_SERVERS = Number(process.env.MAX_CONCURRENT_HUNT_SERVERS ?? "3");
 
 // [2026-07-19] Public Hunt Server Reuse (Part B). When enabled, a SHARED (public Hunting Grounds) request
 // for a player hunt id that already has a live, ready, non-full server JOINS that server instead of
@@ -548,7 +549,8 @@ async function StartServer(Map: string, Behemoth: string | undefined, Matchmaker
         processId: Child.pid!,
         startTime: new Date(),
         state: "starting",
-        launchId: Id
+        launchId: Id,
+        logPath: LogPath
     };
 
     Gameservers.push(NewGameserver);

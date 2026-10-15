@@ -15,6 +15,7 @@
     "start": "node --env-file=.env build/server.js",
     "prestart:api": "node scripts/ensure-build-fresh.cjs",
     "start:api": "node --env-file=.env build/server.js",
+    "start:status-watch": "node --env-file=.env build/statusWatch.js",
     "test:bootstrap": "npm run build && node --env-file=.env scripts/test_bootstrap_regression.cjs",
     "pretest:mongo-migration-rehearsal": "node --test scripts/test_mongo_schema_migration_rehearsal.test.cjs",
     "test:mongo-migration-rehearsal": "node scripts/test_mongo_schema_migration_rehearsal.cjs",
@@ -44,6 +45,7 @@
   },
   "dependencies": {
     "@node-rs/argon2": "^2.0.2",
+    "discord.js": "14.27.0",
     "dotenv": "^17.4.2",
     "express": "5.2.1",
     "express-rate-limit": "8.7.0",

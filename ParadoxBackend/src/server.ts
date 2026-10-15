@@ -27,6 +27,7 @@ import { ReadMetagameServiceRole } from "./config/serviceRole";
 import { SetServiceReadiness } from "./observability/serviceReadiness";
 import { GetP2PExtension } from "./extensions/p2p";
 import { DefaultRelayDeps, StartVoiceRelay, VoicePort } from "./voiceRelay";
+import { StartDiscordIssues, StopDiscordIssues } from "./discordIssues";
 
 const PORT = process.env.PORT?.trim() || "3000";
 
@@ -190,6 +191,9 @@ async function Main(): Promise<void> {
     } catch (e) {
         logger.warn(`[Voice] relay could not start: ${e}`);
     }
+
+    // Discord /issue tickets (discordIssues.ts). Same rule: a Discord failure never takes the API down.
+    StartDiscordIssues();
 }
 
 // [hardening] Graceful shutdown: on SIGINT/SIGTERM, stop accepting new connections first, THEN
@@ -231,6 +235,7 @@ async function GracefulShutdown(Signal: string, ExitCode = 0): Promise<void> {
         // listeners go away (plan §8.4). No-op when realtime is disabled.
         await shutdownRealtime();
         partyOutboxDispatcher.stop();
+        await StopDiscordIssues();
         await GetP2PExtension().server.stop();
         logger.info("Realtime (XMPP) gateway stopped");
 

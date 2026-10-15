@@ -37,6 +37,7 @@ function PublicAccount(account: LauncherAccountRecord): Record<string, unknown> 
         usernameSet: account.usernameSet !== false,
         createdAt: account.createdAt,
         lastLoginAt: account.lastLoginAt,
+        lastSeenAt: account.lastSeenAt,
         approvalUpdatedAt: account.approvalUpdatedAt,
         approvalUpdatedBy: account.approvalUpdatedBy,
         approvalReason: account.approvalReason
@@ -120,26 +121,6 @@ export async function ListPlayers(req: Request, res: Response): Promise<void> {
         limit: Limit
     });
     res.json({ accounts: Result.accounts.map(PublicAccount), total: Result.total, page: Page, limit: Limit });
-}
-
-export async function ListOnlinePlayers(_req: Request, res: Response): Promise<void> {
-    // The XMPP registry represents live game-client sockets, not reusable launcher/login
-    // sessions. Account IDs are deduplicated there when one client has multiple resources.
-    const AccountIds = sessionRegistry.onlineAccountIds();
-    const Accounts = await Promise.all(
-        AccountIds.map((UserId) => GetRepositories().launcherAccounts.findByUserId(UserId))
-    );
-    const Players = Accounts
-        .filter((Account): Account is LauncherAccountRecord => Account !== undefined)
-        .map((Account) => ({ userId: Account.userId, displayName: Account.displayName }))
-        .sort((A, B) => A.displayName.localeCompare(B.displayName, undefined, { sensitivity: "base" }));
-
-    res.json({
-        count: Players.length,
-        players: Players,
-        observedAt: new Date().toISOString(),
-        source: "xmpp"
-    });
 }
 
 export async function UpdatePlayerAccess(req: Request, res: Response): Promise<void> {

@@ -13,7 +13,7 @@ import {
     IsAuthorizedProgressionReporter,
     IsCharacterOwnedByUser
 } from "./controllers/progression";
-import { CaptureProgressionObjectiveEvent, MasteryTrackForObjective } from "./controllers/progression";
+import { CaptureProgressionObjectiveEvent, ConfirmPublicProgressionRank, MasteryTrackForObjective } from "./controllers/progression";
 import { HuntPassMaxXp, HuntPassStorageId } from "./huntPassRotation";
 
 const Track = {
@@ -256,4 +256,8 @@ test("mastery objectives map to their category track", () => {
     assert.equal(MasteryTrackForObjective("MasteryObjective_Weapon_DP_Quillshot_Craft"), "MasteryTrack_Weapon_Repeaters");
     assert.equal(MasteryTrackForObjective("MasteryObjective_Weapon_Pike_Generic_Kills1"), "MasteryTrack_Weapon_Spear");
     assert.equal(MasteryTrackForObjective("AchievementObjective_Discover_Collectables"), undefined);
+});
+
+test("Elite (premium) rank confirm is only for hunt passes", async () => {
+    assert.deepEqual(await ConfirmPublicProgressionRank("user-1", "ExperienceTrack_PlayerLevel", 1, true), { ok: false, reason: "not_entitled" });
 });

@@ -25,7 +25,13 @@
 //          (FOnlineLinkedSlayer::SendLinkRewards 0x1c80e08, body serializer 0x1c8379f, entry 0x1c850e0) -> {}
 //   GET    /slayerlink/links/rewards/:account_id/:slot (GetLinkRewardsGrant 0x1c64500) -> {is_service_granting}
 //          (0x1c825af). false = the game server grants; answered once per player per link (409 after).
-// Link progress is the per-player progression track Linked_Slayer_Slot_<slot>, reset for both players on accept.
+// The live game (wiki "Slayer Links", 1.3.6): all Hunt Pass XP earned in a party together moves the link toward 4
+// chests at 5/400/800/1600 XP (2,805 total). Each chest unlocks one prize from the pool shown for the link; the prizes
+// stay hidden until the 7 days end. A link that has earned XP cannot be broken. No 1.14.7 capture ever showed the game
+// server saving a pool, so the backend draws the pool, unlocks the chests and grants the prizes (SettleLink), and the
+// grant check answers is_service_granting: true. A pool the game server does save still replaces the drawn one.
+// Link progress is the per-player progression track Linked_Slayer_Slot_<slot>, reset for both players on accept;
+// both players' tracks get every hunted-together grant, so they read the same.
 // Slots are 1..3 (the client's slot-map keys). One row per invite; an accepted invite becomes the link
 // (same id, status LINKED). Envelope {code, message, payload}; errors {code: "<status>", message, payload: null}.
 // ponytail: no blocklist (friends.ts has none yet) and no per-player invite rate limit (3 slots = 3 pending
@@ -39,6 +45,22 @@ export const MAX_AVAILABILITY_IDS = 50;
 export const REWARD_GRACE_HOURS = 168;
 export const MAX_PRIZES = 50;
 export const LINK_TRACK_PREFIX = "Linked_Slayer_Slot_";
+// XP to reach each chest, per chest (same numbers as the Linked_Slayer_Slot_* curve in scripts/generate_progression_config.cjs)
+export const LINK_CHEST_XP = [5, 400, 800, 1600];
+export const LINK_CROWN = "AC_HEAD_CROWN";   // Crown of Friendship, only from Slayer Links
+// The wiki's reward list: [catalog id, quantity]
+export const LINK_REWARDS: [string, number][] = [
+    [LINK_CROWN, 1],
+    ...[1500, 2000, 3000, 4000, 5000, 8000, 12000, 15000, 18000].map((q): [string, number] => ["CURRENCY_NOTES", q]),            // Rams
+    ...[10, 60, 90, 120, 150, 300, 450, 600].map((q): [string, number] => ["CURRENCY_CELLDUST", q]),                           // Aetherdust
+    ...[2, 3, 4, 5, 8].map((q): [string, number] => ["TOKEN_BOUNTY_DRAFT", q]),                                                // Bounty Tokens
+    ...[3, 5, 10, 12].map((q): [string, number] => ["TOKEN_DAILY_PATROL_BONUS_PURCHASED", q]),                                 // Patrol Keys
+    ...[5, 10, 20, 30, 100, 200].map((q): [string, number] => ["CURRENCY_PJM_WEAPON", q]),                                     // Combat Merits
+    ...[25, 50].map((q): [string, number] => ["CURRENCY_PJM_PRESTIGE_EMPTY", q]),                                              // Aethersparks
+];
+// ponytail: pool size and the uniform draw are guesses (LinkedSlayerConfigTable/LinkedSlayerRewardsTable are not
+// exported); use their MaxRewards and ItemWeight if they ever are.
+export const PRIZE_POOL_SIZE = 8;
 const HOUR_MS = 60 * 60 * 1000;
 const ALL_SLOTS = Array.from({ length: LINK_SLOTS }, (_, i) => i + 1);
 
@@ -85,9 +107,11 @@ const PendingOf = (rows: SlayerLinkRow[], me: string, now: number) => rows.filte
 const LinksOf = (rows: SlayerLinkRow[], me: string, now: number) => rows.filter((r) => Involves(r, me) && IsLinked(r, now));
 const LinkedWith = (rows: SlayerLinkRow[], a: string, b: string, now: number) => LinksOf(rows, a, now).some((r) => Other(r, a) === b);
 
-// My active link slots whose partner is in my party: a hunt's XP counts for a link only when hunted together.
-export const HuntedTogetherSlots = (rows: SlayerLinkRow[], me: string, partyMembers: string[], now: number) =>
-    LinksOf(rows, me, now).filter((r) => partyMembers.includes(Other(r, me))).map((r) => LinkSlot(r, me)).filter((s) => s >= 1);
+// My active links whose partner is in my party: a hunt's XP counts for a link only when hunted together.
+export const HuntedTogether = (rows: SlayerLinkRow[], me: string, partyMembers: string[], now: number) =>
+    LinksOf(rows, me, now).filter((r) => partyMembers.includes(Other(r, me)))
+        .map((r) => ({ slot: LinkSlot(r, me), partnerId: Other(r, me), partnerSlot: LinkSlot(r, Other(r, me)) }))
+        .filter((l) => l.slot >= 1 && l.partnerSlot >= 1);
 
 function FreeSlots(rows: SlayerLinkRow[], me: string, now: number): number[] {
     const used = new Set(LinksOf(rows, me, now).map((r) => LinkSlot(r, me)));
@@ -114,7 +138,8 @@ function Lists(rows: SlayerLinkRow[], me: string, now: number) {
                 slot: LinkSlot(r, me),
                 ends: new Date(r.endsAt ?? 0).toISOString(),
                 link_id: r._id,
-                prize_pool: r.prizePools?.[me] ?? []
+                // the unlocked prizes stay hidden until the link ends
+                prize_pool: (r.prizePools?.[me] ?? []).map((p) => ({ ...p, received_for_level: 0 }))
             }))
             .sort((a, b) => a.slot - b.slot)
     };
@@ -207,7 +232,8 @@ export function DeleteInvites(rows: SlayerLinkRow[], me: string, accountId: unkn
 }
 
 // DELETE /slayerlink/links: ends the link for both players. Nothing to remove is still 200.
-export function DeleteLink(rows: SlayerLinkRow[], me: string, body: any, query: any, now: number): SlayerLinkResult {
+// locked: ids of links that earned XP, which stay until the week ends.
+export function DeleteLink(rows: SlayerLinkRow[], me: string, body: any, query: any, now: number, locked = new Set<string>()): SlayerLinkResult {
     const slot = SlotOf(body?.slot ?? query?.slot);
     const other = body?.account_id ?? query?.account_id;
     const hasOther = IsId(other);
@@ -217,6 +243,9 @@ export function DeleteLink(rows: SlayerLinkRow[], me: string, body: any, query: 
     const link = links.find((r) => (slot === undefined || LinkSlot(r, me) === slot) && (!hasOther || Other(r, me) === other))
         ?? links.find((r) => hasOther && Other(r, me) === other)
         ?? links.find((r) => slot !== undefined && LinkSlot(r, me) === slot);
+    if (link && locked.has(link._id)) {
+        return { reply: Fail(409, "the link has earned XP and lasts until its week ends"), log: `delete link by=${me} id=${link._id} refused 409: has XP` };
+    }
     return { reply: Ok({}), remove: link?._id, log: `delete link by=${me} slot=${slot ?? "-"} other=${hasOther ? other : "-"} -> ${link ? `removed ${link._id}` : "nothing to remove"}` };
 }
 
@@ -255,7 +284,7 @@ export function SaveRewards(rows: SlayerLinkRow[], owner: string, body: any, now
     return { reply: Ok({}), put: [done], log: `rewards save for=${owner} slot=${slot} id=${link._id} -> ${pool.length} prizes [${summary}]` };
 }
 
-// GET /slayerlink/links/rewards/:account_id/:slot
+// GET /slayerlink/links/rewards/:account_id/:slot. The backend grants (SettleLink), so the game server never does.
 export function RewardsGrant(rows: SlayerLinkRow[], owner: string, slotValue: unknown, now: number): SlayerLinkResult {
     const slot = SlotOf(slotValue);
     const refuse = (status: number, why: string): SlayerLinkResult =>
@@ -263,9 +292,50 @@ export function RewardsGrant(rows: SlayerLinkRow[], owner: string, slotValue: un
     if (slot === undefined) return refuse(400, `the slot must be 1 to ${LINK_SLOTS}`);
     const link = RewardLink(rows, owner, slot, now);
     if (!link) return refuse(404, "no link in this slot");
-    if (link.rewardsGranted?.includes(owner)) return refuse(409, "the rewards of this link were already granted");
-    const done: SlayerLinkRow = { ...link, rewardsGranted: [...(link.rewardsGranted ?? []), owner] };
-    return { reply: Ok({ is_service_granting: false }), put: [done], log: `rewards grant for=${owner} slot=${slot} id=${link._id} -> game server grants (${link.prizePools?.[owner]?.length ?? 0} prizes stored)` };
+    return { reply: Ok({ is_service_granting: true }), log: `rewards grant for=${owner} slot=${slot} id=${link._id} -> backend grants` };
+}
+
+// A fresh pool for one player's side of a link: PRIZE_POOL_SIZE different prizes, none unlocked yet. skip: catalog ids
+// to leave out (a Crown of Friendship the player already owns).
+export function DrawPrizePool(random: () => number, skip: Set<string>): LinkPrize[] {
+    const all = LINK_REWARDS.filter(([id]) => !skip.has(id)).map(([catalog_id, quantity]): LinkPrize => ({ catalog_id, quantity, received_for_level: 0 }));
+    const n = Math.min(PRIZE_POOL_SIZE, all.length);
+    for (let i = 0; i < n; i++) {
+        const j = i + Math.floor(random() * (all.length - i));
+        [all[i], all[j]] = [all[j], all[i]];
+    }
+    return all.slice(0, n);
+}
+
+export function ChestsReached(progress: number): number {
+    let total = 0, reached = 0;
+    for (const xp of LINK_CHEST_XP) if (progress >= (total += xp)) reached++;
+    return reached;
+}
+
+// Each chest reached unlocks one random still-locked prize (received_for_level = the chest). undefined: nothing new.
+export function UnlockChests(pool: LinkPrize[], progress: number, random: () => number): LinkPrize[] | undefined {
+    const out = pool.map((p) => ({ ...p }));
+    let changed = false;
+    for (let level = 1; level <= ChestsReached(progress); level++) {
+        if (out.some((p) => p.received_for_level === level)) continue;
+        const locked = out.filter((p) => p.received_for_level === 0);
+        if (locked.length === 0) break;
+        locked[Math.floor(random() * locked.length)].received_for_level = level;
+        changed = true;
+    }
+    return changed ? out : undefined;
+}
+
+// One player's side of a link, run whenever that player reads their links: draws the pool if there is none, unlocks
+// the chests their link XP reached, and once the week is over returns the unlocked prizes to grant. The caller adds the
+// player to rewardsGranted after the grant committed; a granted side is never touched again.
+export function SettleLink(row: SlayerLinkRow, me: string, progress: number, now: number, random: () => number, skip: Set<string>): { put?: SlayerLinkRow; grant?: LinkPrize[] } {
+    if (row.status !== "LINKED" || !Involves(row, me) || row.rewardsGranted?.includes(me)) return {};
+    const drawn = row.prizePools?.[me] ?? DrawPrizePool(random, skip);
+    const pool = UnlockChests(drawn, progress, random) ?? drawn;
+    const put = pool !== row.prizePools?.[me] ? { ...row, prizePools: { ...row.prizePools, [me]: pool } } : undefined;
+    return { put, grant: (row.endsAt ?? 0) <= now ? pool.filter((p) => p.received_for_level > 0) : undefined };
 }
 
 export function AvailabilityIds(body: any): string[] {

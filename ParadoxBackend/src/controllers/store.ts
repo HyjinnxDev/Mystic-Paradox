@@ -104,6 +104,26 @@ function ExchangeSlotSku(Slot: 2 | 3): StoreSku {
         duplicateInstancedItems: [],
     };
 }
+// [1.14.7 2026-10-15] Ramsgate fountain coin toss: UArchonActivitiesProgressionComponent::ClaimDailyBonus queries
+// `fountain_daily_free_bundle` (runtime [CoinToss] probe), buys the offer, and cointoss_stringer_bpw plays the flip
+// when CONTAINER_CORE_REWARD_DAILY_01 is granted. No live SKU capture: id is ours, price free (0 Platinum, never
+// debited). One claim per UTC day (same day boundary as the bounty token refill): the ownership key carries the day,
+// so a repeat toss the same day replays the first purchase instead of granting again. The listing hides the offer
+// once today's claim is in the ledger (FountainClaimedToday), so the coin is only tossable once per day.
+function FountainDailySku(): StoreSku {
+    return {
+        id: "fountain_daily_free_bundle_01",
+        displayName: "Daily Fountain Bonus",
+        displayDescription: "Toss a coin in the Ramsgate fountain once a day.",
+        displayPriority: 0,
+        prices: [{ currencyId: "id_currency_platinum", price: 0 }],
+        maxAllowed: 1,
+        ownershipKey: `fountain_daily_free_bundle_01:${new Date().toISOString().slice(0, 10)}`,
+        tags: ["fountain_daily_free_bundle"],
+        items: [{ catalogId: "CONTAINER_CORE_REWARD_DAILY_01", quantity: 1, instanced: false }],
+        duplicateInstancedItems: [],
+    };
+}
 const HUNT_PASS_SKUS = Object.fromEntries(HUNT_PASS_SLOT_IDS.map((Slot) => [HuntPassPassSkuTag(Slot), HuntPassSkus(Slot)]));
 const EXCHANGE_SLOT_SKUS = { slot2: [ExchangeSlotSku(2)], slot3: [ExchangeSlotSku(3)] };
 
@@ -117,6 +137,7 @@ const STORE_SKUS: Record<string, StoreSku[]> = {
     dyes: PlatinumSection("dyes"),
     hp_level_skip_rank: PlatinumSection("hp_level_skip_rank"),
     huntpass_store: PlatinumSection("huntpass_store"),
+    get fountain_daily_free_bundle() { return [FountainDailySku()]; },   // rebuilt per read: the ownership key carries today's date
 };
 
 // Store-service currency ids (id_currency_x) -> our wallet's catalog currency ids (CURRENCY_X).
@@ -204,6 +225,17 @@ function TransactionScopeFor(storeTag: string): { transaction: string; instance:
     return { transaction: `store-purchase:${storeTag}`, instance: `store-purchase-instance:${storeTag}` };
 }
 
+function OneTimeTransactionId(storeTag: string, userId: string, sku: StoreSku): string {
+    const Scope = TransactionScopeFor(storeTag).transaction;
+    return crypto.createHash("sha256").update(`${Scope}:${userId}:${sku.ownershipKey ?? sku.id}`).digest("hex").slice(0, 32).toUpperCase();
+}
+
+// Today's fountain coin toss already completed for this character (same ledger row PurchaseStoreSku replays).
+export async function FountainClaimedToday(userId: string, characterId: string): Promise<boolean> {
+    const TransactionId = OneTimeTransactionId("fountain_daily_free_bundle", userId, FountainDailySku());
+    return GetRepositories().inventoryTransactions.isCompleted(TransactionId, userId, characterId);
+}
+
 // Applies a SKU's `skuProgression` payload. Rank-skip SKUs name `selected_huntpass` and a rank
 // count, which src/skuProgression.ts converts to an XP delta against the same rank curve
 // controllers/progression.ts validates rank-confirm requests with. A no-op plan (unknown track,
@@ -269,10 +301,10 @@ export async function PurchaseStoreSku(userId: string, characterId: string, stor
     // section of the SAME store shares one scope - see TransactionScopeFor.
     const { transaction: TransactionScope, instance: InstanceScope } = TransactionScopeFor(storeTag);
     const TransactionId = IsOneTime
-        ? crypto.createHash("sha256").update(`${TransactionScope}:${userId}:${Sku.ownershipKey ?? skuId}`).digest("hex").slice(0, 32).toUpperCase()
+        ? OneTimeTransactionId(storeTag, userId, Sku)
         : crypto.randomBytes(16).toString("hex").toUpperCase();
 
-    const StackedItemsToRemove = Sku.prices.map((p) => ({
+    const StackedItemsToRemove = Sku.prices.filter((p) => p.price > 0).map((p) => ({
         catalogId: CURRENCY_ID_MAP[p.currencyId] ?? p.currencyId.toUpperCase(),
         quantity: p.price,
     }));

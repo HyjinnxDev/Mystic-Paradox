@@ -47,8 +47,8 @@ export interface ProgressionTrackRepository {
     setProgressIfGreater(userId: string, progressionId: string, value: number): Promise<ProgressionTrackRecord>;
 
     /**
-     * Persists confirmedFremiumRank using a monotonic max-guard ($max) — never touches `progress`
-     * or confirmedPremiumRank. Fixes a real bug (confirmed via live repro) where the rank-confirm
+     * Persists confirmedFremiumRank (or confirmedPremiumRank when `premium`) using a monotonic
+     * max-guard ($max) — never touches `progress` or the other track's rank. Fixes a real bug (confirmed via live repro) where the rank-confirm
      * route was returning the rank NUMBER in the `progress` field, which the client trusts and
      * uses to overwrite its cached XP total, visibly clobbering e.g. 250 XP down to "3" (the
      * rank). The $max guard is a second layer against replay/reordering — callers (see
@@ -58,7 +58,7 @@ export interface ProgressionTrackRepository {
      * happen but must be handled without fabricating a progress value), creates it with
      * progress:0 rather than inventing a number.
      */
-    setConfirmedFremiumRank(userId: string, progressionId: string, rank: number): Promise<ProgressionTrackRecord>;
+    setConfirmedRank(userId: string, progressionId: string, rank: number, premium?: boolean): Promise<ProgressionTrackRecord>;
 
     /** Appends one raw mastery/objective event. Append-only — never updates or dedupes here. */
     appendObjectiveEvent(event: ProgressionObjectiveEventRecord): Promise<void>;

@@ -347,7 +347,8 @@ function ParseItemData(Row: CatalogRow): ParsedItemData {
             rarity: Number(ItemData.RarityLevel ?? 0),
             icon: typeof ItemData.Icon === "string" ? ItemData.Icon : "",
             largeIcon: typeof ItemData.LargeIcon === "string" ? ItemData.LargeIcon : "",
-            customIcon: typeof ItemData.CustomIcon === "string" ? ItemData.CustomIcon : "",
+            // Gliders' CustomIcon is the HUD glider-meter ring, not item art; fall through to Icon.
+            customIcon: typeof ItemData.CustomIcon === "string" && !ItemData.CustomIcon.startsWith("/Game/UI/Textures/HUD/") ? ItemData.CustomIcon : "",
         };
     } catch {
         return { rarity: 0, icon: "", largeIcon: "", customIcon: "" };
