@@ -621,6 +621,12 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
             if (typeof NewStackedItem?.catalogId === "string" && Number.isSafeInteger(NewStackedItem?.quantity) && NewStackedItem.quantity > 0) {
                 AcceptedStackedAdds.push({ catalogId: NewStackedItem.catalogId, quantity: NewStackedItem.quantity });
             }
+            // [2026-10-15] Currency lives only in the wallet. Adding it here too kept a second, drifting copy in the
+            // blob and reported it in updatedStackedItems ahead of the real balance: a +40 merit bounty showed 215
+            // (stale blob 175 + 40) while the wallet held 220. The wallet balance is reported below instead.
+            if(typeof NewStackedItem?.catalogId === "string" && NewStackedItem.catalogId.startsWith("CURRENCY_")){
+                continue;
+            }
 
             const ExistingStackedItem = StackedItemsByCatalogId.get(NewStackedItem.catalogId);
 
@@ -637,6 +643,8 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
 
         RemoveInstancedItems(InstancedItems, InstancedItemsToRemove ?? []);
         RemoveStackedItems(StackedItems, StackedItemsToRemove ?? []);
+        // Drop legacy currency copies left in the blob by the old add path (see above); the wallet is the authority.
+        StackedItems = StackedItems.filter((Item) => !(typeof Item?.catalogId === "string" && Item.catalogId.startsWith("CURRENCY_")));
 
         // [BUG D fix 2026-07-18] Report the POST-removal quantity of every non-currency stacked item this
         // transaction removed, so the client updates its counts. Previously only ADDED stacked items were

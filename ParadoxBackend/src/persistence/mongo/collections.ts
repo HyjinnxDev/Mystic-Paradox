@@ -73,5 +73,10 @@ export const Collections = {
     PartyOutbox: "partyOutbox",
 
     // Slayer Links invites and links, one row per invite (src/slayerLinks.ts). Purged by the purgeAt TTL.
-    SlayerLinks: "slayerLinks"
+    SlayerLinks: "slayerLinks",
+
+    // Guilds (controllers/guild.ts). guildMembers _id = accountId (one guild per account); guildInvites purged by the expiresAt TTL.
+    Guilds: "guilds",
+    GuildMembers: "guildMembers",
+    GuildInvites: "guildInvites"
 } as const;

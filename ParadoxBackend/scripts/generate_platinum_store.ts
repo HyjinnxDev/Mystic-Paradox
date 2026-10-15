@@ -453,6 +453,30 @@ for (const Sku of ReadCapture("hp_level_skip_rank.json")) {
     });
 }
 
+// No rank-skip capture: build them from the client's own baked hp_level_skip_<N>_rank(s) rows instead.
+// Linear from the one captured anchor (hp_level_skip_20_ranks = 3000, storeRegistry test).
+// ponytail: other ladder steps are extrapolated; replace with the captured ladder when one exists.
+const RANK_SKIP_PRICE = 150;
+for (const RowName of [...BakedRows.keys()].sort()) {
+    const Match = /^hp_level_skip_(\d+)_ranks?$/.exec(RowName);
+    if (!Match || ClaimedSkuIds.has(RowName)) continue;
+    const Ranks = Number(Match[1]);
+    ClaimedSkuIds.add(RowName);
+    Output.push({
+        id: RowName,
+        displayName: `Skip ${Ranks} Hunt Pass ${Ranks === 1 ? "Rank" : "Ranks"}`,
+        displayDescription: `Instantly advance your current Hunt Pass by ${Ranks} ${Ranks === 1 ? "rank" : "ranks"}.`,
+        displayPriority: Ranks,
+        prices: [{ currencyId: CURRENCY_ID, price: Ranks * RANK_SKIP_PRICE }],
+        maxAllowed: null,
+        images: ResolveImages(RowName, []) ?? {},
+        tags: [SECTION_RANK_SKIP, "event", "platinum_store_reconstructed"],
+        items: [],
+        duplicateInstancedItems: [],
+        skuProgression: { progressionId: "selected_huntpass", xp: null, ranks: Ranks },
+    });
+}
+
 // Hunt Pass premium passes: pure entitlement payloads. Only those the 1.12 client bakes.
 for (const Sku of ReadCapture("huntpass_store.json")) {
     if (!BakedRows.has(Sku.id)) { Skip("huntpass pass: sku id not baked"); continue; }

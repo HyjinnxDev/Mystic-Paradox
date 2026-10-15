@@ -21,6 +21,7 @@
 #include <cstdlib>   // atof — used by BleedoutDurationFallback()
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <thread>
 #include <iostream>
@@ -4797,6 +4798,7 @@ static void MpSendPathDiag();                          // [1.14.7 hub send-path 
 static void MpSuppressPhantomReplication();            // [1.14.7 phantom-pawn suppression]
 static void MpNetIdContractProbe();                    // [1.14.7 genuine net-id contract probe]
 static void MpCaptureGenuineNetIdType();               // [1.14.7 synthetic net-id type capture]
+static void MpVoiceProximityTick();                    // [1.14.7 hub proximity voice reports]
 static bool IsClientRolePumpPossessionStable(UObject* PC, UObject** OutPawn);
 static void TickFrankDroneClientDiag(void* Pawn, const char* Trigger);
 static std::string FrankDroneGateSummary(void* PlayerRole);
@@ -4852,86 +4854,222 @@ static constexpr uint64_t kClientRolePumpStableChainMs = 750;
 //     ManualTickDispatchSEH code=0xC0000005 params=0x0,0x88 regs{rax=0x0 ...}
 // 0x88 is UNetDriver::ServerConnection, which Networking::Listen deliberately nulls - i.e. the code was
 // following a client-style path off a garbage base. Calling it with the real engine is the correct fix.
-// [1.14.7 2026-10-14] In-game voice (Voice.cpp) follows the game's own Audio settings: the "Voice chat" toggle
-// (UArchonGameUserSettings::bVoiceChatEnabled +0x244) turns it on/off and the voice chat volume slider
-// (VoiceChatVolume +0x248) sets playback gain. Client game thread, 1 Hz.
-// Also a one-off discovery log [VoipMenu] for adding a push-to-talk keybind and a PTT/open-mic option to the
-// options menu: the keybinding DataTable rows (OptionsKeybindingData), voice-ish input action names, and the
-// widget tree around the Audio tab's Voice chat toggle. Read-only.
+// [1.14.7 2026-10-15] In-game voice (Voice.cpp) wired into the game's own options menu. Client game thread, 1 Hz.
+//  - Audio "Voice chat" toggle (UArchonGameUserSettings::bVoiceChatEnabled +0x244) turns voice on/off; the voice
+//    chat volume slider (VoiceChatVolume +0x248) sets playback gain.
+//  - Bindings > Communication gets a "Push to Talk" row. The keybinding table (options_keybindings_table,
+//    FOptionsKeybindingData rows) has no free slot and TMap row inserts are fragile, so the hidden gamepad-only row
+//    Binding_ToggleHUD_Gamepad (never shown in the menu; its input action is untouched) is repurposed. Its action
+//    "Push To Talk" is added to the input settings with Mouse4 (ThumbMouseButton) when missing; the game's own
+//    rebind screen then edits it, and the bound key is read back from UInputSettings::ActionMappings.
+//  - Audio gets an "Open Mic" toggle (a second w_options_toggle_C, added under the Voice chat toggle's box): on =
+//    open mic, off = push to talk. Saved as VOIP_OPEN_MIC.flag beside the exe.
+// Log tag [VoipMenu].
 namespace VoiceSettings {
-    static void LogKeybindTables() {
-        static std::set<void*> s_seen;
+    static const wchar_t* PTT_ACTION = L"Push To Talk";
+    static const char* PTT_ROW = "Binding_ToggleHUD_Gamepad";
+
+    // Copies an FText (TSharedRef<ITextData> {Object, Controller} + Flags) and takes a reference on it, so a
+    // destination that is later destroyed (a closed menu widget) cannot free the shared text TextFor() keeps.
+    static void AssignText(void* Dst, const uint8_t* Src) {
+        if (!Src) return;
+        memcpy(Dst, Src, 0x18);
+        uint8_t* Controller = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(Dst) + 8);
+        if (Controller) InterlockedIncrement(reinterpret_cast<volatile LONG*>(Controller + 8));
+    }
+
+    static SDK::FName NameOf(const wchar_t* Value) {
+        return SDK::UKismetStringLibrary::Conv_StringToName(SDK::FString(Value));
+    }
+
+    static std::wstring ExePath(const wchar_t* FileName) {
+        wchar_t Exe[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, Exe, MAX_PATH);
+        std::wstring Path(Exe);
+        return Path.substr(0, Path.find_last_of(L"\\/") + 1) + FileName;
+    }
+
+    static void PatchKeybindRow() {
+        static bool s_done = false;
+        if (s_done) return;
         for (int i = 0; i < SDK::UObject::GObjects->Num(); i++) {
             SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
             if (!Obj || Obj->IsDefaultObject() || !Obj->IsA(SDK::UDataTable::StaticClass())) continue;
             auto* Dt = static_cast<SDK::UDataTable*>(Obj);
-            if (!Dt->RowStruct || Dt->RowStruct->GetName() != "OptionsKeybindingData" || s_seen.count(Dt)) continue;
-            s_seen.insert(Dt);
-            MpLog("[VoipMenu] keybind table " + Dt->GetFullName() + " rows=" + std::to_string(Dt->RowMap.Num()));
+            if (!Dt->RowStruct || Dt->RowStruct->GetName() != "OptionsKeybindingData") continue;
             for (auto& Pair : Dt->RowMap) {
+                if (Pair.Key().GetRawString() != PTT_ROW) continue;
                 auto* Row = reinterpret_cast<SDK::FOptionsKeybindingData*>(Pair.Value());
                 if (!Row || !IsReadablePointer(Row, sizeof(SDK::FOptionsKeybindingData))) continue;
-                MpLog("[VoipMenu]   row=" + Pair.Key().GetRawString() + " action=" + Row->Action.GetRawString()
-                    + " group=" + std::to_string(static_cast<int>(Row->GroupCategory))
-                    + " ctx=" + std::to_string(static_cast<int>(Row->InputContext))
-                    + " press=" + std::to_string(static_cast<int>(Row->KeyPress))
-                    + " uiAction=" + std::to_string(static_cast<int>(Row->InputAction))
-                    + " axis=" + std::to_string(Row->bIsAxisMapping) + " hidden=" + std::to_string(Row->bHidden)
-                    + " name=\"" + SafeFTextToString(&Row->ActionDisplayName) + "\"");
+                Row->Action = NameOf(PTT_ACTION);
+                Row->InputAction = static_cast<SDK::EUIInputAction>(0);
+                Row->GroupCategory = SDK::EOptionsKeybindingGroup::Communication;
+                Row->InputContext = static_cast<SDK::EOptionsKeybindingContext>(0);
+                Row->KeyPress = static_cast<SDK::EOptionsKeybindingPress>(0);
+                Row->bIsAxisMapping = false;
+                Row->bIsAxisPositive = false;
+                Row->bCannotAssignKeyboard = false;
+                Row->bCannotAssignGamepad = true;              // voice reads keyboard/mouse keys only
+                Row->bHidden = false;
+                AssignText(&Row->ActionDisplayName, CreditsBranding::TextFor(L"Push to Talk"));
+                AssignText(&Row->ActionDescription, CreditsBranding::TextFor(L"Hold to talk to your party and nearby players."));
+                s_done = true;
+                MpLog("[VoipMenu] Bindings > Communication: Push to Talk row added (repurposed " + std::string(PTT_ROW) + ")");
+                return;
             }
         }
     }
 
-    static void LogVoiceActionMappings() {
-        static bool s_done = false;
-        if (s_done) return;
-        SDK::UInputSettings* In = SDK::UInputSettings::GetInputSettings();
-        if (!In) return;
-        s_done = true;
-        // UInputSettings::ActionMappings (private) +0x80; FInputActionKeyMapping is 0x28 with FKey.KeyName at +0x10.
-        auto& Arr = *reinterpret_cast<SDK::TArray<uint8_t>*>(reinterpret_cast<uintptr_t>(In) + 0x80);
-        const uint8_t* Data = *reinterpret_cast<uint8_t* const*>(&Arr);
-        const int Num = Arr.Num();
-        std::string All;
-        for (int i = 0; i < Num && Data; ++i) {
-            const auto& Action = *reinterpret_cast<const SDK::FName*>(Data + i * 0x28);
-            const auto& Key = *reinterpret_cast<const SDK::FName*>(Data + i * 0x28 + 0x10);
-            All += " " + Action.GetRawString() + "=" + Key.GetRawString();
+    // A TArray<FInputActionKeyMapping> (0x28 each: ActionName +0, ActionMappingType +9, Key.KeyName +0x10): the
+    // Push To Talk key of the given mapping type (-1 = any), "None" when unbound, "" when the array has no entry.
+    static std::string PttKeyIn(const void* ArrPtr, int Type) {
+        auto& Arr = *reinterpret_cast<const SDK::TArray<uint8_t>*>(ArrPtr);
+        const uint8_t* Data = *reinterpret_cast<const uint8_t* const*>(&Arr);
+        static const std::string Action = "Push To Talk";
+        for (int i = 0; i < Arr.Num() && Data; ++i) {
+            const uint8_t* M = Data + i * 0x28;
+            if (reinterpret_cast<const SDK::FName*>(M)->GetRawString() != Action) continue;
+            if (Type >= 0 && M[9] != Type) continue;
+            const std::string Key = reinterpret_cast<const SDK::FName*>(M + 0x10)->GetRawString();
+            if (Key.find("Gamepad") == std::string::npos) return Key;
         }
-        MpLog("[VoipMenu] input action mappings (" + std::to_string(Num) + "):" + All);
+        return "";
     }
 
-    static void LogAudioTab() {
-        static std::set<void*> s_seen;
+    // UInputSettings::ActionMappings (private) +0x80 holds the defaults.
+    static std::string DefaultPttKey(SDK::UInputSettings* In) {
+        const std::string Key = PttKeyIn(reinterpret_cast<uint8_t*>(In) + 0x80, -1);
+        return Key == "None" ? "" : Key;
+    }
+
+    // The options menu's rebinds live in UGameUserSettings::UserActionMappings (GameUserSettings.ini), not
+    // UInputSettings: a primary-key entry there overrides the default, then a secondary one.
+    // ponytail: one key only (primary wins over secondary); pass both to Voice.cpp if people bind two.
+    static std::string BoundPttKey(SDK::UInputSettings* In, SDK::UGameUserSettings* User) {
+        if (User && IsReadablePointer(User, 0xB0)) {
+            for (int Type : { 0, 1 }) {                    // AMT_PrimaryKey, AMT_SecondaryKey
+                const std::string Key = PttKeyIn(&User->UserActionMappings, Type);
+                if (!Key.empty() && Key != "None") return Key;
+            }
+        }
+        return DefaultPttKey(In);
+    }
+
+    static int VkForKey(const std::string& K) {
+        static const std::unordered_map<std::string, int> Named = {
+            { "LeftMouseButton", VK_LBUTTON }, { "RightMouseButton", VK_RBUTTON }, { "MiddleMouseButton", VK_MBUTTON },
+            { "ThumbMouseButton", VK_XBUTTON1 }, { "ThumbMouseButton2", VK_XBUTTON2 },
+            { "SpaceBar", VK_SPACE }, { "Tab", VK_TAB }, { "CapsLock", VK_CAPITAL }, { "Enter", VK_RETURN },
+            { "BackSpace", VK_BACK }, { "Tilde", VK_OEM_3 }, { "LeftShift", VK_LSHIFT }, { "RightShift", VK_RSHIFT },
+            { "LeftControl", VK_LCONTROL }, { "RightControl", VK_RCONTROL }, { "LeftAlt", VK_LMENU }, { "RightAlt", VK_RMENU },
+            { "Zero", '0' }, { "One", '1' }, { "Two", '2' }, { "Three", '3' }, { "Four", '4' },
+            { "Five", '5' }, { "Six", '6' }, { "Seven", '7' }, { "Eight", '8' }, { "Nine", '9' },
+            { "Insert", VK_INSERT }, { "Delete", VK_DELETE }, { "Home", VK_HOME }, { "End", VK_END },
+            { "PageUp", VK_PRIOR }, { "PageDown", VK_NEXT },
+        };
+        if (auto It = Named.find(K); It != Named.end()) return It->second;
+        if (K.size() == 1 && K[0] >= 'A' && K[0] <= 'Z') return K[0];
+        if (K.size() >= 2 && K.size() <= 3 && K[0] == 'F') { int N = atoi(K.c_str() + 1); if (N >= 1 && N <= 24) return VK_F1 + N - 1; }
+        if (K.rfind("NumPad", 0) == 0) {
+            static const char* Digits[] = { "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine" };
+            for (int d = 0; d < 10; ++d) if (K == std::string("NumPad") + Digits[d]) return VK_NUMPAD0 + d;
+        }
+        return 0;
+    }
+
+    static void ApplyPttKey(SDK::UGameUserSettings* User) {
+        SDK::UInputSettings* In = SDK::UInputSettings::GetInputSettings();
+        if (!In || !IsReadablePointer(In, 0x90)) return;
+        static bool s_added = false;
+        if (DefaultPttKey(In).empty() && !s_added) {
+            s_added = true;
+            SDK::FInputActionKeyMapping Mapping{};
+            Mapping.ActionName = NameOf(PTT_ACTION);
+            Mapping.Key.KeyName = NameOf(L"ThumbMouseButton");
+            In->AddActionMapping(Mapping, true);
+            In->SaveKeyMappings();
+            MpLog("[VoipMenu] added input action \"Push To Talk\" = ThumbMouseButton (Mouse4)");
+        }
+        const std::string Key = BoundPttKey(In, User);
+        static std::string s_last;
+        if (Key == s_last) return;
+        s_last = Key;
+        const int Vk = VkForKey(Key);
+        MpLog("[VoipMenu] push-to-talk key " + (Key.empty() ? std::string("(none)") : Key)
+            + (Vk ? "" : " - not usable for voice, pick a keyboard key or mouse button"));
+        MpVoiceSetPttKey(Vk);
+    }
+
+    // A second w_options_toggle_C under the Audio tab's Voice chat toggle, one per options screen.
+    static void InjectOpenMicToggle() {
+        static std::set<void*> s_doneCats;
+        static std::vector<SDK::UOptionsToggleWidget*> s_toggles;
+        const bool OpenMic = MpExeRelativeFlagPresent(L"VOIP_OPEN_MIC.flag");
+        for (auto It = s_doneCats.begin(); It != s_doneCats.end();) {   // a closed screen's address can be reused
+            if (!IsRegisteredLiveObject(*It)) It = s_doneCats.erase(It); else ++It;
+        }
+
         for (int i = 0; i < SDK::UObject::GObjects->Num(); i++) {
             SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
-            if (!Obj || Obj->IsDefaultObject() || !Obj->IsA(SDK::UOptionsCatAudio::StaticClass()) || s_seen.count(Obj)) continue;
+            if (!Obj || Obj->IsDefaultObject() || !Obj->IsA(SDK::UOptionsCatAudio::StaticClass()) || s_doneCats.count(Obj)) continue;
             auto* Cat = static_cast<SDK::UOptionsCatAudio*>(Obj);
-            SDK::UWidget* Toggle = reinterpret_cast<SDK::UWidget*>(Cat->AdvancedVoiceChatToggle);
-            if (!Toggle || !IsReadablePointer(Toggle, 0x40)) continue;
-            s_seen.insert(Obj);
-            MpLog("[VoipMenu] audio tab " + Cat->GetFullName() + " voiceToggle=" + Toggle->Class->GetName()
-                + " carousel=" + (Cat->AdvancedDynamicRangeCarousel ? Cat->AdvancedDynamicRangeCarousel->Class->GetName() : std::string("null")));
-            SDK::UWidget* W = Toggle;
-            for (int Depth = 0; Depth < 4 && W && W->Slot && IsReadablePointer(W->Slot, 0x40); ++Depth) {
-                SDK::UPanelWidget* Parent = W->Slot->Parent;
-                if (!Parent || !IsReadablePointer(Parent, 0x180)) break;
-                auto& Slots = *reinterpret_cast<SDK::TArray<SDK::UPanelSlot*>*>(reinterpret_cast<uintptr_t>(Parent) + 0x170);
-                std::string Kids;
-                for (int k = 0; k < Slots.Num(); ++k) {
-                    SDK::UPanelSlot* S = Slots[k];
-                    if (S && IsReadablePointer(S, 0x40) && S->Content) Kids += " " + S->Content->GetName() + ":" + S->Content->Class->GetName();
-                }
-                MpLog("[VoipMenu]   parent[" + std::to_string(Depth) + "] " + Parent->GetName() + ":" + Parent->Class->GetName()
-                    + " slot=" + W->Slot->Class->GetName() + " children=" + std::to_string(Slots.Num()) + Kids);
-                W = Parent;
-            }
+            SDK::UOptionsToggleWidget* Src = Cat->AdvancedVoiceChatToggle;
+            if (!Src || !IsReadablePointer(Src, 0x3B0) || !Src->Slot || !IsReadablePointer(Src->Slot, 0x40)) continue;
+            SDK::UPanelWidget* Box = Src->Slot->Parent;
+            if (!Box || !IsReadablePointer(Box, 0x180)) continue;
+            s_doneCats.insert(Obj);
+            auto* W = static_cast<SDK::UOptionsToggleWidget*>(SDK::UWidgetBlueprintLibrary::Create(
+                Cat, static_cast<SDK::UClass*>(Src->Class), Cat->GetOwningPlayer()));
+            if (!W) { MpLog("[VoipMenu] could not create the Open Mic toggle"); continue; }
+            AssignText(&W->ToggleName, CreditsBranding::TextFor(L"Open Mic (off = Push to Talk)"));
+            Box->AddChild(W);
+            if (W->CheckboxControl) W->CheckboxControl->SetIsChecked(OpenMic);
+            s_toggles.push_back(W);
+            MpLog(std::string("[VoipMenu] Audio: Open Mic toggle added (") + (OpenMic ? "on" : "off") + ")");
         }
+
+        // The menu toggle drives the flag file; drop toggles whose screen has been closed and collected.
+        for (auto It = s_toggles.begin(); It != s_toggles.end();) {
+            SDK::UOptionsToggleWidget* W = *It;
+            if (!IsRegisteredLiveObject(W) || !W->CheckboxControl || !IsRegisteredLiveObject(W->CheckboxControl)) { It = s_toggles.erase(It); continue; }
+            const bool Checked = W->CheckboxControl->IsChecked();
+            if (Checked != OpenMic) {
+                const std::wstring Flag = ExePath(L"VOIP_OPEN_MIC.flag");
+                if (Checked) { HANDLE H = CreateFileW(Flag.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr); if (H != INVALID_HANDLE_VALUE) CloseHandle(H); }
+                else DeleteFileW(Flag.c_str());
+                MpLog(std::string("[VoipMenu] voice mode ") + (Checked ? "open mic" : "push to talk"));
+                break;                                     // re-read the flag next tick
+            }
+            ++It;
+        }
+        MpVoiceSetOpenMic(MpExeRelativeFlagPresent(L"VOIP_OPEN_MIC.flag"));
+    }
+
+    // Proximity voice listener: own pawn location + camera yaw, 20x a second (Voice.cpp pans/fades with it).
+    static void UpdateListener() {
+        SDK::UWorld* World = SDK::UWorld::GetWorld();
+        SDK::APlayerController* PC = World ? SDK::UGameplayStatics::GetPlayerController(World, 0) : nullptr;
+        if (!PC || !PC->Pawn || !PC->PlayerCameraManager) { MpVoiceSetListener(false, 0, 0, 0, 0); return; }
+        const SDK::FVector L = PC->Pawn->K2_GetActorLocation();
+        const SDK::FRotator R = PC->PlayerCameraManager->GetCameraRotation();
+        MpVoiceSetListener(true, L.X, L.Y, L.Z, R.Yaw);
+    }
+
+    static bool s_listenerFaulted = false;
+    static void UpdateListenerGuarded() {
+        __try { UpdateListener(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { s_listenerFaulted = true; MpVoiceSetListener(false, 0, 0, 0, 0); }
     }
 
     static void Tick() {
-        static uint64_t s_nextMs = 0;
+        static uint64_t s_nextListenerMs = 0;
         const uint64_t Now = GetTickCount64();
+        if (!s_listenerFaulted && Now >= s_nextListenerMs) {
+            s_nextListenerMs = Now + 50;
+            UpdateListenerGuarded();
+            if (s_listenerFaulted) MpLog("[Voip] listener update faulted - proximity pan off for this session");
+        }
+        static uint64_t s_nextMs = 0;
         if (Now < s_nextMs) return;
         s_nextMs = Now + 1000;
         static SDK::UArchonGameUserSettings* s_settings = nullptr;
@@ -4939,13 +5077,10 @@ namespace VoiceSettings {
         if (s_settings && IsReadablePointer(s_settings, 0x250)) {
             MpVoiceApplySettings(s_settings->bVoiceChatEnabled, s_settings->VoiceChatVolume);
         }
-        if (!SDK::UObject::GObjects) return;
-        static int s_scan = 0;
-        if (s_scan++ % 5 == 0) {                          // discovery every 5 s (tables/widgets load lazily)
-            LogKeybindTables();
-            LogVoiceActionMappings();
-            LogAudioTab();
-        }
+        if (!SDK::UObject::GObjects || MpExeRelativeFlagPresent(L"DISABLE_VOIP.flag")) return;
+        PatchKeybindRow();
+        ApplyPttKey(s_settings && IsReadablePointer(s_settings, 0x250) ? s_settings : nullptr);
+        InjectOpenMicToggle();
     }
 }
 
@@ -5514,6 +5649,7 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
     // phantom pawn existed received it (client census archonCharacters=2).
     MpSuppressPhantomReplication();
     MpDriveReplicationGraph(DeltaTime);
+    if (Globals::AmServer) MpVoiceProximityTick();
 
     // [2026-07-20] Server-side skeletal pose/socket fix (FORCE_SERVER_MESH_POSE.flag). Server-only; the
     // helper self-throttles + no-ops unless the flag is present. See its definition above.
@@ -12135,6 +12271,130 @@ static const std::string& CachedFunctionFullName(UFunction* Function) {
     return Slot.Name;
 }
 
+// [1.14.7 2026-10-15 LOOT POPUP PROBE] Left-side pickup popups (pickup_notification_queue_bpw) show rewards the
+// backend never receives (e.g. ~1000 Rams after a normal kill, backend got CURRENCY_NOTES x130 from PlayerLoot).
+// Read-only: logs [LootPopup] for every popup entry point that reaches ProcessEvent and for the server's
+// ClientHandleLootGranted RPC, so popups can be matched against the backend's [GrantMon] lines by time.
+// BP-to-BP calls skip ProcessEvent, so the first 5 calls of every queue-widget function are also logged by name.
+// DISABLE_LOOT_POPUP_PROBE.flag (beside the exe) turns it off.
+std::string CoreCapFString(void* fstr);
+static void MpLootPopupProbe(const std::string& FunctionName, void* Parms) {
+    static const bool s_off = MpExeRelativeFlagPresent(L"DISABLE_LOOT_POPUP_PROBE.flag");
+    if (s_off) return;
+    const bool Queue = FunctionName.find("pickup_notification_queue_bpw_C:") != std::string::npos;
+    const bool LootRpc = !Queue && FunctionName.find("PlayerLootComponent.ClientHandleLootGranted") != std::string::npos;
+    if (!Queue && !LootRpc) return;
+    auto* P = static_cast<uint8_t*>(Parms);
+    if (LootRpc) {
+        if (!P || !IsReadablePointer(P, 0x10)) return;
+        uint8_t* Data = *reinterpret_cast<uint8_t**>(P);
+        const int32_t Num = *reinterpret_cast<int32_t*>(P + 0x08);
+        std::string Line = "[LootPopup] ClientHandleLootGranted n=" + std::to_string(Num);
+        for (int32_t i = 0; Data && i < Num && i < 32 && IsReadablePointer(Data + i * 0x60, 0x60); ++i) {
+            uint8_t* L = Data + i * 0x60;   // FArchonLoot: ItemId +0x00, Source +0x10, Count +0x58, AwardImmediately +0x5D
+            Line += " | " + CoreCapFString(L) + " x" + std::to_string(*reinterpret_cast<int32_t*>(L + 0x58))
+                + " src=" + CoreCapFString(L + 0x10) + " now=" + std::to_string(L[0x5D]);
+        }
+        MpLog(Line);
+        return;
+    }
+    const std::string Fn = FunctionName.substr(FunctionName.rfind(':') + 1);
+    if (Fn == "Tick") return;
+    // Add_Acquisition_For_Notification / Add_New_Notification / QueueNewNotification / AddCustomNotification all
+    // start with ItemId FString +0x00, Amount +0x10, Condition +0x14.
+    const bool ItemCall = Fn == "Add_Acquisition_For_Notification" || Fn == "Add_New_Notification"
+        || Fn == "QueueNewNotification" || Fn == "AddCustomNotification";
+    if (ItemCall && P && IsReadablePointer(P, 0x16)) {
+        MpLog("[LootPopup] " + Fn + " item=" + CoreCapFString(P)
+            + " amount=" + std::to_string(*reinterpret_cast<int32_t*>(P + 0x10))
+            + " cond=" + std::to_string(P[0x14]));
+        return;
+    }
+    if (Fn == "On_Progress_Granted" && P && IsReadablePointer(P, 0x1C)) {   // FProgressGrant: Track +0x00, Increase +0x18
+        MpLog("[LootPopup] On_Progress_Granted track=" + CoreCapFString(P)
+            + " increase=" + std::to_string(*reinterpret_cast<int32_t*>(P + 0x18)));
+        return;
+    }
+    static std::unordered_map<std::string, int> s_seen;
+    if (s_seen[Fn]++ < 5) MpLog("[LootPopup] fn=" + Fn);
+}
+
+// [1.14.7 2026-10-15 PROJECTILE TICK FIX] Player projectiles never damaged anything. On this headless server every
+// AArchonProjectileBase spawns with actor tick OFF (probe: tickEnabled=0 for the whole flight), so the native per-tick
+// AuthSweepHit -> AuthProcessHits never runs; ProjectileMovement still moves it, so it flies through the behemoth and
+// stops on terrain. A sphere sweep with the projectile's own object types along the same path hits the behemoth's
+// part capsules (type 15), so collision is fine. Likely cause: the projectile's SignificanceComponent
+// (UInstigatorDrivenSigComp) disables tick when no local viewer finds it significant — there is none on a server.
+// Fix: server only, re-enable actor tick when a projectile begins play (fresh or from the pool).
+// DISABLE_PROJECTILE_TICK_FIX.flag (beside the exe) turns it off.
+static void MpServerProjectileTickFix(UObject* Object, const std::string& FunctionName) {
+    static const bool s_on = Globals::AmServer && !MpExeRelativeFlagPresent(L"DISABLE_PROJECTILE_TICK_FIX.flag");
+    if (!s_on || !Object) return;
+    if (FunctionName.find(".ReceiveBeginPlay") == std::string::npos && FunctionName.find(".BeginPlayFromPool") == std::string::npos) return;
+    static SDK::UClass* s_ProjClass = SDK::AArchonProjectileBase::StaticClass();
+    if (!s_ProjClass || !Object->IsA(s_ProjClass)) return;
+    auto* Proj = static_cast<SDK::AActor*>(static_cast<void*>(Object));
+    if (Proj->IsActorTickEnabled()) return;
+    Proj->SetActorTickEnabled(true);
+    static std::atomic<int> s_logged{ 0 };
+    if (s_logged.fetch_add(1) < 20) MpLog("[ProjTickFix] enabled tick on " + SafeObjectNameForDiagnostic(Object));
+}
+
+// [1.14.7 2026-10-15 COIN TOSS PROBE] Ramsgate coin toss (coin_toss_interact_bp) does nothing: the backend has no
+// offer for UArchonActivitiesProgressionComponent::ClaimDailyBonus's store query. Read-only: logs [CoinToss] for
+// every coin toss / activities-progression UFunction reaching ProcessEvent, the store query and purchase results,
+// and (throttled, deduped) the query tags and DailyBonusItemId from every component/stinger, defaults included.
+// DISABLE_COIN_TOSS_PROBE.flag (beside the exe) turns it off.
+static void MpCoinTossProbe(const std::string& FunctionName, void* Parms) {
+    static const bool s_off = MpExeRelativeFlagPresent(L"DISABLE_COIN_TOSS_PROBE.flag");
+    if (s_off) return;
+    if (FunctionName.find("ActivitiesProgression") == std::string::npos && FunctionName.find("CoinToss") == std::string::npos
+        && FunctionName.find("cointoss") == std::string::npos && FunctionName.find("coin_toss") == std::string::npos) return;
+    const std::string Fn = FunctionName.substr(FunctionName.rfind('.') + 1);
+    if (Fn == "Tick" || Fn.find("Skyfish") != std::string::npos) return;
+    auto* P = static_cast<uint8_t*>(Parms);
+    if (Fn == "OnStoreQueryCompleted" && P && IsReadablePointer(P, 0x28)) {
+        uint8_t* Data = *reinterpret_cast<uint8_t**>(P + 0x18);
+        const int32_t Num = *reinterpret_cast<int32_t*>(P + 0x20);
+        std::string Line = "[CoinToss] OnStoreQueryCompleted ok=" + std::to_string(P[0]) + " msg='" + CoreCapFString(P + 0x08)
+            + "' offers=" + std::to_string(Num);
+        for (int32_t i = 0; Data && i < Num && i < 8 && IsReadablePointer(Data + i * 0x230, 0x60); ++i) {
+            uint8_t* O = Data + i * 0x230;   // FOnlineStorePhoenixOffer: SkuId +0x00, CatalogId +0x38, PlatPrice +0x58
+            Line += " | sku=" + CoreCapFString(O) + " catalog=" + CoreCapFString(O + 0x38)
+                + " plat=" + std::to_string(*reinterpret_cast<int32_t*>(O + 0x58));
+        }
+        MpLog(Line);
+    } else if (Fn == "OnStorePurchaseResult" && P && IsReadablePointer(P, 0x18)) {
+        MpLog("[CoinToss] OnStorePurchaseResult ok=" + std::to_string(P[0]) + " purchased=" + std::to_string(P[1])
+            + " msg='" + CoreCapFString(P + 0x08) + "'");
+    } else if (Fn == "ClaimDailyBonus" && P && IsReadablePointer(P, 1)) {
+        MpLog("[CoinToss] ClaimDailyBonus debug=" + std::to_string(P[0]));
+    } else {
+        static std::unordered_map<std::string, int> s_seen;
+        if (s_seen[FunctionName]++ < 5) MpLog("[CoinToss] fn=" + FunctionName);
+    }
+    static ULONGLONG s_last = 0;
+    const ULONGLONG Now = GetTickCount64();
+    if (Now - s_last < 10000u) return;
+    s_last = Now;
+    static std::unordered_set<std::string> s_logged;
+    for (int i = 0, N = SDK::UObject::GObjects->Num(); i < N; i++) {
+        SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+        if (!Obj) continue;
+        std::string Line;
+        if (Obj->IsA(SDK::UArchonActivitiesProgressionComponent::StaticClass())) {
+            auto* C = static_cast<SDK::UArchonActivitiesProgressionComponent*>(Obj);
+            Line = "component " + Obj->GetFullName() + " queryTag='" + C->DailyBundleStoreQueryTag.ToString()
+                + "' debugQueryTag='" + C->DebugDailyBundleStoreQueryTag.ToString() + "'";
+        } else if (Obj->IsA(SDK::UCoinTossStinger::StaticClass())) {
+            auto* S = static_cast<SDK::UCoinTossStinger*>(Obj);
+            Line = "stinger " + Obj->GetFullName() + " dailyBonusItemId='" + S->DailyBonusItemId.ToString()
+                + "' duration=" + std::to_string(S->StingerDuration);
+        } else continue;
+        if (s_logged.insert(Line).second) MpLog("[CoinToss] " + Line);
+    }
+}
+
 // [1.14.7 2026-10-14 HUNTPASS PROBE] Hunt Pass screen shows "Service not available" (UHuntingPassScreen
 // ::bIsServiceHealthy false?) and Unlock/Claim are dead, with no backend request at all. Read-only: logs which
 // hunt pass UFunctions run, and on a throttle the screen flag, its view model and the player's
@@ -12189,6 +12449,9 @@ static void MpHuntPassProbe(UObject* Object, const std::string& FunctionName) {
         }
     }
 }
+
+// Set when our own hunt arrival cinematic ends; reset at every LoadMap. See [PartyDropIn].
+static bool s_LocalArrivalDone = false;
 
 void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     g_clientProcessEventCount.fetch_add(1, std::memory_order_relaxed);
@@ -12249,6 +12512,56 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
 
     const std::string& FunctionName = CachedFunctionFullName(Function);
     MpHuntPassProbe(Object, FunctionName);
+    MpLootPopupProbe(FunctionName, Parms);
+    MpCoinTossProbe(FunctionName, Parms);
+
+    // Party drop-in during hunt intro (adventure_island_arrival_trigger_bp, one per player, owned by the pawn).
+    // Retail: the trigger is owner-relevant only (server side now clears that, see ProcessEventHook), a
+    // non-owner copy destroys itself in ReceiveBeginPlay, and ReceiveTick hides every other player each
+    // frame of your own arrival. Keeping remote copies lets their dynamic_cinematic_component play that
+    // player's arrival sequence on their real pawn here as a non-viewer (camera/HUD/overlay are gated on
+    // bIsClientViewingCinematic, i.e. only the owner). Its start path still calls SetCinematicState(2) +
+    // HideGameplayHUD on the local PC, so remote copies are only kept until our own arrival has ended
+    // (late joiners keep retail behaviour). DISABLE_PARTY_DROP_IN.flag = retail for all of it.
+    if (Object && FunctionName.find("adventure_island_arrival_trigger_bp_C.") != std::string::npos) {
+        static const bool s_Disabled = MpExeRelativeFlagPresent(L"DISABLE_PARTY_DROP_IN.flag");
+        if (!s_Disabled) {
+            const bool IsTick = FunctionName.find("_C.ReceiveTick") != std::string::npos;
+            const bool IsBeginPlay = FunctionName.find("_C.ReceiveBeginPlay") != std::string::npos;
+            const bool IsArrivalStop = FunctionName.find("_C.OnClientArrivalStop") != std::string::npos;
+            if (IsTick) return;   // its only job is the hide-everyone-else loop
+            if (IsBeginPlay || IsArrivalStop) {
+                UWorld* World = UWorld::GetWorld();
+                APlayerController* PC = World ? UGameplayStatics::GetPlayerController(World, 0) : nullptr;
+                AActor* LocalPawn = PC ? PC->Pawn : nullptr;
+                AActor* TriggerOwner = reinterpret_cast<AActor*>(Object)->Owner;
+                const bool Own = TriggerOwner && TriggerOwner == LocalPawn;
+                if (IsArrivalStop) {
+                    reinterpret_cast<void(*)(UObject*, UFunction*, void*)>(OrigProcessEventClient)(Object, Function, Parms);
+                    if (Own) { s_LocalArrivalDone = true; MpLog("[PartyDropIn] local arrival ended"); }
+                    return;
+                }
+                if (Own || !s_LocalArrivalDone) {
+                    // Client ReceiveBeginPlay only does the relevance check + K2_DestroyActor; skip it.
+                    // WaitForClientReady=true and ClientReady (not replicated) is only set by the owner's
+                    // ReceiveGameplayStart, so mark the remote copy's component ready ourselves.
+                    std::string Ready = "own";
+                    if (!Own) {
+                        Ready = "no-component";
+                        FProperty* CompProp = FindPropertyByNameInChain(Object->Class, "dynamic_cinematic_component_bp");
+                        UObject* Comp = CompProp ? *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(Object) + CompProp->Offset) : nullptr;
+                        FProperty* ReadyProp = Comp && IsReadablePointer(Comp, sizeof(UObject))
+                            ? FindPropertyByNameInChain(Comp->Class, "ClientReady") : nullptr;
+                        if (ReadyProp) { *(reinterpret_cast<uint8_t*>(Comp) + ReadyProp->Offset) = 1; Ready = "set"; }
+                    }
+                    MpLog("[PartyDropIn] keeping arrival trigger " + MpPtr(Object) + " owner=" + MpPtr(TriggerOwner)
+                        + " localPawn=" + MpPtr(LocalPawn) + " clientReady=" + Ready);
+                    return;
+                }
+                MpLog("[PartyDropIn] local arrival already ended; retail destroy for trigger " + MpPtr(Object));
+            }
+        }
+    }
 
     // Player-host joins can complete the UE handshake and PostLogin, then be rejected by
     // the client during its first travel/replication frame.  The normal UE diagnostics are
@@ -14728,6 +15041,22 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
 
     std::string FunctionName = Function ? Function->GetFullName() : "null";
     MpHuntPassProbe(Object, FunctionName);
+    MpCoinTossProbe(FunctionName, Parms);
+    MpServerProjectileTickFix(Object, FunctionName);
+
+    // Party drop-in during hunt intro: each player's adventure_island_arrival_trigger_bp is
+    // bOnlyRelevantToOwner (AActor+0x58 bit 2), so other clients never get it and can't play that
+    // player's arrival sequence. Clear it so the trigger + its dynamic_cinematic_component replicate to
+    // everyone; the client side (ProcessEventClientHook) keeps it and plays it as a non-viewer.
+    // DISABLE_PARTY_DROP_IN.flag beside the server exe reverts.
+    if (Object && FunctionName.find("adventure_island_arrival_trigger_bp_C.ReceiveBeginPlay") != std::string::npos) {
+        static const bool s_Disabled = MpExeRelativeFlagPresent(L"DISABLE_PARTY_DROP_IN.flag");
+        auto* Bits = reinterpret_cast<uint8_t*>(Object) + 0x58;
+        if (!s_Disabled && IsReadablePointer(Bits, 1)) {
+            *Bits &= static_cast<uint8_t>(~0x04);
+            MpLog("[PartyDropIn] trigger " + MpPtr(Object) + " now relevant to all clients");
+        }
+    }
 
     // [1.14.7 HEADLESS AUDIO 2026-10-03] A dedicated hub must not play sound. Removing the Wwise
     // output device crashes the process (measured: EXCEPTION_ACCESS_VIOLATION writing 0x...a4, round
@@ -16087,6 +16416,7 @@ bool LoadMapDiagHook(void* Engine, void* Ctx, void* URL, void* Pending, void* Er
     }
     void* Prev = s_lmCtx;
     s_lmCtx = Ctx;
+    s_LocalArrivalDone = false;
     MpLog("[LoadMapPL] ENTER map=" + Map + " pending=" + MpPtr(Pending) + " ctx=" + MpPtr(Ctx) + " " + MpLmWorld(MpLmCtxWorld()));
     if (MpLmHasZombieWorld(Map)) {
         if (MpExeRelativeFlagPresent(L"DISABLE_ZOMBIE_WORLD_TRASH.flag")) {
@@ -19622,6 +19952,55 @@ static bool EnsureSyntheticNetId(void* PlayerState) {
     MpLog("[SynthNetId] installed for playerState=" + MpPtr(PlayerState)
         + " id='" + MpNarrow(MpSynthNetIdString()) + "'");
     return true;
+}
+
+// [1.14.7 2026-10-15] Proximity voice. A hub (g_wdIsHub == 1: Ramsgate, dojo) reports every connected player's
+// backend account id and pawn location to the voice relay 5x a second (Voice.cpp MpVoiceReportPositions); the
+// relay decides from these alone who hears whom. Hunts never report, so proximity voice never reaches into one.
+// Same route as MpCaptureGenuineNetIdType: NetDriver ClientConnections -> PC +0x98 -> PlayerState +0x228 ->
+// net id +0x258; the id string is the genuine object's vtable slot +0x18 (const TCHAR*, measured). The phantom's
+// synthetic id is skipped. An id the relay has no ticket for never matches anyone (fails closed).
+static void MpVoiceProximityTick() {
+    if (g_wdIsHub.load(std::memory_order_relaxed) != 1 || !Networking::NetDriver || !Globals::ServerAPIKey) return;
+    static bool s_started = false;
+    if (!s_started) {
+        s_started = true;
+        MpVoiceServerStart(MpNarrow(Globals::ServerAPIKey), static_cast<uint16_t>(Globals::Port));
+    }
+    static uint64_t s_nextMs = 0;
+    const uint64_t Now = GetTickCount64();
+    if (Now < s_nextMs) return;
+    s_nextMs = Now + 200;
+
+    const RawPointerArray* Clients = reinterpret_cast<const RawPointerArray*>(
+        reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x90);
+    if (!IsReadablePointer(Clients, sizeof(RawPointerArray))
+        || !IsSanePointerArray(Clients->Data, Clients->Num, Clients->Max, 1024)) {
+        return;
+    }
+    static std::set<std::string> s_logged;
+    std::vector<MpVoicePos> Players;
+    for (int i = 0; i < Clients->Num; ++i) {
+        void* C = Clients->Data[i];
+        if (!C || !IsReadablePointer(C, 0x420)) continue;
+        const uintptr_t PC = SafeReadPtr(reinterpret_cast<uintptr_t>(C), 0x98);
+        const uintptr_t PS = PC ? SafeReadPtr(PC, 0x228) : 0;
+        void* Id = PS ? reinterpret_cast<void*>(SafeReadPtr(PS, 0x258)) : nullptr;
+        if (!Id || Id == reinterpret_cast<void*>(&g_MpSynthNetIdObject)) continue;
+        const uintptr_t Vt = SafeReadPtr(reinterpret_cast<uintptr_t>(Id), 0x00);
+        const uintptr_t Fn = Vt ? SafeReadPtr(Vt, 0x18) : 0;
+        if (!Fn) continue;
+        uint8_t Scratch[0x10] = {};
+        const uint64_t Rax = MpNetIdCallSlotRaw(reinterpret_cast<void*>(Fn), Id, Scratch);
+        if (Rax == 0xEEEEEEEEEEEEEEEEull) continue;
+        const std::string AccountId = MpTryWideString(static_cast<uintptr_t>(Rax));
+        float X, Y, Z;
+        if (AccountId.empty() || AccountId.size() > 64
+            || !GetActorWorldLocation(reinterpret_cast<void*>(SafeReadPtr(PC, 0x250)), X, Y, Z)) continue;
+        if (s_logged.insert(AccountId).second) MpLog("[ProxVoice] reporting player id=" + AccountId);
+        Players.push_back({ AccountId, X, Y, Z });
+    }
+    MpVoiceReportPositions(Players);
 }
 
 // ============================================================================

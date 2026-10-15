@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // Helpers and globals defined in dllmain.cpp that the runtime's other source files may use.
 
@@ -48,6 +49,16 @@ std::wstring MpApiBaseForCrashReports();
 void MpVoiceStart();
 // Game thread -> voice threads: the game's Audio "Voice chat" toggle and voice chat volume (0..1).
 void MpVoiceApplySettings(bool enabled, float volume);
+// Game thread -> voice threads: the Bindings "Push to Talk" key (a VK code, 0 = unusable) and the Audio Open Mic toggle.
+void MpVoiceSetPttKey(int vk);
+void MpVoiceSetOpenMic(bool open);
+// Game thread -> voice threads: this player's pawn location (UE units) and camera yaw (degrees), for proximity pan/fade.
+void MpVoiceSetListener(bool valid, float x, float y, float z, float yawDegrees);
+// Hub server only: report every connected player's backend account id and location to the voice relay, which
+// decides proximity from these alone (HMAC-signed with the gameserver API key).
+struct MpVoicePos { std::string id; float x, y, z; };
+void MpVoiceServerStart(const std::string& apiKey, uint16_t gamePort);
+void MpVoiceReportPositions(const std::vector<MpVoicePos>& players);
 
 // Game thread: UKismetSystemLibrary::QuitGame on the current world.
 void MpQuitGame();

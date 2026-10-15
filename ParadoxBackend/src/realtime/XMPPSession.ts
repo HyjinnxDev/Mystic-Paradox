@@ -157,8 +157,10 @@ export class XMPPSession {
             }
             const ping = childByLocal(el, "ping");
             if (ping) {
-                // urn:xmpp:ping keepalive — an empty result IS the pong; don't change state.
-                return { send: [`<iq type="result" id="${escapeXml(id)}"/>`], note: "ping -> pong" };
+                // urn:xmpp:ping keepalive; don't change state. UE's FXmppPingStrophe only counts a
+                // result carrying <ping xmlns="urn:xmpp:ping"/> as a pong: an empty result is ignored,
+                // so the client hit PingTimeout twice and reconnected every ~150 s (presence flapping).
+                return { send: [`<iq type="result" id="${escapeXml(id)}" from="${escapeXml(this.domain)}"><ping xmlns="urn:xmpp:ping"/></iq>`], note: "ping -> pong" };
             }
             if (type === "set" || type === "get") {
                 // Session establishment / other IQs: empty result keeps the client advancing.

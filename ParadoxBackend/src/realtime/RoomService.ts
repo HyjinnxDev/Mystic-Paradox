@@ -10,6 +10,7 @@
  */
 
 import { GetPartyForPlayer } from "../controllers/party";
+import { IsGuildMember } from "../controllers/guild";
 import { logger } from "../logger";
 import { RegisteredConnection } from "./SessionRegistry";
 import { escapeXml, sanitizeName } from "./xml";
@@ -189,6 +190,10 @@ export class RoomService {
             const party = await GetPartyForPlayer(accountId);
             if (party && party.partyId === partyId) return { ok: true, reason: "" };
             return { ok: false, reason: "not a party member" };
+        }
+        if (roomLocal.startsWith("Guild-")) {
+            return (await IsGuildMember(accountId, roomLocal.slice("Guild-".length)))
+                ? { ok: true, reason: "" } : { ok: false, reason: "not a guild member" };
         }
         if (roomLocal.startsWith("City-")) {
             if (!this.devCityMuc) return { ok: false, reason: "city muc disabled" };
