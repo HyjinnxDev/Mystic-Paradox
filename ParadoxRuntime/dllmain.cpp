@@ -12864,20 +12864,54 @@ static SDK::AArchonHUD* Hud(SDK::APlayerController* PC) {
     return H && H->IsA(SDK::AArchonHUD::StaticClass()) ? static_cast<SDK::AArchonHUD*>(H) : nullptr;
 }
 
+// HideGameplayHUD leaves the chat box and the overhead name plates (players, NPCs) up. Those get render opacity 0
+// (the game toggles their visibility itself, never their opacity) and their own opacity back on show.
+struct HiddenWidget { Ref W; float Opacity; };
+static std::vector<HiddenWidget> s_HiddenWidgets;
+
+static void HideExtras(bool Hide) {
+    if (!Hide) {
+        for (HiddenWidget& H : s_HiddenWidgets) if (auto* W = H.W.Get<SDK::UWidget>()) W->SetRenderOpacity(H.Opacity);
+        s_HiddenWidgets.clear();
+        return;
+    }
+    SDK::UWorld* World = SDK::UWorld::GetWorld();
+    if (!World) return;
+    static auto* s_Found = new SDK::TArray<SDK::UUserWidget*>();   // engine-allocated storage, never freed (exit-safe)
+    for (SDK::UClass* C : { SDK::UChatWidget::StaticClass(), SDK::UNamePlatesWidget::StaticClass(), SDK::UNPC_NamePlates_C::StaticClass() }) {
+        if (!C) continue;                               // NPC plates' blueprint not loaded on this map
+        SDK::UWidgetBlueprintLibrary::GetAllWidgetsOfClass(World, s_Found, C, false);
+        for (int32_t i = 0; i < s_Found->Num(); ++i) {
+            SDK::UUserWidget* W = (*s_Found)[i];
+            if (!W || W->RenderOpacity == 0.f) continue;
+            if (std::none_of(s_HiddenWidgets.begin(), s_HiddenWidgets.end(), [&](HiddenWidget& H) { return H.W.Get() == W; })) {
+                s_HiddenWidgets.push_back(HiddenWidget{});
+                s_HiddenWidgets.back().W.Set(W);
+                s_HiddenWidgets.back().Opacity = W->RenderOpacity;
+            }
+            W->SetRenderOpacity(0.f);
+        }
+    }
+}
+
 static void SetHudHidden(SDK::APlayerController* PC, bool Hide) {
     g_MpHudHidden = Hide;
     SDK::AArchonHUD* H = Hud(PC);
     if (H) { if (Hide) H->HideGameplayHUD(); else H->ShowGameplayHUD(); }
-    Log(std::string("HUD ") + (Hide ? "hidden" : "shown") + (H ? std::string(" visible=") + (H->IsHUDVisible() ? "1" : "0") : " (no ArchonHUD)"));
+    HideExtras(Hide);
+    Log(std::string("HUD ") + (Hide ? "hidden" : "shown") + (H ? std::string(" visible=") + (H->IsHUDVisible() ? "1" : "0") : " (no ArchonHUD)")
+        + " extras=" + std::to_string(s_HiddenWidgets.size()));
 }
 
-// The game shows its HUD again after its own cinematics and menus: hide it again, twice a second.
+// The game shows its HUD again after its own cinematics and menus, and name plates appear as players come near:
+// hide them again four times a second.
 static void KeepHudHidden(SDK::APlayerController* PC, ULONGLONG Now) {
     static ULONGLONG s_Next = 0;
     if (!g_MpHudHidden || Now < s_Next) return;
-    s_Next = Now + 500;
+    s_Next = Now + 250;
     SDK::AArchonHUD* H = Hud(PC);
     if (H && H->IsHUDVisible()) H->HideGameplayHUD();
+    HideExtras(true);
 }
 
 // ---------------------------------------------------------------- camera
@@ -13172,6 +13206,7 @@ static void Update() {
         s_Actor.Set(nullptr); s_Label.Set(nullptr); s_InputPawn.Set(nullptr); s_OldView.Set(nullptr);
         s_Mode = Mode::Off;
         s_Ignoring = s_LabelShown = g_MpHudHidden = false;
+        s_HiddenWidgets.clear();
         s_Keys.clear();                                 // world positions mean nothing on another map
     }
     DWORD Pid = 0;
