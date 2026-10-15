@@ -12448,6 +12448,35 @@ static void MpServerProjectileTickFix(UObject* Object, const std::string& Functi
     if (s_logged.fetch_add(1) < 20) MpLog("[ProjTickFix] enabled tick on " + SafeObjectNameForDiagnostic(Object));
 }
 
+// [1.14.7 2026-10-16 PANGAR ROLL PROBE] Pangar's (mcrollin) roll does no damage to players. Read-only, server only:
+// logs [RollProbe] for each distinct UFunction reaching ProcessEvent on an object whose class (or whose outer's class)
+// contains "mcrollin" (first 20 per function), and any *Damage* UFunction (first 200 each), with actor tick state at BeginPlay, to see what the roll runs and
+// whether something it spawns has tick off like the projectile bug. DISABLE_ROLL_PROBE.flag (beside the exe) turns it off.
+static void MpPangarRollProbe(UObject* Object, const std::string& FunctionName) {
+    static const bool s_on = Globals::AmServer && !MpExeRelativeFlagPresent(L"DISABLE_ROLL_PROBE.flag");
+    if (!s_on || !Object || !Object->Class) return;
+    static std::unordered_map<SDK::UClass*, bool> s_classMatch;
+    auto Matches = [](SDK::UClass* C) {
+        auto It = s_classMatch.find(C);
+        if (It != s_classMatch.end()) return It->second;
+        std::string N = C->GetName();
+        for (auto& ch : N) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+        return s_classMatch[C] = N.find("mcrollin") != std::string::npos;
+    };
+    const bool IsDamage = FunctionName.find("Damage") != std::string::npos;
+    bool Hit = IsDamage || Matches(Object->Class);
+    if (!Hit && Object->Outer && Object->Outer->Class) Hit = Matches(Object->Outer->Class);
+    if (!Hit) return;
+    static std::unordered_map<std::string, int> s_seen;
+    static int s_total = 0;
+    if (s_seen[FunctionName]++ >= (IsDamage ? 200 : 20) || ++s_total > 5000) return;
+    std::string Line = "[RollProbe] " + FunctionName + " obj=" + SafeObjectNameForDiagnostic(Object);
+    static SDK::UClass* s_ActorClass = SDK::AActor::StaticClass();
+    if (FunctionName.find(".ReceiveBeginPlay") != std::string::npos && s_ActorClass && Object->IsA(s_ActorClass))
+        Line += std::string(" tickEnabled=") + (static_cast<SDK::AActor*>(static_cast<void*>(Object))->IsActorTickEnabled() ? "1" : "0");
+    MpLog(Line);
+}
+
 // [1.14.7 2026-10-15 COIN TOSS PROBE] Ramsgate coin toss (coin_toss_interact_bp) does nothing: the backend has no
 // offer for UArchonActivitiesProgressionComponent::ClaimDailyBonus's store query. Read-only: logs [CoinToss] for
 // every coin toss / activities-progression UFunction reaching ProcessEvent, the store query and purchase results,
@@ -12777,7 +12806,9 @@ static void Tick() {
 //   F8 camera on/off   F9 hide HUD (also without the camera)   F10 settings panel: Up/Down pick, Left/Right change
 //   Free: WASD move, E/Space up, Q/Ctrl down, Shift fast, Alt slow, mouse look, wheel zoom, Z/X roll, R reset zoom+roll
 //   T tripod (camera stays put, you play your character)   Y track player (tripod/path: camera aims at you)
-//   K add keyframe   J remove last   L play/stop the keyframe path (you keep your character while it plays)
+//   K add keyframe   J remove last   L play the keyframe path (you play your character while it runs)
+// Free mode blocks all game input (no menus, chat, attacks); camera keys work only there. Tripod and path give the
+// game its input back and only F8 (back to free), F9 and F10 stay ours.
 // Settings persist in CINECAM.ini beside the exe. DISABLE_CINECAM.flag turns it off. Log tag [CineCam].
 // ponytail: fixed keys, keyframes not saved, path time split evenly per segment (not constant speed), no gamepad.
 namespace CineCam {
@@ -12809,11 +12840,11 @@ static Mode s_Mode = Mode::Off;
 static Pose s_Target, s_Cam;               // where the controls want the camera / where it is (smoothed)
 static std::vector<Pose> s_Keys;
 static float s_PathT = 0.f, s_StartFov = 70.f;
-static bool s_Track = false, s_Panel = false, s_Front = false, s_Ignoring = false, s_LabelShown = false, s_Dirty = false;
+static bool s_Track = false, s_Panel = false, s_Front = false, s_Blocking = false, s_LabelShown = false, s_Dirty = false;
 static int s_Sel = 0, s_Logs = 0;
 static int64_t s_LastFrame = -1;
 static ULONGLONG s_HintUntil = 0, s_NextCreate = 0, s_NextSave = 0;
-static Ref s_PC, s_Actor, s_OldView, s_InputPawn, s_Label, s_TextClass;
+static Ref s_PC, s_Actor, s_OldView, s_Label, s_TextClass;
 static std::wstring s_LastText;
 static volatile bool s_Faulted = false;
 
@@ -12864,8 +12895,9 @@ static SDK::AArchonHUD* Hud(SDK::APlayerController* PC) {
     return H && H->IsA(SDK::AArchonHUD::StaticClass()) ? static_cast<SDK::AArchonHUD*>(H) : nullptr;
 }
 
-// HideGameplayHUD leaves the chat box and the overhead name plates (players, NPCs) up. Those get render opacity 0
-// (the game toggles their visibility itself, never their opacity) and their own opacity back on show.
+// HideGameplayHUD leaves the chat box (and its "Enter to chat" root), the overhead name plates (players, NPCs) and
+// the "Hold Q" interaction callouts up. Those get render opacity 0 (the game toggles their visibility itself, never
+// their opacity) and their own opacity back on show.
 struct HiddenWidget { Ref W; float Opacity; };
 static std::vector<HiddenWidget> s_HiddenWidgets;
 
@@ -12878,8 +12910,10 @@ static void HideExtras(bool Hide) {
     SDK::UWorld* World = SDK::UWorld::GetWorld();
     if (!World) return;
     static auto* s_Found = new SDK::TArray<SDK::UUserWidget*>();   // engine-allocated storage, never freed (exit-safe)
-    for (SDK::UClass* C : { SDK::UChatWidget::StaticClass(), SDK::UNamePlatesWidget::StaticClass(), SDK::UNPC_NamePlates_C::StaticClass() }) {
-        if (!C) continue;                               // NPC plates' blueprint not loaded on this map
+    for (SDK::UClass* C : { SDK::UChatMenuRoot::StaticClass(), SDK::UChatWidget::StaticClass(),
+                            SDK::UNamePlatesWidget::StaticClass(), SDK::UNPC_NamePlates_C::StaticClass(),
+                            SDK::UInteractionCalloutWidget::StaticClass(), SDK::Ubutton_hold_callout_bpw_C::StaticClass() }) {
+        if (!C) continue;                               // a blueprint class not loaded on this map
         SDK::UWidgetBlueprintLibrary::GetAllWidgetsOfClass(World, s_Found, C, false);
         for (int32_t i = 0; i < s_Found->Num(); ++i) {
             SDK::UUserWidget* W = (*s_Found)[i];
@@ -12931,20 +12965,31 @@ static SDK::ACameraActor* Actor(SDK::APlayerController* PC) {
     return A;
 }
 
-// Free mode takes the character's controls away; tripod and path give them back.
-static void SetPawnInput(SDK::APlayerController* PC, bool On) {
-    if (!On && !s_Ignoring) {
-        PC->SetIgnoreMoveInput(true);
-        PC->SetIgnoreLookInput(true);
-        if (PC->Pawn) { PC->Pawn->DisableInput(PC); s_InputPawn.Set(PC->Pawn); }
-        s_Ignoring = true;
-    } else if (On && s_Ignoring) {
-        PC->SetIgnoreMoveInput(false);
-        PC->SetIgnoreLookInput(false);
-        if (auto* P = s_InputPawn.Get<SDK::APawn>()) P->EnableInput(PC);
-        s_InputPawn.Set(nullptr);
-        s_Ignoring = false;
+// Free mode shuts the game's input off entirely (menus, chat, map, attacks, movement): the camera actor's input
+// component, with no bindings, bBlockInput and the highest priority, sits on top of the controller's input stack
+// so nothing below it fires. Keys still reach PlayerInput, so mouse look and wheel zoom keep reading them.
+// Tripod and path hand the game its input back (that is what they are for: you play while the camera films).
+static void SetGameInput(SDK::APlayerController* PC, bool On) {
+    SDK::ACameraActor* Cam = s_Actor.Get<SDK::ACameraActor>();
+    if (!Cam) return;
+    if (!On && !s_Blocking) {
+        Cam->bBlockInput = 1;                           // copied onto the component EnableInput creates
+        Cam->InputPriority = INT32_MAX;
+        Cam->EnableInput(PC);
+        s_Blocking = true;
+        Log("game input blocked (component " + MpPtr(Cam->InputComponent) + ")");
+    } else if (On && s_Blocking) {
+        Cam->DisableInput(PC);
+        s_Blocking = false;
     }
+}
+
+// Tripod or path back to the free camera: game input off again, a path's last zoom and roll kept.
+static void ToFree(SDK::APlayerController* PC) {
+    s_Set[SFov].Val = s_Target[PFov];
+    s_Set[SRoll].Val = s_Target[PRoll];
+    s_Mode = Mode::Free;
+    SetGameInput(PC, false);
 }
 
 static void Start(SDK::APlayerController* PC, ULONGLONG Now) {
@@ -12960,14 +13005,14 @@ static void Start(SDK::APlayerController* PC, ULONGLONG Now) {
     s_Cam = s_Target;
     s_OldView.Set(Pcm->ViewTarget.Target);
     s_Mode = Mode::Free;
-    SetPawnInput(PC, false);
+    SetGameInput(PC, false);
     PC->SetViewTargetWithBlend(Cam, 0.f, SDK::EViewTargetBlendFunction::VTBlend_Linear, 0.f, false);
     if (!s_Panel) s_HintUntil = Now + 4000;
     Log("on at " + std::to_string(L.X) + "," + std::to_string(L.Y) + "," + std::to_string(L.Z) + " fov=" + std::to_string(s_StartFov));
 }
 
 static void Stop(SDK::APlayerController* PC) {
-    SetPawnInput(PC, true);
+    SetGameInput(PC, true);
     s_Mode = Mode::Off;
     SDK::AActor* Back = s_OldView.Get<SDK::AActor>();
     if (!Back || Back == s_Actor.Get()) Back = PC->Pawn;
@@ -13058,16 +13103,13 @@ static void Drive(SDK::APlayerController* PC, float Dt) {
     if (!Cam) { Stop(PC); return; }
     SDK::APawn* Pawn = PC->Pawn;
 
-    if (Pressed('T') && s_Mode != Mode::Path) {
-        s_Mode = s_Mode == Mode::Tripod ? Mode::Free : Mode::Tripod;
-        SetPawnInput(PC, s_Mode != Mode::Free);
-    }
-    if (Pressed('Y')) s_Track = !s_Track;
-    if (Pressed('K')) { s_Keys.push_back(s_Target); Log("keyframe " + std::to_string(s_Keys.size())); }
-    if (Pressed('J') && !s_Keys.empty()) s_Keys.pop_back();
-    if (Pressed('L')) {
-        if (s_Mode == Mode::Path) s_Mode = Mode::Tripod;
-        else if (!s_Keys.empty()) { s_Mode = Mode::Path; s_PathT = 0.f; SetPawnInput(PC, true); }
+    // Camera keys only in free mode, where the game hears nothing; in tripod/path they would reach the game.
+    if (s_Mode == Mode::Free) {
+        if (Pressed('T')) { s_Mode = Mode::Tripod; SetGameInput(PC, true); }
+        if (Pressed('Y')) s_Track = !s_Track;
+        if (Pressed('K')) { s_Keys.push_back(s_Target); Log("keyframe " + std::to_string(s_Keys.size())); }
+        if (Pressed('J') && !s_Keys.empty()) s_Keys.pop_back();
+        if (Pressed('L') && !s_Keys.empty()) { s_Mode = Mode::Path; s_PathT = 0.f; SetGameInput(PC, true); }
     }
 
     if (s_Mode == Mode::Path) {
@@ -13113,12 +13155,14 @@ static std::wstring ValueText(int I) {
 }
 
 static std::wstring PanelText() {
-    static const wchar_t* Modes[] = { L"Off (F8 on)", L"Free (F8 off)", L"Tripod (F8 off)", L"Playing path (F8 off)" };
+    static const wchar_t* Modes[] = { L"Off (F8 on)", L"Free, game input off (F8 off)",
+        L"Tripod, you play (F8 back to free cam)", L"Playing path, you play (F8 back to free cam)" };
     std::wstring T = L"CINEMATIC CAMERA   F10 close\n";
     T += std::wstring(L"Camera: ") + Modes[static_cast<int>(s_Mode)] + L"    HUD: " + (g_MpHudHidden ? L"hidden" : L"shown") + L" (F9)\n";
     T += std::wstring(L"T tripod   Y track player: ") + (s_Track ? L"on" : L"off")
         + L"   K/J keyframes: " + std::to_wstring(s_Keys.size()) + L"   L play path\n";
-    T += L"Up/Down pick, Left/Right change (Shift = x10)\n\n";
+    T += s_Mode == Mode::Tripod || s_Mode == Mode::Path ? L"Settings locked while you play (F8 back to free cam)\n\n"
+        : L"Up/Down pick, Left/Right change (Shift = x10)\n\n";
     for (int I = 0; I < SN; ++I) T += std::wstring(I == s_Sel ? L"> " : L"   ") + s_Set[I].Name + L":  " + ValueText(I) + L"\n";
     T += L"\nWASD move, E/Q up/down, Shift fast, Alt slow, mouse look\nWheel zoom, Z/X roll, R reset zoom and roll";
     return T;
@@ -13203,9 +13247,9 @@ static void Update() {
         if (s_PC.P) Log("new world - camera off");
         else { Load(); Log("ready (F8 camera, F9 HUD, F10 settings)"); }
         s_PC.Set(PC);
-        s_Actor.Set(nullptr); s_Label.Set(nullptr); s_InputPawn.Set(nullptr); s_OldView.Set(nullptr);
+        s_Actor.Set(nullptr); s_Label.Set(nullptr); s_OldView.Set(nullptr);
         s_Mode = Mode::Off;
-        s_Ignoring = s_LabelShown = g_MpHudHidden = false;
+        s_Blocking = s_LabelShown = g_MpHudHidden = false;
         s_HiddenWidgets.clear();
         s_Keys.clear();                                 // world positions mean nothing on another map
     }
@@ -13217,9 +13261,13 @@ static void Update() {
 
     if (Pressed(VK_F9)) SetHudHidden(PC, !g_MpHudHidden);
     if (Pressed(VK_F10)) { s_Panel = !s_Panel; s_HintUntil = 0; }
-    if (Pressed(VK_F8)) { if (s_Mode == Mode::Off) Start(PC, Now); else Stop(PC); }
+    if (Pressed(VK_F8)) {                               // off -> free -> off; tripod/path -> free
+        if (s_Mode == Mode::Off) Start(PC, Now);
+        else if (s_Mode == Mode::Free) Stop(PC);
+        else ToFree(PC);
+    }
     KeepHudHidden(PC, Now);
-    if (s_Panel) PanelInput(Now);
+    if (s_Panel && s_Mode != Mode::Tripod && s_Mode != Mode::Path) PanelInput(Now);   // arrows would reach the game
     if (s_Mode != Mode::Off) Drive(PC, Dt);
     DrawPanel(PC, Now);
     if (s_Dirty && Now >= s_NextSave) { s_NextSave = Now + 2000; Save(); }
@@ -15844,6 +15892,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     MpHuntPassProbe(Object, FunctionName);
     MpCoinTossProbe(FunctionName, Parms);
     MpServerProjectileTickFix(Object, FunctionName);
+    MpPangarRollProbe(Object, FunctionName);
 
 
     // [1.14.7 HEADLESS AUDIO 2026-10-03] A dedicated hub must not play sound. Removing the Wwise
