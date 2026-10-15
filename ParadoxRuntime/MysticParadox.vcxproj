@@ -146,6 +146,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
+      <AdditionalDependencies>delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>D3DCOMPILER_47.dll;d3d11.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -154,6 +156,7 @@
     <ClInclude Include="Networking.h" />
     <ClInclude Include="P2PHooks.h" />
     <ClInclude Include="RuntimeShared.h" />
+    <ClInclude Include="CineCamShared.h" />
     <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>
@@ -166,6 +169,14 @@
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="CrashReporter.cpp" />
     <ClCompile Include="Voice.cpp" />
+    <ClCompile Include="CineCamMenu.cpp" />
+    <ClCompile Include="CineCamPath.cpp" />
+    <ClCompile Include="imgui\imgui.cpp" />
+    <ClCompile Include="imgui\imgui_draw.cpp" />
+    <ClCompile Include="imgui\imgui_tables.cpp" />
+    <ClCompile Include="imgui\imgui_widgets.cpp" />
+    <ClCompile Include="imgui\imgui_impl_dx11.cpp" />
+    <ClCompile Include="imgui\imgui_impl_win32.cpp" />
     <ClCompile Include="..\tools\CatalogExporter\StoreRuntimeExporter.cpp">
       <ObjectFileName>$(IntDir)StoreRuntimeExporter.obj</ObjectFileName>
     </ClCompile>

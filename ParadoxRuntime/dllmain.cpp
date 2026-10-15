@@ -36,6 +36,7 @@
 #include "P2PHooks.h"
 #include "deployment_config.generated.h"
 #include "resource.h"
+#include "CineCamShared.h"
 
 #include "SDK/GameplayAbilities_parameters.hpp"
 #include "SDK/Archon_parameters.hpp"
@@ -12800,61 +12801,47 @@ static void Tick() {
 
 // [1.14.7 2026-10-16] Cinematic camera for clips and machinima. Client only, game thread, once per frame from
 // ProcessEventClientHook. A local ACameraActor (spawned here, never replicated) becomes the view target and is moved
-// every frame; its camera component carries FOV and depth of field. The HUD hide is the game's own
-// AArchonHUD::HideGameplayHUD (what its cinematics use), re-applied when the game shows the HUD again.
-// Keys (GetAsyncKeyState, only while the game window is in front):
-//   F8 camera on/off   F9 hide HUD (also without the camera)   F10 settings panel: Up/Down pick, Left/Right change
+// every frame; its camera component carries FOV, frame shape, depth of field, motion blur and colour grading. The
+// HUD hide is the game's own AArchonHUD::HideGameplayHUD (what its cinematics use) plus render opacity 0 on what
+// that leaves up, re-applied while hidden.
+// The menu (F10) is Dear ImGui in CineCamMenu.cpp; the two share Cine::G (CineCamShared.h). This side takes a
+// snapshot of it each frame, runs the menu's commands, and never holds its lock while calling into the engine.
+// While the menu is open the mouse cursor shows; holding the right mouse button outside the menu looks around.
+// Keys (GetAsyncKeyState, only while the game window is in front and the menu is not taking typed text):
+//   F8 camera on/off (tripod/path: back to free)   F9 hide HUD (also without the camera)   F10 menu
 //   Free: WASD move, E/Space up, Q/Ctrl down, Shift fast, Alt slow, mouse look, wheel zoom, Z/X roll, R reset zoom+roll
-//   T tripod (camera stays put, you play your character)   Y track player (tripod/path: camera aims at you)
+//   T tripod (camera stays put, you play your character)   Y aim at my character (tripod/path)
 //   K add keyframe   J remove last   L play the keyframe path (you play your character while it runs)
 // Free mode blocks all game input (no menus, chat, attacks); camera keys work only there. Tripod and path give the
-// game its input back and only F8 (back to free), F9 and F10 stay ours.
-// Settings persist in CINECAM.ini beside the exe. DISABLE_CINECAM.flag turns it off. Log tag [CineCam].
-// ponytail: fixed keys, keyframes not saved, path time split evenly per segment (not constant speed), no gamepad.
+// game its input back and only F8, F9 and F10 stay ours.
+// Settings persist in CINECAM.ini beside the exe, saved shots in CINECAM_shots\. DISABLE_CINECAM.flag turns it off.
+// Log tag [CineCam].
+// ponytail: fixed keys, no gamepad; path speed between keys follows key times (use "Even out speed").
 namespace CineCam {
 
 using BehemothHealthBar::Ref;
+using namespace Cine;
 constexpr float kDeg = 3.14159265f / 180.f;
 
-enum { PX, PY, PZ, PYaw, PPitch, PRoll, PFov, PN };
-struct Pose { float V[PN] = {}; float& operator[](int I) { return V[I]; } };
-
-struct Setting { const wchar_t* Name; const wchar_t* Key; float Val, Min, Max, Step; const wchar_t* Unit; };
-enum { SSpeed, SLook, SSmooth, SFov, SRoll, SOrbit, SDof, SFocus, SFstop, SPathTime, SLoop, SN };
-static Setting s_Set[SN] = {
-    { L"Move speed", L"Speed", 600.f, 25.f, 5000.f, 25.f, L" cm/s" },
-    { L"Look sensitivity", L"Look", 1.f, 0.05f, 10.f, 0.05f, L"" },
-    { L"Smoothing", L"Smooth", 0.85f, 0.f, 0.98f, 0.01f, L"" },
-    { L"Field of view", L"Fov", 70.f, 5.f, 120.f, 1.f, L" deg" },
-    { L"Roll", L"Roll", 0.f, -90.f, 90.f, 1.f, L" deg" },
-    { L"Orbit speed (tripod + track)", L"Orbit", 0.f, -90.f, 90.f, 1.f, L" deg/s" },
-    { L"Depth of field", L"Dof", 0.f, 0.f, 2.f, 1.f, L"" },
-    { L"Focus distance (manual)", L"Focus", 5.f, 0.5f, 200.f, 0.25f, L" m" },
-    { L"Aperture", L"Fstop", 2.8f, 0.7f, 32.f, 0.1f, L" f-stop" },
-    { L"Path duration", L"PathTime", 10.f, 1.f, 300.f, 0.5f, L" s" },
-    { L"Path loop", L"Loop", 0.f, 0.f, 1.f, 1.f, L"" },
-};
-
-enum class Mode { Off, Free, Tripod, Path };
 static Mode s_Mode = Mode::Off;
 static Pose s_Target, s_Cam;               // where the controls want the camera / where it is (smoothed)
-static std::vector<Pose> s_Keys;
 static float s_PathT = 0.f, s_StartFov = 70.f;
-static bool s_Track = false, s_Panel = false, s_Front = false, s_Blocking = false, s_LabelShown = false, s_Dirty = false;
-static int s_Sel = 0, s_Logs = 0;
+static bool s_Front = false, s_KeysOn = false, s_Blocking = false, s_CursorShown = false, s_RmbLook = false, s_RmbWas = false;
+static bool s_ReopenMenu = false, s_Toasted = false, s_MenuWarned = false;
+static int s_Logs = 0;
 static int64_t s_LastFrame = -1;
-static ULONGLONG s_HintUntil = 0, s_NextCreate = 0, s_NextSave = 0;
-static Ref s_PC, s_Actor, s_OldView, s_Label, s_TextClass;
-static std::wstring s_LastText;
+static ULONGLONG s_NextSave = 0, s_NextCursor = 0;
+static Ref s_PC, s_Actor, s_OldView;
+static Settings s_Saved;                   // what CINECAM.ini holds
 static volatile bool s_Faulted = false;
 
 static void Log(const std::string& Msg) {
-    if (s_Logs++ < 60) MpLog("[CineCam] " + Msg);
+    if (s_Logs++ < 80) MpLog("[CineCam] " + Msg);
 }
 
 static float Clamp(float V, float Lo, float Hi) { return V < Lo ? Lo : V > Hi ? Hi : V; }
 
-static bool Down(int Vk) { return s_Front && (GetAsyncKeyState(Vk) & 0x8000); }
+static bool Down(int Vk) { return s_KeysOn && (GetAsyncKeyState(Vk) & 0x8000); }
 
 static bool Pressed(int Vk) {
     static bool s_Was[256];
@@ -12863,29 +12850,60 @@ static bool Pressed(int Vk) {
     return P;
 }
 
-// True on press, then every 40 ms after a 350 ms hold.
-static bool Repeat(int Vk, ULONGLONG Now) {
-    static ULONGLONG s_Next[256];
-    if (!Down(Vk)) { s_Next[Vk] = 0; return false; }
-    if (!s_Next[Vk]) { s_Next[Vk] = Now + 350; return true; }
-    if (Now < s_Next[Vk]) return false;
-    s_Next[Vk] = Now + 40;
-    return true;
+static bool MenuVisible() { return G.MenuOpen.load() && G.MenuReady.load(); }
+
+// ---------------------------------------------------------------- CINECAM.ini
+
+struct IniField { const char* Key; char Type; size_t Off; };   // Type: f float, i int, b bool
+#define CINE_INI(N, T) { #N, T, offsetof(Settings, N) }
+static const IniField kIni[] = {
+    CINE_INI(Speed, 'f'), CINE_INI(Look, 'f'), CINE_INI(Smooth, 'f'), CINE_INI(Fov, 'f'), CINE_INI(Roll, 'f'),
+    CINE_INI(Orbit, 'f'), CINE_INI(Track, 'b'), CINE_INI(Aspect, 'i'), CINE_INI(Thirds, 'b'), CINE_INI(Dof, 'i'),
+    CINE_INI(Focus, 'f'), CINE_INI(Fstop, 'f'), CINE_INI(MotionBlurOn, 'b'), CINE_INI(MotionBlur, 'f'),
+    CINE_INI(Grade, 'b'), CINE_INI(Preset, 'i'), CINE_INI(Exposure, 'f'), CINE_INI(Temp, 'f'), CINE_INI(Tint, 'f'),
+    CINE_INI(Saturation, 'f'), CINE_INI(Contrast, 'f'), CINE_INI(Split, 'f'), CINE_INI(Vignette, 'f'),
+    CINE_INI(Grain, 'f'), CINE_INI(Fringe, 'f'), CINE_INI(Bloom, 'f'), CINE_INI(Loop, 'b'), CINE_INI(Ease, 'b'),
+    CINE_INI(ShowPath, 'b'), CINE_INI(HideMenuOnPlay, 'b'), CINE_INI(Spacing, 'f'),
+};
+#undef CINE_INI
+
+static std::string IniPath() {
+    char Exe[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, Exe, MAX_PATH);
+    const std::string P(Exe);
+    return P.substr(0, P.find_last_of("\\/") + 1) + "CINECAM.ini";
 }
 
-static void Load() {
-    const std::wstring Ini = VoiceSettings::ExePath(L"CINECAM.ini");
-    for (Setting& S : s_Set) {
-        wchar_t Buf[32]{};
-        GetPrivateProfileStringW(L"CineCam", S.Key, L"", Buf, 32, Ini.c_str());
-        if (Buf[0]) S.Val = Clamp(wcstof(Buf, nullptr), S.Min, S.Max);
+static void Load(Settings& S) {
+    const std::string Ini = IniPath();
+    for (const IniField& F : kIni) {
+        char Buf[32]{};
+        GetPrivateProfileStringA("CineCam", F.Key, "", Buf, sizeof(Buf), Ini.c_str());
+        if (!Buf[0]) continue;
+        char* P = reinterpret_cast<char*>(&S) + F.Off;
+        const float V = strtof(Buf, nullptr);
+        if (F.Type == 'f') *reinterpret_cast<float*>(P) = V;
+        else if (F.Type == 'i') *reinterpret_cast<int*>(P) = static_cast<int>(V);
+        else *reinterpret_cast<bool*>(P) = V != 0.f;
     }
+    // a hand-edited file must not index out of the menu's lists or freeze the camera
+    S.Aspect = (std::clamp)(S.Aspect, 0, static_cast<int>(std::size(kAspects)) - 1);
+    S.Dof = (std::clamp)(S.Dof, 0, 2);
+    S.Preset = (std::max)(S.Preset, 0);
+    S.Speed = Clamp(S.Speed, 1.f, 50000.f); S.Look = Clamp(S.Look, 0.01f, 50.f); S.Smooth = Clamp(S.Smooth, 0.f, 0.98f);
+    S.Fov = Clamp(S.Fov, 5.f, 120.f); S.Fstop = Clamp(S.Fstop, 0.7f, 32.f); S.Focus = Clamp(S.Focus, 0.1f, 1000.f);
+    S.Spacing = Clamp(S.Spacing, 0.1f, 60.f);
 }
 
-static void Save() {
-    const std::wstring Ini = VoiceSettings::ExePath(L"CINECAM.ini");
-    for (const Setting& S : s_Set) WritePrivateProfileStringW(L"CineCam", S.Key, std::to_wstring(S.Val).c_str(), Ini.c_str());
-    s_Dirty = false;
+static void Save(const Settings& S) {
+    const std::string Ini = IniPath();
+    for (const IniField& F : kIni) {
+        const char* P = reinterpret_cast<const char*>(&S) + F.Off;
+        const std::string V = F.Type == 'f' ? std::to_string(*reinterpret_cast<const float*>(P))
+            : F.Type == 'i' ? std::to_string(*reinterpret_cast<const int*>(P))
+            : std::string(*reinterpret_cast<const bool*>(P) ? "1" : "0");
+        WritePrivateProfileStringA("CineCam", F.Key, V.c_str(), Ini.c_str());
+    }
 }
 
 // ---------------------------------------------------------------- HUD
@@ -12959,7 +12977,6 @@ static SDK::ACameraActor* Actor(SDK::APlayerController* PC) {
         PC, SDK::ACameraActor::StaticClass(), T, SDK::ESpawnActorCollisionHandlingMethod::AlwaysSpawn, nullptr));
     if (A) A = static_cast<SDK::ACameraActor*>(SDK::UGameplayStatics::FinishSpawningActor(A, T));
     if (!A || !A->CameraComponent) { Log("camera actor spawn failed: " + MpPtr(A)); return nullptr; }
-    A->CameraComponent->bConstrainAspectRatio = 0;      // fill any screen shape, no letterbox
     s_Actor.Set(A);
     Log("camera actor " + A->GetFullName());
     return A;
@@ -12984,66 +13001,72 @@ static void SetGameInput(SDK::APlayerController* PC, bool On) {
     }
 }
 
-// Tripod or path back to the free camera: game input off again, a path's last zoom and roll kept.
-static void ToFree(SDK::APlayerController* PC) {
-    s_Set[SFov].Val = s_Target[PFov];
-    s_Set[SRoll].Val = s_Target[PRoll];
+// Free and tripod take zoom and roll from the settings; a pose set any other way hands its own to them.
+static void TakeZoomRoll(Settings& S) { S.Fov = Clamp(s_Target[PFov], 5.f, 120.f); S.Roll = s_Target[PRoll]; }
+
+static void ToFree(SDK::APlayerController* PC, Settings& S) {
+    TakeZoomRoll(S);
     s_Mode = Mode::Free;
     SetGameInput(PC, false);
 }
 
-static void Start(SDK::APlayerController* PC, ULONGLONG Now) {
+static void ReopenMenu() {
+    if (s_ReopenMenu) { s_ReopenMenu = false; G.MenuOpen = true; }
+}
+
+// A path that finished or was stopped holds its last frame on a tripod (you may still be acting).
+static void EndPath(Settings& S) {
+    s_Mode = Mode::Tripod;
+    TakeZoomRoll(S);
+    ReopenMenu();
+}
+
+static void Start(SDK::APlayerController* PC, Settings& S) {
     SDK::ACameraActor* Cam = Actor(PC);
     if (!Cam) return;
     SDK::APlayerCameraManager* Pcm = PC->PlayerCameraManager;
     const SDK::FVector L = Pcm->GetCameraLocation();
     const SDK::FRotator R = Pcm->GetCameraRotation();
-    s_StartFov = Clamp(Pcm->GetFOVAngle(), s_Set[SFov].Min, s_Set[SFov].Max);
-    s_Set[SFov].Val = s_StartFov;                       // starts exactly on the game's view, no jump
-    s_Set[SRoll].Val = 0.f;
-    s_Target = Pose{ { L.X, L.Y, L.Z, R.Yaw, R.Pitch, 0.f, s_StartFov } };
+    s_StartFov = Clamp(Pcm->GetFOVAngle(), 5.f, 120.f);
+    s_Target = Pose{ { L.X, L.Y, L.Z, R.Yaw, R.Pitch, 0.f, s_StartFov } };   // starts exactly on the game's view
     s_Cam = s_Target;
+    TakeZoomRoll(S);
     s_OldView.Set(Pcm->ViewTarget.Target);
     s_Mode = Mode::Free;
     SetGameInput(PC, false);
     PC->SetViewTargetWithBlend(Cam, 0.f, SDK::EViewTargetBlendFunction::VTBlend_Linear, 0.f, false);
-    if (!s_Panel) s_HintUntil = Now + 4000;
+    if (!s_Toasted && !MenuVisible()) { s_Toasted = true; G.ToastUntil = GetTickCount64() + 5000; }
     Log("on at " + std::to_string(L.X) + "," + std::to_string(L.Y) + "," + std::to_string(L.Z) + " fov=" + std::to_string(s_StartFov));
 }
 
 static void Stop(SDK::APlayerController* PC) {
     SetGameInput(PC, true);
     s_Mode = Mode::Off;
+    ReopenMenu();
     SDK::AActor* Back = s_OldView.Get<SDK::AActor>();
     if (!Back || Back == s_Actor.Get()) Back = PC->Pawn;
     if (Back) PC->SetViewTargetWithBlend(Back, 0.f, SDK::EViewTargetBlendFunction::VTBlend_Linear, 0.f, false);
     Log("off");
 }
 
-static float CatmullRom(float P0, float P1, float P2, float P3, float T) {
-    return 0.5f * (2.f * P1 + (P2 - P0) * T + (2.f * P0 - 5.f * P1 + 4.f * P2 - P3) * T * T
-        + (3.f * P1 - P0 - 3.f * P2 + P3) * T * T * T);
+// Puts the camera on a pose at once (Go to, the preview scrubber); a playing path stops in the free camera.
+static void JumpTo(SDK::APlayerController* PC, Settings& S, const Pose& P, float PathT) {
+    if (s_Mode == Mode::Path) { s_Mode = Mode::Free; SetGameInput(PC, false); }
+    s_Target = P;
+    s_Cam = P;
+    s_PathT = PathT;
+    TakeZoomRoll(S);
 }
 
-// T 0..1 along the keyframes, through every one of them.
-static Pose PathAt(float T) {
-    const int N = static_cast<int>(s_Keys.size());
-    if (N == 1) return s_Keys[0];
-    const float S = T * (N - 1);
-    const int I = (std::min)(static_cast<int>(S), N - 2);
-    Pose& P0 = s_Keys[(std::max)(I - 1, 0)], & P1 = s_Keys[I], & P2 = s_Keys[I + 1], & P3 = s_Keys[(std::min)(I + 2, N - 1)];
-    Pose R;
-    for (int K = 0; K < PN; ++K) R[K] = CatmullRom(P0[K], P1[K], P2[K], P3[K], S - I);
-    return R;
-}
+static void FreeInput(SDK::APlayerController* PC, float Dt, Settings& S) {
+    if (!MenuVisible() || s_RmbLook) {                  // with the menu open the mouse is the menu's, unless RMB is held
+        float Mx = 0.f, My = 0.f;
+        PC->GetInputMouseDelta(&Mx, &My);
+        s_Target[PYaw] += Mx * S.Look;
+        s_Target[PPitch] = Clamp(s_Target[PPitch] + My * S.Look, -89.f, 89.f);
+    }
 
-static void FreeInput(SDK::APlayerController* PC, float Dt) {
-    float Mx = 0.f, My = 0.f;
-    PC->GetInputMouseDelta(&Mx, &My);
-    s_Target[PYaw] += Mx * s_Set[SLook].Val;
-    s_Target[PPitch] = Clamp(s_Target[PPitch] + My * s_Set[SLook].Val, -89.f, 89.f);
-
-    const float Speed = s_Set[SSpeed].Val * Dt * (Down(VK_SHIFT) ? 4.f : 1.f) * (Down(VK_MENU) ? 0.25f : 1.f);
+    const float Speed = S.Speed * Dt * (Down(VK_SHIFT) ? 4.f : 1.f) * (Down(VK_MENU) ? 0.25f : 1.f);
     const float F = float(Down('W')) - float(Down('S')), Rt = float(Down('D')) - float(Down('A'));
     const float U = float(Down('E') || Down(VK_SPACE)) - float(Down('Q') || Down(VK_CONTROL));
     const float Yaw = s_Target[PYaw] * kDeg, Pitch = s_Target[PPitch] * kDeg;
@@ -13052,20 +13075,16 @@ static void FreeInput(SDK::APlayerController* PC, float Dt) {
     s_Target[PZ] += (F * sinf(Pitch) + U) * Speed;
 
     static SDK::FKey s_Wheel = [] { SDK::FKey K{}; K.KeyName = VoiceSettings::NameOf(L"MouseWheelAxis"); return K; }();
-    const float Wheel = PC->GetInputAnalogKeyState(s_Wheel);
-    const float Roll = float(Down('X')) - float(Down('Z'));
-    if (Wheel != 0.f || Roll != 0.f) {
-        s_Set[SFov].Val = Clamp(s_Set[SFov].Val - Wheel * 2.f, s_Set[SFov].Min, s_Set[SFov].Max);
-        s_Set[SRoll].Val = Clamp(s_Set[SRoll].Val + Roll * 30.f * Dt, s_Set[SRoll].Min, s_Set[SRoll].Max);
-        s_Dirty = true;
-    }
-    if (Pressed('R')) { s_Set[SFov].Val = s_StartFov; s_Set[SRoll].Val = 0.f; s_Dirty = true; }
+    const float Wheel = G.WantMouse.load() ? 0.f : PC->GetInputAnalogKeyState(s_Wheel);   // over the menu it scrolls
+    S.Fov = Clamp(S.Fov - Wheel * 2.f, 5.f, 120.f);
+    S.Roll = Clamp(S.Roll + (float(Down('X')) - float(Down('Z'))) * 30.f * Dt, -90.f, 90.f);
+    if (Pressed('R')) { S.Fov = s_StartFov; S.Roll = 0.f; }
 }
 
 // Aims s_Target at the player (orbiting around them in tripod mode).
-static void Track(SDK::APawn* Pawn, float Dt) {
+static void Track(SDK::APawn* Pawn, float Dt, const Settings& S) {
     const SDK::FVector P = Pawn->K2_GetActorLocation();
-    const float Orbit = s_Set[SOrbit].Val * Dt * kDeg;
+    const float Orbit = S.Orbit * Dt * kDeg;
     if (s_Mode == Mode::Tripod && Orbit != 0.f) {
         const float Dx = s_Target[PX] - P.X, Dy = s_Target[PY] - P.Y;
         s_Target[PX] = P.X + Dx * cosf(Orbit) - Dy * sinf(Orbit);
@@ -13077,7 +13096,8 @@ static void Track(SDK::APawn* Pawn, float Dt) {
     s_Target[PPitch] = atan2f(Dz, sqrtf(Dx * Dx + Dy * Dy)) / kDeg;
 }
 
-static void Apply(SDK::ACameraActor* Cam, SDK::APawn* Pawn) {
+// Pose, zoom and frame shape, then the lens and grading as a camera post-process override (weight 0 when unused).
+static void Apply(SDK::ACameraActor* Cam, SDK::APawn* Pawn, const Settings& S) {
     static SDK::FHitResult s_Hit;
     SDK::FRotator R{};
     R.Pitch = s_Cam[PPitch]; R.Yaw = s_Cam[PYaw]; R.Roll = s_Cam[PRoll];
@@ -13085,144 +13105,124 @@ static void Apply(SDK::ACameraActor* Cam, SDK::APawn* Pawn) {
     Cam->K2_SetActorLocationAndRotation(L, R, false, &s_Hit, true);
     SDK::UCameraComponent* C = Cam->CameraComponent;
     C->FieldOfView = s_Cam[PFov];                       // read by GetCameraView every frame
-    const int Dof = static_cast<int>(s_Set[SDof].Val + 0.5f);
-    float Focus = s_Set[SFocus].Val * 100.f;
-    if (Dof == 2 && Pawn) {
-        const SDK::FVector P = Pawn->K2_GetActorLocation();
-        Focus = sqrtf((P.X - L.X) * (P.X - L.X) + (P.Y - L.Y) * (P.Y - L.Y) + (P.Z - L.Z) * (P.Z - L.Z));
+    const float Ratio = kAspects[S.Aspect].Ratio;
+    C->bConstrainAspectRatio = Ratio > 0.f ? 1 : 0;     // black bars outside the chosen shape
+    if (Ratio > 0.f) C->AspectRatio = Ratio;
+
+    SDK::FPostProcessSettings& P = C->PostProcessSettings;
+    const uint8_t Dof = S.Dof ? 1 : 0, Gr = S.Grade ? 1 : 0, Mb = S.MotionBlurOn ? 1 : 0;
+    float Focus = S.Focus * 100.f;
+    if (S.Dof == 2 && Pawn) {
+        const SDK::FVector A = Pawn->K2_GetActorLocation();
+        Focus = sqrtf((A.X - L.X) * (A.X - L.X) + (A.Y - L.Y) * (A.Y - L.Y) + (A.Z - L.Z) * (A.Z - L.Z));
     }
-    C->PostProcessBlendWeight = Dof ? 1.f : 0.f;
-    C->PostProcessSettings.bOverride_DepthOfFieldFocalDistance = Dof ? 1 : 0;
-    C->PostProcessSettings.bOverride_DepthOfFieldFstop = Dof ? 1 : 0;
-    C->PostProcessSettings.DepthOfFieldFocalDistance = Focus;
-    C->PostProcessSettings.DepthOfFieldFstop = s_Set[SFstop].Val;
+    P.bOverride_DepthOfFieldFocalDistance = Dof; P.DepthOfFieldFocalDistance = Focus;
+    P.bOverride_DepthOfFieldFstop = Dof;         P.DepthOfFieldFstop = S.Fstop;
+    P.bOverride_MotionBlurAmount = Mb;           P.MotionBlurAmount = S.MotionBlur;
+    P.bOverride_AutoExposureBias = Gr;           P.AutoExposureBias = S.Exposure;
+    P.bOverride_WhiteTemp = Gr;                  P.WhiteTemp = S.Temp;
+    P.bOverride_WhiteTint = Gr;                  P.WhiteTint = S.Tint;
+    P.bOverride_ColorSaturation = Gr;            P.ColorSaturation = SDK::FVector4{ S.Saturation, S.Saturation, S.Saturation, 1.f };
+    P.bOverride_ColorContrast = Gr;              P.ColorContrast = SDK::FVector4{ S.Contrast, S.Contrast, S.Contrast, 1.f };
+    // teal & orange: shadows lifted toward teal, highlights pushed warm
+    P.bOverride_ColorOffsetShadows = Gr;         P.ColorOffsetShadows = SDK::FVector4{ -0.015f * S.Split, 0.005f * S.Split, 0.02f * S.Split, 0.f };
+    P.bOverride_ColorGainHighlights = Gr;        P.ColorGainHighlights = SDK::FVector4{ 1.f + 0.1f * S.Split, 1.f + 0.03f * S.Split, 1.f - 0.08f * S.Split, 1.f };
+    P.bOverride_VignetteIntensity = Gr;          P.VignetteIntensity = S.Vignette;
+    P.bOverride_GrainIntensity = Gr;             P.GrainIntensity = S.Grain;
+    P.bOverride_SceneFringeIntensity = Gr;       P.SceneFringeIntensity = S.Fringe;
+    P.bOverride_BloomIntensity = Gr;             P.BloomIntensity = S.Bloom;
+    C->PostProcessBlendWeight = Dof || Gr || Mb ? 1.f : 0.f;
 }
 
-static void Drive(SDK::APlayerController* PC, float Dt) {
+static void Drive(SDK::APlayerController* PC, float Dt, Settings& S, const std::vector<Key>& Keys) {
     SDK::ACameraActor* Cam = Actor(PC);
     if (!Cam) { Stop(PC); return; }
     SDK::APawn* Pawn = PC->Pawn;
 
-    // Camera keys only in free mode, where the game hears nothing; in tripod/path they would reach the game.
-    if (s_Mode == Mode::Free) {
-        if (Pressed('T')) { s_Mode = Mode::Tripod; SetGameInput(PC, true); }
-        if (Pressed('Y')) s_Track = !s_Track;
-        if (Pressed('K')) { s_Keys.push_back(s_Target); Log("keyframe " + std::to_string(s_Keys.size())); }
-        if (Pressed('J') && !s_Keys.empty()) s_Keys.pop_back();
-        if (Pressed('L') && !s_Keys.empty()) { s_Mode = Mode::Path; s_PathT = 0.f; SetGameInput(PC, true); }
-    }
-
     if (s_Mode == Mode::Path) {
-        const bool Loop = s_Set[SLoop].Val >= 0.5f;
-        s_PathT += Dt / s_Set[SPathTime].Val;
-        if (s_PathT >= 1.f) {
-            if (Loop) s_PathT -= floorf(s_PathT);
-            else s_PathT = 1.f;
-        }
-        // eased in and out unless looping (a loop would stall at the seam)
-        s_Target = PathAt(Loop ? s_PathT : s_PathT * s_PathT * (3.f - 2.f * s_PathT));
-        if (!Loop && s_PathT >= 1.f) {                  // ends held in tripod on the last frame
-            s_Mode = Mode::Tripod;
-            s_Set[SFov].Val = s_Target[PFov];
-            s_Set[SRoll].Val = s_Target[PRoll];
+        if (Keys.size() < 2) { EndPath(S); }
+        else {
+            const float Start = Keys.front().Time, End = Keys.back().Time;
+            s_PathT += Dt;
+            const bool Done = !S.Loop && s_PathT >= End;
+            if (Done) s_PathT = End;
+            else if (S.Loop && End > Start && s_PathT >= End) s_PathT = Start + fmodf(s_PathT - Start, End - Start);
+            s_Target = PathAt(Keys, s_PathT, S.Ease, S.Loop);
+            if (Done) EndPath(S);
         }
     } else {
-        if (s_Mode == Mode::Free) FreeInput(PC, Dt);
-        s_Target[PFov] = s_Set[SFov].Val;
-        s_Target[PRoll] = s_Set[SRoll].Val;
+        if (s_Mode == Mode::Free) FreeInput(PC, Dt, S);
+        s_Target[PFov] = S.Fov;
+        s_Target[PRoll] = S.Roll;
     }
-    if (s_Track && Pawn && s_Mode != Mode::Free) Track(Pawn, Dt);
+    if (S.Track && Pawn && s_Mode != Mode::Free) Track(Pawn, Dt, S);
 
     // Smoothing = how much of the gap is left after 1/60 s; the path is already smooth.
-    const float A = s_Mode == Mode::Path ? 1.f : 1.f - powf(s_Set[SSmooth].Val, Dt * 60.f);
+    const float A = s_Mode == Mode::Path ? 1.f : 1.f - powf(S.Smooth, Dt * 60.f);
     for (int K = 0; K < PN; ++K) s_Cam[K] += (s_Target[K] - s_Cam[K]) * A;
-    Apply(Cam, Pawn);
+    Apply(Cam, Pawn, S);
     // the server can hand the view back (respawn, the game's own cinematics); keep ours while on
     if (PC->PlayerCameraManager->ViewTarget.Target != Cam) {
         PC->SetViewTargetWithBlend(Cam, 0.f, SDK::EViewTargetBlendFunction::VTBlend_Linear, 0.f, false);
     }
 }
 
-// ---------------------------------------------------------------- settings panel
-
-static std::wstring ValueText(int I) {
-    const Setting& S = s_Set[I];
-    if (I == SDof) return S.Val < 0.5f ? L"Off" : S.Val < 1.5f ? L"Manual" : L"Auto (focus on player)";
-    if (I == SLoop) return S.Val >= 0.5f ? L"On" : L"Off";
-    wchar_t B[32];
-    swprintf(B, 32, S.Step < 0.1f ? L"%.2f" : S.Step < 1.f ? L"%.1f" : L"%.0f", S.Val);
-    return B + std::wstring(S.Unit);
+static void Run(SDK::APlayerController* PC, const Cmd& C, Settings& S, const std::vector<Key>& Keys) {
+    const bool On = s_Mode != Mode::Off;
+    switch (C.T) {
+    case CmdType::ToggleCam: if (On) Stop(PC); else Start(PC, S); break;
+    case CmdType::Free: if (s_Mode == Mode::Tripod || s_Mode == Mode::Path) ToFree(PC, S); break;
+    case CmdType::Tripod:
+        if (s_Mode == Mode::Path) EndPath(S);
+        else if (s_Mode == Mode::Free) { s_Mode = Mode::Tripod; SetGameInput(PC, true); }
+        break;
+    case CmdType::Play:
+        if (!On || Keys.size() < 2) break;
+        s_Mode = Mode::Path;
+        s_PathT = Keys.front().Time;
+        SetGameInput(PC, true);
+        if (S.HideMenuOnPlay && G.MenuOpen.load()) { G.MenuOpen = false; s_ReopenMenu = true; }
+        break;
+    case CmdType::Stop: if (s_Mode == Mode::Path) EndPath(S); break;
+    case CmdType::GoToKey: if (On && C.I >= 0 && C.I < static_cast<int>(Keys.size())) JumpTo(PC, S, Keys[C.I].P, Keys[C.I].Time); break;
+    case CmdType::Preview: if (On && !Keys.empty()) JumpTo(PC, S, PathAt(Keys, C.F, S.Ease, false), C.F); break;
+    case CmdType::ToggleHud: SetHudHidden(PC, !g_MpHudHidden); break;
+    default: break;                                     // keyframe edits are done under the lock in Update
+    }
 }
 
-static std::wstring PanelText() {
-    static const wchar_t* Modes[] = { L"Off (F8 on)", L"Free, game input off (F8 off)",
-        L"Tripod, you play (F8 back to free cam)", L"Playing path, you play (F8 back to free cam)" };
-    std::wstring T = L"CINEMATIC CAMERA   F10 close\n";
-    T += std::wstring(L"Camera: ") + Modes[static_cast<int>(s_Mode)] + L"    HUD: " + (g_MpHudHidden ? L"hidden" : L"shown") + L" (F9)\n";
-    T += std::wstring(L"T tripod   Y track player: ") + (s_Track ? L"on" : L"off")
-        + L"   K/J keyframes: " + std::to_wstring(s_Keys.size()) + L"   L play path\n";
-    T += s_Mode == Mode::Tripod || s_Mode == Mode::Path ? L"Settings locked while you play (F8 back to free cam)\n\n"
-        : L"Up/Down pick, Left/Right change (Shift = x10)\n\n";
-    for (int I = 0; I < SN; ++I) T += std::wstring(I == s_Sel ? L"> " : L"   ") + s_Set[I].Name + L":  " + ValueText(I) + L"\n";
-    T += L"\nWASD move, E/Q up/down, Shift fast, Alt slow, mouse look\nWheel zoom, Z/X roll, R reset zoom and roll";
-    return T;
+// Path line and keyframe markers on screen, for the menu to draw.
+static void Project(SDK::APlayerController* PC, const std::vector<Key>& Keys, std::vector<Point>& Path, std::vector<Point>& Marks) {
+    auto At = [&](const Pose& Q) {
+        SDK::FVector2D Sc{};
+        const bool On = PC->ProjectWorldLocationToScreen(SDK::FVector{ Q[PX], Q[PY], Q[PZ] }, &Sc, false);
+        return Point{ Sc.X, Sc.Y, On };
+    };
+    for (const Key& K : Keys) Marks.push_back(At(K.P));
+    if (Keys.size() < 2) return;
+    const int Steps = (std::min)(400, static_cast<int>(Keys.size() - 1) * 16);
+    const float A = Keys.front().Time, B = Keys.back().Time;
+    for (int I = 0; I <= Steps; ++I) Path.push_back(At(PathAt(Keys, A + (B - A) * I / Steps, false, false)));
 }
 
-static void PanelInput(ULONGLONG Now) {
-    if (Repeat(VK_UP, Now)) s_Sel = (s_Sel + SN - 1) % SN;
-    if (Repeat(VK_DOWN, Now)) s_Sel = (s_Sel + 1) % SN;
-    const int Dir = int(Repeat(VK_RIGHT, Now)) - int(Repeat(VK_LEFT, Now));
-    if (!Dir) return;
-    Setting& S = s_Set[s_Sel];
-    S.Val = Clamp(S.Val + Dir * S.Step * (Down(VK_SHIFT) ? 10.f : 1.f), S.Min, S.Max);
-    s_Dirty = true;
-}
-
-static SDK::Uw_chat_log_label_bpw_C* CreateLabel(SDK::APlayerController* PC) {
-    SDK::UClass* Cls = BehemothHealthBar::LoadClass(s_TextClass, L"/Game/UI/Chat/w_chat_log_label_bpw.w_chat_log_label_bpw_C");
-    auto* L = Cls ? static_cast<SDK::Uw_chat_log_label_bpw_C*>(SDK::UWidgetBlueprintLibrary::Create(PC, Cls, PC)) : nullptr;
-    if (!L || !L->ChatLogLabelTextBlock) { Log("panel label not created: " + MpPtr(L)); return nullptr; }
-    SDK::UTextBlock* Tb = L->ChatLogLabelTextBlock;
-    if (SDK::UTextBlock* HudText = BehemothHealthBar::FindHudHealthText()) {   // field by field: TSharedPtrs inside
-        Tb->Font.FontObject = HudText->Font.FontObject;
-        Tb->Font.TypefaceFontName = HudText->Font.TypefaceFontName;
+// Cursor while the menu is open; holding the right mouse button outside the menu hides it to look around.
+static void UpdateCursor(SDK::APlayerController* PC, ULONGLONG Now) {
+    const bool Menu = MenuVisible();
+    const bool Rmb = s_Front && (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
+    if (!Menu || !Rmb) s_RmbLook = false;
+    else if (!s_RmbWas && !G.WantMouse.load()) s_RmbLook = true;
+    s_RmbWas = Rmb;
+    const bool Show = Menu && !s_RmbLook;
+    if (Show == s_CursorShown && !(Show && Now >= s_NextCursor && !PC->bShowMouseCursor)) return;
+    s_NextCursor = Now + 250;                           // the game hides it again on some of its own UI changes
+    if (Show) {
+        PC->bShowMouseCursor = 1;
+        SDK::UWidgetBlueprintLibrary::SetInputMode_GameAndUIEx(PC, nullptr, SDK::EMouseLockMode::DoNotLock, false);
+    } else if (s_CursorShown) {
+        PC->bShowMouseCursor = 0;
+        SDK::UWidgetBlueprintLibrary::SetInputMode_GameOnly(PC);
     }
-    Tb->Font.OutlineSettings.OutlineSize = 2;
-    Tb->Font.OutlineSettings.OutlineColor = SDK::FLinearColor{ 0.f, 0.f, 0.f, 1.f };
-    Tb->ShadowOffset = SDK::FVector2D{ 2.f, 2.f };
-    Tb->ShadowColorAndOpacity = SDK::FLinearColor{ 0.f, 0.f, 0.f, 0.8f };
-    Tb->ColorAndOpacity.SpecifiedColor = SDK::FLinearColor{ 1.f, 1.f, 1.f, 1.f };
-    Tb->ColorAndOpacity.ColorUseRule = SDK::ESlateColorStylingMode::UseColor_Specified;
-    Tb->Font.Size = 17;                                 // before AddToViewport: Slate reads it when built
-    L->AddToViewport(1001);
-    Tb->SetJustification(SDK::ETextJustify::Left);
-    L->SetPositionInViewport(SDK::FVector2D{ 48.f, 140.f }, false);
-    L->SetDesiredSizeInViewport(SDK::FVector2D{ 780.f, 640.f });
-    L->SetAnchorsInViewport(SDK::FAnchors{ SDK::FVector2D{ 0.f, 0.f }, SDK::FVector2D{ 0.f, 0.f } });
-    L->SetAlignmentInViewport(SDK::FVector2D{ 0.f, 0.f });
-    s_Label.Set(L);
-    s_LabelShown = true;
-    s_LastText.clear();
-    return L;
-}
-
-static void DrawPanel(SDK::APlayerController* PC, ULONGLONG Now) {
-    auto* L = s_Label.Get<SDK::Uw_chat_log_label_bpw_C>();
-    if (!s_Panel && Now >= s_HintUntil) {
-        if (L && s_LabelShown) { L->SetVisibility(SDK::ESlateVisibility::Collapsed); s_LabelShown = false; }
-        return;
-    }
-    if (!L) {
-        if (Now < s_NextCreate) return;
-        s_NextCreate = Now + 5000;
-        if (!(L = CreateLabel(PC))) return;
-    }
-    if (!s_LabelShown) { L->SetVisibility(SDK::ESlateVisibility::HitTestInvisible); s_LabelShown = true; }
-    const std::wstring T = s_Panel ? PanelText() : L"Cinematic camera on.  F10 settings, F8 off";
-    if (T != s_LastText) {
-        L->ChatLogLabelTextBlock->SetText(SDK::UKismetTextLibrary::Conv_StringToText(SDK::FString(T.c_str())));
-        s_LastText = T;
-    }
+    s_CursorShown = Show;
 }
 
 // ---------------------------------------------------------------- frame
@@ -13244,33 +13244,96 @@ static void Update() {
     SDK::APlayerController* PC = World ? SDK::UGameplayStatics::GetPlayerController(World, 0) : nullptr;
     if (!PC || !PC->PlayerCameraManager) return;
     if (PC != s_PC.Get()) {                             // new world: actor, widgets and input state went with the old one
-        if (s_PC.P) Log("new world - camera off");
-        else { Load(); Log("ready (F8 camera, F9 HUD, F10 settings)"); }
+        const bool First = !s_PC.P;
         s_PC.Set(PC);
-        s_Actor.Set(nullptr); s_Label.Set(nullptr); s_OldView.Set(nullptr);
+        s_Actor.Set(nullptr); s_OldView.Set(nullptr);
         s_Mode = Mode::Off;
-        s_Blocking = s_LabelShown = g_MpHudHidden = false;
+        s_Blocking = s_CursorShown = s_RmbLook = s_ReopenMenu = g_MpHudHidden = false;
         s_HiddenWidgets.clear();
-        s_Keys.clear();                                 // world positions mean nothing on another map
+        const std::string Map = SDK::UGameplayStatics::GetCurrentLevelName(PC, true).ToString();
+        {
+            std::lock_guard<std::mutex> Lk(G.Lock);
+            if (First) { Load(G.S); s_Saved = G.S; }
+            G.Keys.clear();                             // world positions mean nothing on another map
+            G.M = Mode::Off;
+            G.HudHidden = false;
+            G.Map = Map;
+            G.PathPts.clear(); G.KeyPts.clear();
+        }
+        G.MenuOpen = false;
+        if (First) { MenuStart(); Log("ready (F8 camera, F9 HUD, F10 menu)"); }
+        else Log("new world " + Map + " - camera off");
     }
     DWORD Pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &Pid);
     s_Front = Pid == GetCurrentProcessId();
+    s_KeysOn = s_Front && !G.WantKeyboard.load();       // typing a shot name in the menu
     const ULONGLONG Now = GetTickCount64();
     const float Dt = Clamp(SDK::UGameplayStatics::GetWorldDeltaSeconds(PC), 0.f, 0.1f);
 
-    if (Pressed(VK_F9)) SetHudHidden(PC, !g_MpHudHidden);
-    if (Pressed(VK_F10)) { s_Panel = !s_Panel; s_HintUntil = 0; }
-    if (Pressed(VK_F8)) {                               // off -> free -> off; tripod/path -> free
-        if (s_Mode == Mode::Off) Start(PC, Now);
-        else if (s_Mode == Mode::Free) Stop(PC);
-        else ToFree(PC);
+    // hotkeys -> the same commands the menu sends
+    std::vector<Cmd> Cmds;
+    if (Pressed(VK_F8)) Cmds.push_back(Cmd{ s_Mode == Mode::Tripod || s_Mode == Mode::Path ? CmdType::Free : CmdType::ToggleCam });
+    if (Pressed(VK_F9)) Cmds.push_back(Cmd{ CmdType::ToggleHud });
+    if (Pressed(VK_F10)) {
+        if (G.MenuReady.load()) { G.MenuOpen = !G.MenuOpen.load(); s_ReopenMenu = false; }
+        else if (!s_MenuWarned) { s_MenuWarned = true; Log("F10: menu unavailable (needs D3D11) - settings are in CINECAM.ini"); }
     }
+    bool TrackFlip = false, PopKey = false;
+    if (s_Mode == Mode::Free) {                         // camera keys only where the game hears nothing
+        if (Pressed('T')) Cmds.push_back(Cmd{ CmdType::Tripod });
+        TrackFlip = Pressed('Y');
+        if (Pressed('K')) Cmds.push_back(Cmd{ CmdType::AddKey });
+        PopKey = Pressed('J');
+        if (Pressed('L')) Cmds.push_back(Cmd{ CmdType::Play });
+    }
+
+    // snapshot; keyframe edits that need the camera's pose happen here, on the shared list
+    Settings S;
+    std::vector<Key> Keys;
+    {
+        std::lock_guard<std::mutex> Lk(G.Lock);
+        Cmds.insert(Cmds.begin(), G.Cmds.begin(), G.Cmds.end());
+        G.Cmds.clear();
+        for (const Cmd& C : Cmds) {
+            if (s_Mode == Mode::Off) break;
+            if (C.T == CmdType::AddKey) {
+                G.Keys.push_back(Key{ s_Target, G.Keys.empty() ? 0.f : G.Keys.back().Time + G.S.Spacing });
+                Log("keyframe " + std::to_string(G.Keys.size()));
+            } else if (C.T == CmdType::UpdateKey && C.I >= 0 && C.I < static_cast<int>(G.Keys.size())) {
+                G.Keys[C.I].P = s_Target;
+            }
+        }
+        if (PopKey && !G.Keys.empty()) G.Keys.pop_back();
+        if (TrackFlip) G.S.Track = !G.S.Track;
+        S = G.S;
+        Keys = G.Keys;
+    }
+    const float Fov = S.Fov, Roll = S.Roll;
+
+    for (const Cmd& C : Cmds) Run(PC, C, S, Keys);
     KeepHudHidden(PC, Now);
-    if (s_Panel && s_Mode != Mode::Tripod && s_Mode != Mode::Path) PanelInput(Now);   // arrows would reach the game
-    if (s_Mode != Mode::Off) Drive(PC, Dt);
-    DrawPanel(PC, Now);
-    if (s_Dirty && Now >= s_NextSave) { s_NextSave = Now + 2000; Save(); }
+    UpdateCursor(PC, Now);
+    if (s_Mode != Mode::Off) Drive(PC, Dt, S, Keys);
+    std::vector<Point> PathPts, KeyPts;
+    if (MenuVisible() && S.ShowPath && s_Mode != Mode::Path) Project(PC, Keys, PathPts, KeyPts);
+
+    Settings Now_S;
+    {
+        std::lock_guard<std::mutex> Lk(G.Lock);
+        G.M = s_Mode;
+        G.PathT = s_PathT;
+        G.HudHidden = g_MpHudHidden;
+        G.PathPts.swap(PathPts);
+        G.KeyPts.swap(KeyPts);
+        if (S.Fov != Fov || S.Roll != Roll) { G.S.Fov = S.Fov; G.S.Roll = S.Roll; }   // wheel, Z/X, R, Go to, path end
+        Now_S = G.S;
+    }
+    if (Now >= s_NextSave && memcmp(&Now_S, &s_Saved, sizeof(Settings)) != 0) {
+        s_NextSave = Now + 2000;
+        Save(Now_S);
+        s_Saved = Now_S;
+    }
 }
 
 // A fault would otherwise leave the character without controls: give them back, then stay off for the session.
