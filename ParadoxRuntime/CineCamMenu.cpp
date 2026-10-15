@@ -445,22 +445,27 @@ static ID3D11DeviceContext* s_Ctx = nullptr;
 static ID3D11RenderTargetView* s_Rtv = nullptr;
 static HWND s_Hwnd = nullptr;
 static WNDPROC s_OrigWndProc = nullptr;
-static std::mutex s_ImLock;                       // ImGui is fed from the game thread and drawn on the RHI thread
+static std::mutex s_ImLock;                       // Frame vs ResizeBuffers (the back buffer view)
 static bool s_Tried = false, s_Ok = false, s_WasOpen = false;
 static volatile bool s_Faulted = false;
 
+// The window procedure only queues input for the menu; ImGui sees it on the RHI thread at the next frame.
+// It must not call ImGui itself: ImGui's Win32 handler calls SetCapture, which re-enters this procedure on the
+// same thread (WM_CAPTURECHANGED) - with a lock held that threw resource_deadlock_would_occur and killed the
+// game (0.2.44). Whether to keep input from the game uses the last frame's answer.
+struct QueuedMsg { HWND H; UINT M; WPARAM W; LPARAM L; };
+static std::mutex s_QLock;                        // held only to push/swap, never across a call
+static std::vector<QueuedMsg> s_Queue;
+
 static LRESULT CALLBACK WndProcHook(HWND H, UINT Msg, WPARAM W, LPARAM L) {
     if (G.MenuOpen.load() && G.MenuReady.load()) {
-        bool Eat = false;
-        {
-            std::lock_guard<std::mutex> Lk(s_ImLock);
-            ImGui_ImplWin32_WndProcHandler(H, Msg, W, L);
-            const ImGuiIO& Io = ImGui::GetIO();
-            const bool Mouse = Msg >= WM_MOUSEFIRST && Msg <= WM_MOUSELAST && Msg != WM_MOUSEMOVE;
-            const bool Keys = Msg >= WM_KEYFIRST && Msg <= WM_KEYLAST;
-            Eat = (Mouse && Io.WantCaptureMouse) || (Keys && Io.WantTextInput);
+        const bool Mouse = Msg >= WM_MOUSEFIRST && Msg <= WM_MOUSELAST;
+        const bool Keys = Msg >= WM_KEYFIRST && Msg <= WM_KEYLAST;
+        if (Mouse || Keys || Msg == WM_SETFOCUS || Msg == WM_KILLFOCUS || Msg == WM_MOUSELEAVE) {
+            std::lock_guard<std::mutex> Lk(s_QLock);
+            if (s_Queue.size() < 1024) s_Queue.push_back(QueuedMsg{ H, Msg, W, L });
         }
-        if (Eat) return 0;
+        if ((Mouse && Msg != WM_MOUSEMOVE && G.WantMouse.load()) || (Keys && G.WantKeyboard.load())) return 0;
     }
     return CallWindowProcW(s_OrigWndProc, H, Msg, W, L);
 }
@@ -489,6 +494,9 @@ static bool Init(IDXGISwapChain* Sc) {
     ApplyStyle();
     ImGui_ImplWin32_Init(s_Hwnd);
     ImGui_ImplDX11_Init(s_Dev, s_Ctx);
+    // Default IME hook calls Imm* on the window from this (RHI) thread, which waits on the game thread. No text
+    // field here needs an IME (shot names are ASCII).
+    ImGui::GetPlatformIO().Platform_SetImeDataFn = nullptr;
     s_OrigWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(s_Hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProcHook)));
     G.MenuReady = true;
     MpLog("[CineCam] menu ready (D3D11, window " + MpPtr(s_Hwnd) + ")");
@@ -510,7 +518,10 @@ static void Frame() {
     if (!Open) { s_WasOpen = false; G.WantMouse = G.WantKeyboard = false; }
     if (!Open && !Toasting) return;
     std::lock_guard<std::mutex> Lk(s_ImLock);
-    if (Open && !s_WasOpen) { s_WasOpen = true; ImGui::GetIO().ClearInputKeys(); }
+    if (Open && !s_WasOpen) { s_WasOpen = true; ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); }
+    std::vector<QueuedMsg> In;
+    { std::lock_guard<std::mutex> Q(s_QLock); In.swap(s_Queue); }
+    for (const QueuedMsg& M : In) ImGui_ImplWin32_WndProcHandler(M.H, M.M, M.W, M.L);
     if (!s_Rtv) {
         ID3D11Texture2D* Back = nullptr;
         if (FAILED(s_Sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&Back)))) return;
