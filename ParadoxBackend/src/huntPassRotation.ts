@@ -17,6 +17,14 @@ export const HUNT_PASS_XP_PER_LEVEL = 100;
 // The pass window only prices Platinum (any other currency renders as "Free"), so the Elite track costs the real 1,000.
 const HUNT_PASS_ELITE_PLATINUM = 1000;
 const PLATINUM_LEVELS = 15;
+const COMBAT_MERITS = "CURRENCY_PJM_WEAPON";
+const FREE_MERITS = 100;
+const ELITE_MERITS = 250; // the newer 30-level passes pay 250 per Elite drop
+// Ranks (1-based) of the added merit drops: round(levels / 10) drops, at least 2, spread evenly.
+const MeritDropRanks = (Levels: number) => {
+    const N = Math.max(2, Math.round(Levels / 10));
+    return Array.from({ length: N }, (_, K) => Math.round(((K + 1) * Levels) / (N + 1)));
+};
 const ROTATION_MS = 60 * 24 * 60 * 60 * 1000;
 const ROTATION_ANCHOR_MS = Date.parse("2026-10-01T00:00:00+00:00");
 
@@ -103,7 +111,14 @@ export function BuildHuntPassPath(SlotId: string, NowMs = Date.now()) {
     const HasPlatinum = Pass.levels.some((L) => L.free.some(IsPlatinum));
     const Spread = Math.min(PLATINUM_LEVELS, Pass.levels.length);
     const PlatinumAt = (I: number): Reward[] => !HasPlatinum || I >= Spread ? [] : [{ catalog_id: "CURRENCY_PLATINUM_UNIV", quantity: Math.floor(HUNT_PASS_ELITE_PLATINUM / Spread) + (I === Spread - 1 ? HUNT_PASS_ELITE_PLATINUM % Spread : 0) }];
-    const Rewards = (Track: "free" | "elite") => Pass.levels.map((L, I) => Level(I + 1, Track === "free" ? [...L.free.filter((R) => !HasPlatinum || !IsPlatinum(R)), ...PlatinumAt(I)] : L.elite));
+    // Combat Merits on every free track, and on Elite tracks that have none (the older and event passes), about one
+    // drop per ten levels, on top of whatever the level already pays.
+    const HasEliteMerits = Pass.levels.some((L) => L.elite.some((R) => R.catalog_id === COMBAT_MERITS));
+    const MeritRanks = MeritDropRanks(Pass.levels.length);
+    const MeritsAt = (I: number, Quantity: number): Reward[] => MeritRanks.includes(I + 1) ? [{ catalog_id: COMBAT_MERITS, quantity: Quantity }] : [];
+    const Rewards = (Track: "free" | "elite") => Pass.levels.map((L, I) => Level(I + 1, Track === "free"
+        ? [...L.free.filter((R) => !HasPlatinum || !IsPlatinum(R)), ...PlatinumAt(I), ...MeritsAt(I, FREE_MERITS)]
+        : [...L.elite, ...(HasEliteMerits ? [] : MeritsAt(I, ELITE_MERITS))]));
     return {
         progression_id: SlotId,
         // Config contract (docs/findings/backend-contract.md in the Revived stack): a path with a premium gate and
@@ -129,6 +144,8 @@ export function HuntPassSkus(SlotId: string) {
         prices: [{ currencyId: "id_currency_platinum", price: HUNT_PASS_ELITE_PLATINUM }],
         maxAllowed: 1,
         get ownershipKey() { return `${SlotId}_premium:${PassForSlot(SlotId).id}`; },
+        get availableFrom() { return ActiveSeasonWindow(Date.now()).start; }, // rotation window: client countdown
+        get availableTo() { return ActiveSeasonWindow(Date.now()).end; },
         tags: [HuntPassPassSkuTag(SlotId)],
         items: [],
         get entitlements() { return [{ name: HuntPassEntitlement(SlotId), duration: 0 }]; },
@@ -179,5 +196,17 @@ if (require.main === module) {
     // an escalation boost / lantern keeps its list: look for any non-stacked reward across the first pass
     const Lists = P.premium_rewards.flatMap((L) => [L.instanced_items.length, L.entitlements.length]);
     assert.ok(Lists.every((N) => Number.isInteger(N)));
+    // combat merits: every pass's free track pays them; Elite gets them only where the data had none
+    const Merits = (Levels: { stacked_items: { catalog_id?: string; quantity: number }[] }[]) => Levels.flatMap((L) => L.stacked_items).filter((I) => I.catalog_id === COMBAT_MERITS).reduce((N, I) => N + I.quantity, 0);
+    for (const [Slot, Passes] of [["season43", CosmeticPasses()], ["season50", CurrencyPasses()]] as const) {
+        Passes.forEach((Pass, Idx) => {
+            const Path = BuildHuntPassPath(Slot, At(Idx));
+            assert.equal(Path.pass_name, Pass.name);
+            assert.ok(Merits(Path.free_rewards) >= 2 * FREE_MERITS, `${Pass.name} free merits`);
+            assert.ok(Merits(Path.premium_rewards) > 0, `${Pass.name} elite merits`);
+        });
+    }
+    assert.equal(Merits(BuildHuntPassPath("season43", At(0)).premium_rewards), MeritDropRanks(50).length * ELITE_MERITS); // Frostfall had none
+    assert.deepEqual(MeritDropRanks(10), [3, 7]);
     console.log("huntPassRotation ok");
 }

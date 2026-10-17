@@ -657,7 +657,7 @@ function renderLauncherCard(root) {
             clearErr();
             const res = await fetch("/admin/v1/launcher-card/logo", { method: "PUT", credentials: "same-origin", headers: { "Content-Type": "application/octet-stream", "X-CSRF-Token": csrf }, body: f });
             const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data.error?.message || (res.status === 413 ? "That image is over 512 KB." : `Upload failed (${res.status}).`));
+            if (!res.ok) throw new Error(data.error?.message || (res.status === 413 ? "That image is over 2 MB." : `Upload failed (${res.status}).`));
             show(data);
         } catch (e) { fail(e); }
     });
@@ -677,7 +677,7 @@ function renderLauncherCard(root) {
         h("div", { class: "panel" }, h("h2", null, "Logo"),
             h("div", { class: "row" }, logo, noLogo),
             h("div", { class: "row" }, btn("Upload image…", () => file.click()), btn("Remove", async () => { try { show(await api("DELETE", "/launcher-card/logo")); } catch (e) { fail(e); } }, "btn danger"), file),
-            h("p", { class: "faint" }, "Square PNG, JPEG or WebP, up to 512 KB. 256×256 looks sharp.")),
+            h("p", { class: "faint" }, "Square PNG, JPEG or WebP, up to 2 MB. 256×256 looks sharp.")),
         h("div", { class: "panel" }, h("h2", null, "Invite link"),
             h("p", { class: "dim" }, "A link players can click (in Discord too) to add this server to their launcher. It holds the server's invite code, so share it only with people you want on the server."),
             h("div", { class: "row" }, h("label", { class: "dim" }, "Address players use"), host, h("label", { class: "dim" }, "Port"), port, btn("Make link", makeLink)),

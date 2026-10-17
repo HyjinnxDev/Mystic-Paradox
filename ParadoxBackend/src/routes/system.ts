@@ -154,6 +154,17 @@ systemRouter.post("/trials/leaderboards/solo/individual", HasParadoxBackendAuth,
 	});
 });
 
+// Same as solo/individual for the party's run on the end-of-hunt group panel (was 404).
+systemRouter.post("/trials/leaderboards/group/individual", HasParadoxBackendAuth, (req, res) => {
+	logger.info("Trials leaderboard group/individual (stubbed - no persisted run)");
+
+	res.status(200).json({
+		code: null,
+		message: "OK",
+		payload: {}
+	});
+});
+
 systemRouter.get("/vivox/login", HasParadoxBackendAuth, (req, res) => {
 	logger.info("Vivox login (stubbed)");
 

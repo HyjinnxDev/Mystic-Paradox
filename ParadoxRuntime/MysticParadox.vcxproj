@@ -170,6 +170,7 @@
     <ClCompile Include="CrashReporter.cpp" />
     <ClCompile Include="Voice.cpp" />
     <ClCompile Include="CineCamMenu.cpp" />
+    <ClCompile Include="JoinPrompt.cpp" />
     <ClCompile Include="CineCamPath.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />

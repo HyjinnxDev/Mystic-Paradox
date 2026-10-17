@@ -49,6 +49,9 @@ export type StoreSku = {
     maxAllowed: number | null;
     /** Identity a one-time purchase is recorded under when the SKU id alone is not unique over time (hunt pass Elite: the id is a client row, the pass behind it rotates). */
     ownershipKey?: string;
+    /** ISO window for a time-limited offer (client fields availableFrom/availableTo); omitted = always available. */
+    availableFrom?: string;
+    availableTo?: string;
     images?: Record<string, string>;
     tags: string[];
     items: StoreSkuItem[];
@@ -89,14 +92,15 @@ function PlatinumSection(sectionTag: string): StoreSku[] {
 // entitlements exchange_slot_2 / exchange_slot_3 (a live account carries exchange_slot_2 in
 // Auth/GetEntitlements.md), sold under the store tags the Middleman requests (exchange_vendor_slot_2/3). The SKU
 // ids are the client's own StoreItemsTable rows (single_exchange_slot_2/3, art Store_Art_512x512_cell_slot_middleman).
-// No live SKU capture exists: price set by the operator, 1,000 Platinum each, permanent (duration 0).
+// No live SKU capture exists: 500 Platinum each per the wiki (The Middleman: "two more are purchasable from the
+// Store for 500 Platinum"; 1,000 was the earlier launch price), permanent (duration 0).
 function ExchangeSlotSku(Slot: 2 | 3): StoreSku {
     return {
         id: `single_exchange_slot_${Slot}`,
         displayName: `Cell Fusion Slot ${Slot}`,
         displayDescription: `Unlocks cell fusion slot ${Slot} at the Middleman permanently.`,
         displayPriority: Slot,
-        prices: [{ currencyId: "id_currency_platinum", price: 1000 }],
+        prices: [{ currencyId: "id_currency_platinum", price: 500 }],
         maxAllowed: 1,
         tags: [`exchange_vendor_slot_${Slot}`],
         items: [],
@@ -119,10 +123,55 @@ function FountainDailySku(): StoreSku {
         prices: [{ currencyId: "id_currency_platinum", price: 0 }],
         maxAllowed: 1,
         ownershipKey: `fountain_daily_free_bundle_01:${new Date().toISOString().slice(0, 10)}`,
+        availableTo: `${new Date(Date.now() + 86_400_000).toISOString().slice(0, 10)}T00:00:00.000Z`, // next UTC day: client countdown
         tags: ["fountain_daily_free_bundle"],
         items: [{ catalogId: "CONTAINER_CORE_REWARD_DAILY_01", quantity: 1, instanced: false }],
         duplicateInstancedItems: [],
     };
+}
+// [1.14.7 2026-10-16] The Middleman's cell offers (store tag `weekly_cell_offering`, read by
+// UExchangeVendorCellOffers: one tile per SKU from its cell item, PlatPrice, DustPrice and availableTo, which the
+// client counts down). [2026-10-17] Rotates DAILY at 18:00 UTC (was weekly) and sells one +1, one +2 and one +3 cell,
+// each from a different family, for Platinum OR Aetherdust; the player picks the currency and PurchaseStoreSku charges
+// only that one. Families from game-data/middleman_cells.json (scripts/generate_middleman_cells.cjs; every family
+// there also has _R (+2) and _E (+3) catalog cells). Tier prices set by the server owner; +2/+3 cost more than fusing
+// +1s yourself, the premium buys skipping the fusion.
+// ponytail: the wiki says each cell has a purchase limit "depending on the cell" but not what it is, so no limit.
+const MIDDLEMAN_DAY_MS = 24 * 60 * 60 * 1000;
+const MIDDLEMAN_ROTATION_EPOCH = Date.UTC(1970, 0, 1, 18);
+const MIDDLEMAN_TIERS = [
+    { suffix: "UC", level: 1, platinum: 50, dust: 40 },
+    { suffix: "R", level: 2, platinum: 150, dust: 100 },
+    { suffix: "E", level: 3, platinum: 300, dust: 250 },
+];
+type MiddlemanFamily = { id: string; name: string };
+let MiddlemanFamilies: MiddlemanFamily[] | undefined;
+export function WeeklyCellSkus(NowMs = Date.now()): StoreSku[] {
+    MiddlemanFamilies ??= loadGameData<{ families: MiddlemanFamily[] }>("middleman_cells.json").families;
+    const Day = Math.floor((NowMs - MIDDLEMAN_ROTATION_EPOCH) / MIDDLEMAN_DAY_MS);
+    const Start = MIDDLEMAN_ROTATION_EPOCH + Day * MIDDLEMAN_DAY_MS;
+    // Fresh shuffle per day, seeded by the day so every read and every server agrees on today's three.
+    const Families = MiddlemanFamilies
+        .map((Family) => ({ Family, Score: crypto.createHash("sha256").update(`middleman-daily-v1:${Day}:${Family.id}`).digest("hex") }))
+        .sort((A, B) => A.Score.localeCompare(B.Score))
+        .map(({ Family }) => Family);
+    return MIDDLEMAN_TIERS.slice(0, Families.length).map((Tier, Index) => {
+        const Family = Families[Index];
+        const CatalogId = `CELL_${Family.id}_${Tier.suffix}`;
+        return {
+            id: `middleman_daily_${CatalogId.toLowerCase()}`,
+            displayName: Family.name.replace(/^\+1 /, `+${Tier.level} `),
+            displayDescription: "Purchase one cell with Platinum or Aetherdust.",
+            displayPriority: Index,
+            prices: [{ currencyId: "id_currency_platinum", price: Tier.platinum }, { currencyId: "id_currency_celldust", price: Tier.dust }],
+            maxAllowed: null,
+            availableFrom: new Date(Start).toISOString(),
+            availableTo: new Date(Start + MIDDLEMAN_DAY_MS).toISOString(),
+            tags: ["weekly_cell_offering"],
+            items: [{ catalogId: CatalogId, quantity: 1, instanced: false }],
+            duplicateInstancedItems: [],
+        };
+    });
 }
 const HUNT_PASS_SKUS = Object.fromEntries(HUNT_PASS_SLOT_IDS.map((Slot) => [HuntPassPassSkuTag(Slot), HuntPassSkus(Slot)]));
 const EXCHANGE_SLOT_SKUS = { slot2: [ExchangeSlotSku(2)], slot3: [ExchangeSlotSku(3)] };
@@ -138,6 +187,7 @@ const STORE_SKUS: Record<string, StoreSku[]> = {
     hp_level_skip_rank: PlatinumSection("hp_level_skip_rank"),
     huntpass_store: PlatinumSection("huntpass_store"),
     get fountain_daily_free_bundle() { return [FountainDailySku()]; },   // rebuilt per read: the ownership key carries today's date
+    get weekly_cell_offering() { return WeeklyCellSkus(); },              // rebuilt per read: rotates daily
 };
 
 // Store-service currency ids (id_currency_x) -> our wallet's catalog currency ids (CURRENCY_X).
@@ -159,6 +209,7 @@ const CURRENCY_ID_MAP: Record<string, string> = {
     // InsufficientStackedItemError (unmapped -> 500) instead of charging anything. It failed closed,
     // but it would have failed. See Progress/33_PLATINUM_STORE.md.
     id_currency_platinum: "CURRENCY_PLATINUM",
+    id_currency_celldust: "CURRENCY_CELLDUST",   // Middleman weekly cell offers
 };
 
 export function GetLadyLuckSkus(): StoreSku[] {
@@ -273,7 +324,10 @@ async function GrantSkuProgressionInTransaction(repos: RepositoryProvider, userI
 
 export type PurchaseResult =
     | { ok: true; result: any }
-    | { ok: false; reason: "unknown_sku" | "insufficient_balance" | "conflict" | "already_purchased_different_request" | "transaction_failed" };
+    | { ok: false; reason: "unknown_sku" | "unknown_currency" | "insufficient_balance" | "conflict" | "already_purchased_different_request" | "transaction_failed" };
+
+// The client's currency path segment (/token/{currency}/{sku}): a price's currencyId without `id_currency_` and underscores.
+export const CurrencySlug = (CurrencyId: string) => CurrencyId.replace(/^id_currency_/, "").replace(/_/g, "");
 
 // [2026-07-24] Confirmed real purchase flow (see routes/store.ts's /token/platinum and
 // /notification/platinum handlers): the client never calls a skuId-in-path/characterId-in-body
@@ -282,10 +336,15 @@ export type PurchaseResult =
 // This function is the actual purchase execution, called from the redeem step once the token's
 // (userId, characterId, skuId) claims are decoded - built on the same atomic machinery as before
 // (RunInventoryTransaction's idempotency ledger + the wallet's overspend guard).
-export async function PurchaseStoreSku(userId: string, characterId: string, storeTag: string, skuId: string, characterBindingValidated = false): Promise<PurchaseResult> {
+export async function PurchaseStoreSku(userId: string, characterId: string, storeTag: string, skuId: string, characterBindingValidated = false, currency?: string): Promise<PurchaseResult> {
     const Sku = GetStoreSkus(storeTag).find((s) => s.id === skuId);
     if (!Sku) {
         return { ok: false, reason: "unknown_sku" };
+    }
+    // A SKU priced in several currencies (Middleman cells: Platinum or Aetherdust) is paid in the one the player chose.
+    const Prices = Sku.prices.length > 1 ? Sku.prices.filter((p) => CurrencySlug(p.currencyId) === currency) : Sku.prices;
+    if (Prices.length === 0) {
+        return { ok: false, reason: "unknown_currency" };
     }
 
     // One-time SKUs (maxAllowed===1, the overwhelming majority - cosmetics/weapons/champion gear) get
@@ -304,7 +363,7 @@ export async function PurchaseStoreSku(userId: string, characterId: string, stor
         ? OneTimeTransactionId(storeTag, userId, Sku)
         : crypto.randomBytes(16).toString("hex").toUpperCase();
 
-    const StackedItemsToRemove = Sku.prices.filter((p) => p.price > 0).map((p) => ({
+    const StackedItemsToRemove = Prices.filter((p) => p.price > 0).map((p) => ({
         catalogId: CURRENCY_ID_MAP[p.currencyId] ?? p.currencyId.toUpperCase(),
         quantity: p.price,
     }));

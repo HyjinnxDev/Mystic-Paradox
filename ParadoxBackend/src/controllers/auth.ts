@@ -75,6 +75,8 @@ export type StorePurchaseTokenPayload = {
     // Optional only so a token minted by the pre-registry Lady Luck build remains redeemable during
     // a rolling deployment. New tokens always bind the store identity.
     storeTag?: string;
+    // The currency segment of /token/{currency}/{sku}; picks the price of a SKU sold in several currencies.
+    currency?: string;
 };
 
 function SignStorePurchaseToken(payload: StorePurchaseTokenPayload){

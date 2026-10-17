@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { MatchmakingPartySnapshot, ResolveMatchmakingParty } from "./matchmakingParty";
+import { LateJoinBlockReason, MatchmakingPartySnapshot, ResolveMatchmakingParty } from "./matchmakingParty";
 
 const Party: MatchmakingPartySnapshot = {
     partyId: "party-live",
@@ -68,4 +68,17 @@ test("a player without a party travels solo", () => {
     assert.equal(Result.partyId, undefined);
     assert.equal(Result.partyMembers, undefined);
     assert.equal(Result.partyIdMismatch, false);
+});
+
+test("join-in-progress gate", () => {
+    const Now = 100000;
+    const Live = { hpPct: 63, players: 1, subState: 2, at: Now - 1000 };
+    assert.equal(LateJoinBlockReason(Live, Now), undefined);
+    assert.equal(LateJoinBlockReason({ ...Live, hpPct: -1 }, Now), undefined);
+    assert.equal(LateJoinBlockReason({ ...Live, hpPct: 20 }, Now), undefined);
+    assert.equal(LateJoinBlockReason({ ...Live, hpPct: 19 }, Now), "NEARLY_DONE");
+    assert.equal(LateJoinBlockReason({ ...Live, players: 4 }, Now), "FULL");
+    assert.equal(LateJoinBlockReason({ ...Live, subState: 4 }, Now), "ENDING");
+    assert.equal(LateJoinBlockReason({ ...Live, at: Now - 16000 }, Now), "STALE_HUNT_STATE");
+    assert.equal(LateJoinBlockReason(null, Now), "NO_HUNT_STATE");
 });

@@ -28,6 +28,25 @@ export type MatchmakingPartyResolution = {
     partyIdMismatch: boolean
 };
 
+// Join-in-progress gate. A party member in Ramsgate may drop into another member's running hunt only while the
+// hunt server reports fresh state (its runtime is the one that rescales behemoth health on join), has a free
+// slot, is not ending, and the behemoth is not nearly dead. hpPct -1 = no behemoth spawned yet.
+export type LateJoinHuntState = { hpPct: number, players: number, subState: number, at: number };
+
+export const LATE_JOIN_MIN_HP_PCT = 20;
+export const LATE_JOIN_MAX_PLAYERS = 4;
+const LATE_JOIN_STATE_MAX_AGE_MS = 15000;
+const SUBSTATE_END_OF_HUNT = 4;
+
+export function LateJoinBlockReason(State: LateJoinHuntState | null | undefined, NowMs: number): string | undefined {
+    if (State == undefined) return "NO_HUNT_STATE";
+    if (NowMs - State.at > LATE_JOIN_STATE_MAX_AGE_MS) return "STALE_HUNT_STATE";
+    if (State.players >= LATE_JOIN_MAX_PLAYERS) return "FULL";
+    if (State.subState === SUBSTATE_END_OF_HUNT) return "ENDING";
+    if (State.hpPct >= 0 && State.hpPct < LATE_JOIN_MIN_HP_PCT) return "NEARLY_DONE";
+    return undefined;
+}
+
 export function ResolveMatchmakingParty(
     GameMode: string,
     UserId: string,

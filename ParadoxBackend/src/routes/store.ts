@@ -136,8 +136,9 @@ const PublicSku = (Sku: ReturnType<typeof GetStoreSkus>[number]) => ({
         ? { progressionId: Sku.skuProgression.progressionId, ranks: Sku.skuProgression.ranks, xp: Sku.skuProgression.xp }
         : null,
     loadoutSlots: null,
-    availableFrom: null,
-    availableTo: null,
+    // Rotation window: the client's store widgets count down to availableTo. Must not be nulled after this.
+    availableFrom: Sku.availableFrom ?? null,
+    availableTo: Sku.availableTo ?? null,
     timeAvailabilityReason: null,
     platformOfferId: null,
     missingEntitlementNames: null,
@@ -242,6 +243,7 @@ storeRouter.get("/token/:currency/:catalogId", HasParadoxBackendAuth, async (req
         characterId: CharacterId,
         storeTag: Located.storeTag,
         skuId: Located.sku.id,
+        currency: req.params.currency,
     });
     logger.info(`[Store:${Located.storeTag}] Minted purchase token for ${UserId} sku=${Located.sku.id}`);
     res.status(200);
@@ -297,7 +299,7 @@ storeRouter.post("/notification/:currency", HasParadoxBackendAuth, async (req: a
     // ValidateStorePurchaseToken verified the signature and this route already checked userId. The
     // characterId was resolved server-side when the token was minted, so the purchase transaction
     // can skip a redundant ownership round trip while retaining the signed binding.
-    const Result = await PurchaseStoreSku(Payload.userId, Payload.characterId, StoreTag, Payload.skuId, true);
+    const Result = await PurchaseStoreSku(Payload.userId, Payload.characterId, StoreTag, Payload.skuId, true, Payload.currency ?? req.params.currency);
 
     if (!Result.ok) {
         const StatusByReason: Record<string, number> = {

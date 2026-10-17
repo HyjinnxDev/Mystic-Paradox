@@ -94,7 +94,7 @@ let Pending: Promise<void> | null = null;
 
 async function FetchNews(token: string, channel: string): Promise<{ items: NewsItem[]; images: Map<string, string> }> {
     const Res = await fetch(`https://discord.com/api/v10/channels/${channel}/messages?limit=50`, {
-        headers: { authorization: `Bot ${token}`, "user-agent": "DauntlessForever (news, 1.0)" },
+        headers: { authorization: `Bot ${token}`, "user-agent": "DauntlessRevamped (news, 1.0)" },
         signal: AbortSignal.timeout(10000),
     });
     if (!Res.ok) throw new Error(`Discord answered ${Res.status}`);

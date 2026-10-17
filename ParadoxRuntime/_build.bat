@@ -10,5 +10,5 @@ if not defined MSBUILD (
   echo MSBuild with C++ tools was not found.
   exit /b 3
 )
-"%MSBUILD%" "%~dp0MysticParadox.sln" /m /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
+"%MSBUILD%" "%~dp0MysticParadox.sln" /m /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64 /nologo /verbosity:minimal
 exit /b %errorlevel%

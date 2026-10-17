@@ -36,7 +36,7 @@ const CURRENCY = {
     // not mapped (which CURRENCY_Sxx_COIN is which is unknown), so those rewards are dropped.
     "exploration merits": "CURRENCY_PJM_AIRSHIP",
     "steel marks": "CURRENCY_MARKS_STEEL",
-    "ace chips": "CURRENCY_TOKEN_EXCHANGE_SPEED_UP",
+    "ace chips": "CURRENCY_CELLDUST", // Ace Chips removed in an earlier update; pay Aetherdust instead
     // display names missing from the 1.14.7 string table, so no catalog name to match
     "bronze slayer core": "Container_Core_Slayer_Bronze",
     "silver slayer core": "Container_Core_Slayer_Silver",

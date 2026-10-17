@@ -58,9 +58,9 @@ export const LINK_REWARDS: [string, number][] = [
     ...[5, 10, 20, 30, 100, 200].map((q): [string, number] => ["CURRENCY_PJM_WEAPON", q]),                                     // Combat Merits
     ...[25, 50].map((q): [string, number] => ["CURRENCY_PJM_PRESTIGE_EMPTY", q]),                                              // Aethersparks
 ];
-// ponytail: pool size and the uniform draw are guesses (LinkedSlayerConfigTable/LinkedSlayerRewardsTable are not
-// exported); use their MaxRewards and ItemWeight if they ever are.
-export const PRIZE_POOL_SIZE = 8;
+// 12 = the live "Your Rewards Pool" screen. ponytail: the uniform draw is a guess (LinkedSlayerRewardsTable is not
+// exported); use its ItemWeight if it ever is.
+export const PRIZE_POOL_SIZE = 12;
 const HOUR_MS = 60 * 60 * 1000;
 const ALL_SLOTS = Array.from({ length: LINK_SLOTS }, (_, i) => i + 1);
 
@@ -296,15 +296,16 @@ export function RewardsGrant(rows: SlayerLinkRow[], owner: string, slotValue: un
 }
 
 // A fresh pool for one player's side of a link: PRIZE_POOL_SIZE different prizes, none unlocked yet. skip: catalog ids
-// to leave out (a Crown of Friendship the player already owns).
-export function DrawPrizePool(random: () => number, skip: Set<string>): LinkPrize[] {
-    const all = LINK_REWARDS.filter(([id]) => !skip.has(id)).map(([catalog_id, quantity]): LinkPrize => ({ catalog_id, quantity, received_for_level: 0 }));
-    const n = Math.min(PRIZE_POOL_SIZE, all.length);
+// to leave out (a Crown of Friendship the player already owns). keep: an older, smaller pool to top up instead.
+export function DrawPrizePool(random: () => number, skip: Set<string>, keep: LinkPrize[] = []): LinkPrize[] {
+    const kept = new Set(keep.map((p) => `${p.catalog_id}x${p.quantity}`));
+    const all = LINK_REWARDS.filter(([id, q]) => !skip.has(id) && !kept.has(`${id}x${q}`)).map(([catalog_id, quantity]): LinkPrize => ({ catalog_id, quantity, received_for_level: 0 }));
+    const n = Math.min(PRIZE_POOL_SIZE - keep.length, all.length);
     for (let i = 0; i < n; i++) {
         const j = i + Math.floor(random() * (all.length - i));
         [all[i], all[j]] = [all[j], all[i]];
     }
-    return all.slice(0, n);
+    return [...keep, ...all.slice(0, n)];
 }
 
 export function ChestsReached(progress: number): number {
@@ -332,7 +333,8 @@ export function UnlockChests(pool: LinkPrize[], progress: number, random: () => 
 // player to rewardsGranted after the grant committed; a granted side is never touched again.
 export function SettleLink(row: SlayerLinkRow, me: string, progress: number, now: number, random: () => number, skip: Set<string>): { put?: SlayerLinkRow; grant?: LinkPrize[] } {
     if (row.status !== "LINKED" || !Involves(row, me) || row.rewardsGranted?.includes(me)) return {};
-    const drawn = row.prizePools?.[me] ?? DrawPrizePool(random, skip);
+    const old = row.prizePools?.[me];
+    const drawn = old && old.length >= PRIZE_POOL_SIZE ? old : DrawPrizePool(random, skip, old);
     const pool = UnlockChests(drawn, progress, random) ?? drawn;
     const put = pool !== row.prizePools?.[me] ? { ...row, prizePools: { ...row.prizePools, [me]: pool } } : undefined;
     return { put, grant: (row.endsAt ?? 0) <= now ? pool.filter((p) => p.received_for_level > 0) : undefined };

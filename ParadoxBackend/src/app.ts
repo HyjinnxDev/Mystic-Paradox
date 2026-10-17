@@ -251,6 +251,13 @@ Extension.http.mountRoutes(app);
 app.use("/", launcherGuardRouter);
 
 app.use((req, res) => {
+    // ponytail: capture probe for the unknown Trials run-submit contract (SubmitLeaderboardsInfo ->
+    // TrialsSolo/GroupEntryEndpoint). Remove once the real route exists.
+    if (String((req as OriginTaggedRequest).originHost ?? "").includes("leaderboard")) {
+        logger.warn(`[TrialsSubmitProbe] ${req.method} ${req.originalUrl} gsKey=${req.headers["x-mysticparadox-gameserver-apikey"] ? "Y" : "N"} type=${req.headers["content-type"] ?? ""} body=${JSON.stringify(req.body ?? null).slice(0, 8000)}`);
+        res.status(200).json({ code: null, message: "OK", payload: {} });
+        return;
+    }
     logger.warn(`Unstubbed route ${req.method} ${req.path}`)
 
     res.status(404);

@@ -20,9 +20,12 @@ import {
     AcceptInvite,
     LeaveParty,
     KickMember,
-    PromoteMember
+    PromoteMember,
+    GetPartyForPlayer
 } from "../controllers/party";
-import { GetPartyInstance, GetPlayerCandidate } from "../controllers/matchmaking";
+import { FindLateJoinOffer, GetPartyInstance, GetPlayerCandidate, GrantLateJoin } from "../controllers/matchmaking";
+import { sessionRegistry } from "../realtime/SessionRegistry";
+import { ValidateVoiceTicket } from "../voiceRelay";
 
 // mm2-prod party service. Shapes captured in
 // DauntlessEndpointDocumentation/Matchmaking/{GetParty,Party/*}.md. The response contract is
@@ -63,6 +66,53 @@ partyRouter.post("/party", HasParadoxBackendAuth, async (req: any, res) => {
         playerHuntId: Instance?.HuntId ?? null,
         playerStates: PlayerStates
     });
+});
+
+// Join-in-progress, for the client runtime's Join / Wait popup. The runtime has no game bearer token, so it
+// authenticates with the launcher's voice ticket (same identity the voice relay trusts).
+function TicketUserId(req: any): string | undefined {
+    const Ticket = req.headers["x-mystic-ticket"];
+    return typeof Ticket === "string" && Ticket.length > 0 ? ValidateVoiceTicket(Ticket) : undefined;
+}
+
+async function LateJoinContext(UserId: string) {
+    const Party = await GetPartyForPlayer(UserId);
+    if (Party == undefined || Party.members.length < 2) return undefined;
+    const Offer = await FindLateJoinOffer(UserId, Party.members, (Id) => sessionRegistry.isOnline(Id));
+    return Offer ? { Party, Offer } : undefined;
+}
+
+// GET /mystic/party/hunt-offer -> { offer: null } or { offer: { memberName, huntId, hpPct, players, blocked } }
+partyRouter.get("/mystic/party/hunt-offer", async (req: any, res) => {
+    const UserId = TicketUserId(req);
+    if (UserId == undefined) { res.status(401).json({}); return; }
+    const Context = await LateJoinContext(UserId);
+    if (Context == undefined) { res.status(200).json({ offer: null }); return; }
+    const { Offer } = Context;
+    res.status(200).json({
+        offer: {
+            memberName: await GetDisplayNameForUserId(Offer.MemberId),
+            huntId: Offer.Result.HuntId,
+            hpPct: Offer.State?.hpPct ?? -1,
+            players: Offer.State?.players ?? 0,
+            blocked: Offer.Blocked ?? null
+        }
+    });
+});
+
+// POST /mystic/party/join-hunt -> 200 { ok: true } or 409 { reason }
+partyRouter.post("/mystic/party/join-hunt", async (req: any, res) => {
+    const UserId = TicketUserId(req);
+    if (UserId == undefined) { res.status(401).json({}); return; }
+    const Context = await LateJoinContext(UserId);
+    const Reason = Context == undefined ? "NO_HUNT" : Context.Offer.Blocked;
+    if (Reason != undefined) {
+        logger.info(`[LateJoin] ${UserId} refused: ${Reason}`);
+        res.status(409).json({ reason: Reason });
+        return;
+    }
+    GrantLateJoin(UserId, Context!.Party.partyId, Context!.Offer);
+    res.status(200).json({ ok: true });
 });
 
 // PUT /party/invite — invite a player to my party (recipientPlayerId in body).

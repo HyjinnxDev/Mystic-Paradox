@@ -13,7 +13,7 @@
 import express from "express";
 import { matchmakingRouter } from "./routes/matchmaker.js";
 import { adminRouter } from "./routes/admin.js";
-import { GetPersistentHubStatus } from "./controllers/gameservers.js";
+import { GetHuntServerStatus, GetPersistentHubStatus } from "./controllers/gameservers.js";
 import { logger } from "./logger.js";
 import { GetRequestId, RequestContextMiddleware } from "./observability/requestContext.js";
 
@@ -33,6 +33,11 @@ app.get('/health/ready', (_req, res) => {
 // a serving one before handing its address to a client. Read-only; no state is changed here.
 app.get('/api/hub-status', (_req, res) => {
     res.status(200).json(GetPersistentHubStatus());
+});
+
+// Join-in-progress: null unless a ready, live hunt server holds the port; huntState is its last report.
+app.get('/api/hunt-status', (req, res) => {
+    res.status(200).json(GetHuntServerStatus(Number(req.query.port)));
 });
 
 // Staff dashboard reads (polled every few seconds), so ahead of the per-request logging below.

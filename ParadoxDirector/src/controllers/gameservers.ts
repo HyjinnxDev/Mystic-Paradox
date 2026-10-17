@@ -53,8 +53,20 @@ export type Gameserver = {
     state: "starting" | "ready" | "failed",
     launchId: string,
     logPath: string,
-    readyTime?: Date
+    readyTime?: Date,
+    // Hunt servers only: last MYSTICPARADOX_HUNT_STATE line (join-in-progress gate, see ParseHuntStateLine).
+    huntState?: HuntState
 };
+
+// hpPct: lowest live behemoth health percent, -1 before any behemoth exists. subState: EArchonInProgressGameSubState
+// (4 = EndOfHunt). players: connected player count. at: epoch ms the line arrived.
+export type HuntState = { hpPct: number, players: number, subState: number, at: number };
+
+export function ParseHuntStateLine(Line: string): Omit<HuntState, "at"> | undefined {
+    const Match = /^MYSTICPARADOX_HUNT_STATE hpPct=(-?\d+) players=(\d+) subState=(\d+)$/.exec(Line.trim());
+    if (!Match) return undefined;
+    return { hpPct: Number(Match[1]), players: Number(Match[2]), subState: Number(Match[3]) };
+}
 
 type ExpectedPlayer = {
     playerUid: string,
@@ -555,6 +567,19 @@ async function StartServer(Map: string, Behemoth: string | undefined, Matchmaker
 
     Gameservers.push(NewGameserver);
 
+    // Extra listener only: pipe(LogStream) stays the stream's consumer (see WaitForServerReady).
+    if (IsHunt) {
+        let Pending = "";
+        Child.stdout?.on("data", (Chunk: Buffer | string) => {
+            const Lines = (Pending + Chunk.toString()).split(/\r?\n/);
+            Pending = Lines.pop()!.slice(-4096);
+            for (const Line of Lines) {
+                const State = ParseHuntStateLine(Line);
+                if (State) NewGameserver.huntState = { ...State, at: Date.now() };
+            }
+        });
+    }
+
     try {
         await WaitForServerReady(Child, Id, Port, Label);
         NewGameserver.state = "ready";
@@ -616,6 +641,13 @@ export function GetPersistentHubStatus(){
         ramsgate: Describe(RamsgateHub.current),
         trainingDojo: Describe(TrainingHub.current)
     };
+}
+
+// Join-in-progress gate input for the backend: a live, ready hunt server's last reported state on Port.
+export function GetHuntServerStatus(Port: number){
+    const Server = Gameservers.find((S) => S.port === Port && !S.isRamsgate && !S.isTrainingDojo);
+    if (Server == undefined || Server.state !== "ready" || !IsProcessAlive(Server.processId)) return null;
+    return { port: Port, huntState: Server.huntState ?? null };
 }
 
 // [2026-10-10 1.14.7] Both getters check ready AND alive (the Training getter used to hand out a dead dojo's

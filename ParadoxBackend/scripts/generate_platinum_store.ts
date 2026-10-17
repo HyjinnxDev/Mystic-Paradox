@@ -17,10 +17,10 @@
  *      text and payload verbatim; their 2.1.1-era tags are discarded and remapped to (3).
  *
  * Two clearly separated tiers, so no reconstructed number is ever mistaken for recovered data:
- *   TIER A ("captured")      - baked id AND captured price/payload. Real Phoenix Labs pricing.
- *   TIER B ("reconstructed") - baked id, catalog-verified content, but no captured price. Priced by
- *                              the explicit RECONSTRUCTED_PRICES ladder below, anchored on tier A's
- *                              real values for the same content types.
+ *   TIER A ("captured") - baked id AND captured price/payload. Real Phoenix Labs pricing.
+ *   TIER B ("wiki")     - items the Dauntless wiki says the store sold on their own, at the wiki's price
+ *                         (game-data/wiki_store_prices.json from scripts/fetch_wiki_store_prices.cjs).
+ *   Hunt Pass rank skips without a capture are the only reconstructed prices ("reconstructed").
  *
  * Deliberately excluded, each for a stated reason:
  *   - `platformOfferId` SKUs (the `plat_1p_*` platinum packs): real-money first-party purchases this
@@ -96,32 +96,6 @@ const CATEGORY_TAGS = {
 
 type Category = keyof typeof CATEGORY_TAGS;
 
-// RECONSTRUCTED price ladder for tier B. Anchored on tier A's real captured platinum prices for the
-// same content types (dye 100, face paint 100, arrival emote 1000) and kept on the same round
-// 50/100 grid the captured data uses. This is an explicit product decision for this server, NOT a
-// claim about original Phoenix Labs pricing.
-const RECONSTRUCTED_PRICES: Record<Category, Partial<Record<number, number>> & { default: number }> = {
-    weapon_ac: { default: 800, 3: 500, 4: 800, 5: 1200 },
-    weapon_eb: { default: 800, 3: 500, 4: 800, 5: 1200 },
-    weapon_dp: { default: 800, 3: 500, 4: 800, 5: 1200 },
-    weapon_ih: { default: 800, 3: 500, 4: 800, 5: 1200 },
-    weapon_ga: { default: 800, 3: 500, 4: 800, 5: 1200 },
-    weapon_ms: { default: 800, 3: 500, 4: 800, 5: 1200 },
-    weapon_cb: { default: 800, 3: 500, 4: 800, 5: 1200 },
-    armour: { default: 600, 3: 400, 4: 600, 5: 800 },
-    lantern: { default: 600, 4: 600, 5: 800 },
-    dye: { default: 100 },
-    slayer: { default: 100 },
-    emote: { default: 500, 3: 300, 4: 500, 5: 700 },
-    emoji: { default: 200 },
-    arrival: { default: 1000 },
-    fabric: { default: 300 },
-    standard: { default: 400 },
-    flaresigil: { default: 250 },
-    glider: { default: 800 },
-    tonics: { default: 100 },
-    boosts: { default: 100 },
-};
 
 const EXCLUDED_CATALOG_TAGS = new Set(["deprecated", "hidden", "wip", "initial", "founder", "translator", "mastery", "partner"]);
 const DECODABLE_ROW_PREFIXES = ["sku_", "single_", "contract_"] as const;
@@ -278,7 +252,7 @@ function CategoryForCatalogId(CatalogId: string): Category | undefined {
     if (CatalogId.startsWith("EJ_")) return "emoji";
     if (CatalogId.startsWith("BNC_FABRIC")) return "fabric";
     if (CatalogId.startsWith("BNC_STANDARD")) return "standard";
-    if (CatalogId.startsWith("BNC_SIGIL") || CatalogId.startsWith("BNC_ANIMATION") || CatalogId.startsWith("FL_")) return "flaresigil";
+    if (CatalogId.startsWith("BNC_SIGIL") || CatalogId.startsWith("BNC_ANIMATION") || CatalogId.startsWith("FL_") || CatalogId.startsWith("QI_FLARE")) return "flaresigil";
     if (CatalogId.startsWith("GD_")) return "glider";
     if (CatalogId.startsWith("QI_")) return "tonics";
     return undefined;
@@ -502,50 +476,75 @@ for (const Sku of ReadCapture("huntpass_store.json")) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// TIER B - baked 1.12 SKU ids with catalog-verified content and a RECONSTRUCTED price.
+// TIER B ("wiki") - the items the Dauntless wiki says the store sold on their own, at that price
+// (game-data/wiki_store_prices.json, scripts/fetch_wiki_store_prices.cjs). Nothing else is sold: hunt pass, Rumour
+// and free items are not store items. The SKU id is the client's baked row for the item when it has one (native tile
+// art), otherwise `sku_<catalog id>` with the injected catalog icon.
+// Armour whose every piece page names the same price of 1,000+ was sold as a whole set (Defender's 1,600, Ramsguard
+// Scout's 2,000): those pieces are one set offer at that price.
 // ---------------------------------------------------------------------------------------------
+type WikiPrice = { price: number; page: string };
+const WikiPrices = JSON.parse(fs.readFileSync(path.join(DataDir, "wiki_store_prices.json"), "utf8")) as Record<string, WikiPrice>;
+const RowForCatalogId = new Map<string, string>();
 for (const RowName of [...BakedRows.keys()].sort()) {
-    if (ClaimedSkuIds.has(RowName)) continue;
-    if (!DECODABLE_ROW_PREFIXES.some((Prefix) => RowName.startsWith(Prefix))) { Skip("tierB: row family is a bundle/quest/pass, not a single decodable offer"); continue; }
-
-    const Baked = BakedRows.get(RowName)!;
-    if ((Baked.standardImage ?? "None") === "None" && (Baked.featureImage ?? "None") === "None") { Skip("tierB: baked row has no artwork"); continue; }
-
+    if (!DECODABLE_ROW_PREFIXES.some((Prefix) => RowName.startsWith(Prefix))) continue;
     const CatalogId = DecodeRowNameToCatalogId(RowName);
-    if (CatalogId == undefined) { Skip("tierB: row name does not decode to a 1.12 catalog id"); continue; }
-    if (AlreadySold.has(CatalogId)) { Skip("tierB: overlaps Lady Luck / Reward Cache"); continue; }
-    if (ClaimedCatalogIds.has(CatalogId)) { Skip("tierB: catalog id already sold by another platinum SKU"); continue; }
-    if (!IsGrantable(CatalogId)) { Skip("tierB: excluded catalog content"); continue; }
-    if (QuestEarned.has(CatalogId)) { Skip("tierB: quest/Rumour-earned"); continue; }
-    if (!HasResolvedName(CatalogId)) { Skip("tierB: unresolved display name"); continue; }
+    if (CatalogId && !RowForCatalogId.has(CatalogId)) RowForCatalogId.set(CatalogId, RowName);
+}
 
-    const Category = CategoryForCatalogId(CatalogId);
-    if (Category == undefined) { Skip("tierB: content type has no 1.12 store tab"); continue; }
+const SetKey = (CatalogId: string) => CatalogId.startsWith("AR_") ? CatalogId.replace(/_(HELM|CHEST|ARMS|LEGS)(?=_|$)/, "_SET") : undefined;
+const Offers: { id: string; name: string; catalogIds: string[]; price: number }[] = [];
+const SetPieces = new Map<string, string[]>();
+for (const [CatalogId, Wiki] of Object.entries(WikiPrices)) {
+    const Key = Wiki.price >= 1000 ? SetKey(CatalogId) : undefined;
+    if (Key) SetPieces.set(`${Key}:${Wiki.price}`, [...(SetPieces.get(`${Key}:${Wiki.price}`) ?? []), CatalogId]);
+}
+const InSet = new Set<string>();
+for (const [KeyPrice, Pieces] of SetPieces) {
+    if (Pieces.length < 2) continue;
+    Pieces.sort();
+    Pieces.forEach((Id) => InSet.add(Id));
+    const Names = Pieces.map((Id) => Catalog.get(Id)?.displayName ?? Id);
+    const Words = Names[0].split(" ");
+    const Common = Words.filter((Word, I) => Names.every((Name) => Name.split(" ")[I] === Word)).join(" ");
+    Offers.push({ id: `sku_${KeyPrice.split(":")[0].toLowerCase()}`, name: `${Common || Names[0]} Set`, catalogIds: Pieces, price: Number(KeyPrice.split(":")[1]) });
+}
+for (const [CatalogId, Wiki] of Object.entries(WikiPrices)) {
+    if (InSet.has(CatalogId)) continue;
+    Offers.push({ id: RowForCatalogId.get(CatalogId) ?? `sku_${CatalogId.toLowerCase()}`, name: Catalog.get(CatalogId)?.displayName ?? CatalogId, catalogIds: [CatalogId], price: Wiki.price });
+}
 
-    const Row = Catalog.get(CatalogId)!;
-    const Rarity = RarityOf(CatalogId);
-    const Ladder = RECONSTRUCTED_PRICES[Category];
-    const Price = Ladder[Rarity] ?? Ladder.default;
+for (const Offer of Offers) {
+    if (ClaimedSkuIds.has(Offer.id)) { Skip("wiki: sku id already emitted"); continue; }
+    if (Offer.catalogIds.some((Id) => AlreadySold.has(Id))) { Skip("wiki: overlaps Lady Luck / Reward Cache"); continue; }
+    if (Offer.catalogIds.some((Id) => ClaimedCatalogIds.has(Id))) { Skip("wiki: catalog id already sold by another platinum SKU"); continue; }
+    if (!Offer.catalogIds.every(IsGrantable)) { Skip("wiki: excluded catalog content"); continue; }
+    if (Offer.catalogIds.some((Id) => QuestEarned.has(Id))) { Skip("wiki: quest/Rumour-earned"); continue; }
+    if (!Offer.catalogIds.every(HasResolvedName)) { Skip("wiki: unresolved display name"); continue; }
 
-    const Images = ResolveImages(RowName, [CatalogId]);
-    if (Images == undefined) { Skip("tierB: no artwork resolved"); continue; }
+    const Category = CategoryForCatalogId(Offer.catalogIds[0]);
+    if (Category == undefined) { Skip("wiki: content type has no 1.12 store tab"); continue; }
 
+    const Images = ResolveImages(Offer.id, Offer.catalogIds);
+    if (Images == undefined) { Skip("wiki: no artwork resolved"); continue; }
+
+    const Rarity = Math.max(...Offer.catalogIds.map(RarityOf));
     const SectionTags = Category === "dye" ? [SECTION_WEBSTORE, SECTION_DYES] : [SECTION_WEBSTORE];
-    ClaimedSkuIds.add(RowName);
-    ClaimedCatalogIds.add(CatalogId);
+    ClaimedSkuIds.add(Offer.id);
+    Offer.catalogIds.forEach((Id) => ClaimedCatalogIds.add(Id));
 
     Output.push({
-        id: RowName,
-        displayName: Row.displayName ?? CatalogId,
-        displayDescription: Row.description ?? "",
+        id: Offer.id,
+        displayName: Offer.name,
+        displayDescription: Offer.catalogIds.length === 1 ? Catalog.get(Offer.catalogIds[0])?.description ?? "" : `Includes ${Offer.catalogIds.map((Id) => Catalog.get(Id)?.displayName ?? Id).join(", ")}.`,
         displayPriority: 1000,
-        prices: [{ currencyId: CURRENCY_ID, price: Price }],
+        prices: [{ currencyId: CURRENCY_ID, price: Offer.price }],
         // Cosmetic ownership unlocks are one-time; consumables restock.
         maxAllowed: Category === "tonics" || Category === "boosts" ? null : 1,
         images: Images,
-        tags: [...SectionTags, CATEGORY_TAGS[Category], "platinum_store_reconstructed", `platinum_store_rarity_${Rarity}`],
-        items: [{ catalogId: CatalogId, quantity: 1, instanced: IsInstanced(CatalogId) }],
-        duplicateInstancedItems: DuplicateInstancedItemsFor([CatalogId]),
+        tags: [...SectionTags, CATEGORY_TAGS[Category], "platinum_store_wiki", `platinum_store_rarity_${Rarity}`],
+        items: Offer.catalogIds.map((Id) => ({ catalogId: Id, quantity: 1, instanced: IsInstanced(Id) })),
+        duplicateInstancedItems: DuplicateInstancedItemsFor(Offer.catalogIds),
     });
 }
 
@@ -564,12 +563,13 @@ fs.writeFileSync(OutputPath, JSON.stringify(Output, null, 2) + "\n", "utf8");
 // ---------------------------------------------------------------------------------------------
 const Captured = Output.filter((Sku) => Sku.tags.includes("platinum_store_captured"));
 const Reconstructed = Output.filter((Sku) => Sku.tags.includes("platinum_store_reconstructed"));
+const FromWiki = Output.filter((Sku) => Sku.tags.includes("platinum_store_wiki"));
 const BySection = new Map<string, number>();
 for (const Section of [SECTION_WEBSTORE, SECTION_DYES, SECTION_RANK_SKIP, SECTION_HUNTPASS]) {
     BySection.set(Section, Output.filter((Sku) => Sku.tags.includes(Section)).length);
 }
 
-console.log(`platinum_store.json: ${Output.length} SKUs (${Captured.length} captured price, ${Reconstructed.length} reconstructed price)`);
+console.log(`platinum_store.json: ${Output.length} SKUs (${Captured.length} captured price, ${FromWiki.length} wiki price, ${Reconstructed.length} reconstructed price)`);
 console.log(`  sections: ${[...BySection].map(([Section, Count]) => `${Section}=${Count}`).join(" ")}`);
 console.log(`  payloads: items=${Output.filter((S) => S.items.length > 0).length} entitlements=${Output.filter((S) => (S.entitlements ?? []).length > 0).length} progression=${Output.filter((S) => S.skuProgression).length}`);
 for (const Tag of Object.values(CATEGORY_TAGS)) {

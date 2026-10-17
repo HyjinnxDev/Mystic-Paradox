@@ -34,7 +34,7 @@ export interface CardText { title: string; motd: string }
 
 const COLLECTION = "launcher_card";
 const DOC_ID = "card";
-const MAX_LOGO_BYTES = 512 * 1024;
+const MAX_LOGO_BYTES = 2 * 1024 * 1024;
 export const MAX_TITLE = 48;
 export const MAX_MOTD = 300;
 
@@ -148,7 +148,7 @@ launcherCardRouter.put("/admin/v1/launcher-card/logo", ...Owner,
     (req: Request, res: Response) => Wrap(res, async () => {
         const Data = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
         const Type = LogoType(Data);
-        if (!Type) { res.status(400).json({ error: { code: "CARD_LOGO", message: "Use a PNG, JPEG or WebP image up to 512 KB." } }); return; }
+        if (!Type) { res.status(400).json({ error: { code: "CARD_LOGO", message: "Use a PNG, JPEG or WebP image up to 2 MB." } }); return; }
         await Save({ logo: Data, logoType: Type });
         await Audit(req, "launcher.card.logo", { type: Type, bytes: Data.length });
         res.json(PublicCard(await Card()));
@@ -163,11 +163,11 @@ launcherCardRouter.delete("/admin/v1/launcher-card/logo", ...Owner, (req: Reques
 // The invite for this server (launcher format, src/shared/invite.ts there) and its clickable https link.
 // The host is whatever players reach this server at (a Tailscale address or a public name), so the owner
 // names it; the fingerprint and the code come from this backend's own certificate and LAUNCHER_INVITE_CODES.
-export const JOIN_PAGE = "https://hyjinnxdev.github.io/dauntless-forever-1147-releases/join/";
+export const JOIN_PAGE = "https://hyjinnxdev.github.io/dauntless-revamped-releases/join/";
 
 export function InviteFor(host: string, port: number, fp: string, code: string, name: string): { invite: string; link: string } {
     const Query = ["v=1", `host=${encodeURIComponent(host)}`, `port=${port}`, `fp=${fp}`, `code=${encodeURIComponent(code)}`, `name=${encodeURIComponent(name)}`].join("&");
-    return { invite: `dauntless-forever-1147://join?${Query}`, link: `${JOIN_PAGE}#${Query}` };
+    return { invite: `dauntless-revamped://join?${Query}`, link: `${JOIN_PAGE}#${Query}` };
 }
 
 launcherCardRouter.get("/admin/v1/launcher-card/invite", ...Owner, (req: Request, res: Response) => Wrap(res, async () => {

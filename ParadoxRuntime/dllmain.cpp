@@ -4800,6 +4800,7 @@ static void MpSuppressPhantomReplication();            // [1.14.7 phantom-pawn s
 static void MpNetIdContractProbe();                    // [1.14.7 genuine net-id contract probe]
 static void MpCaptureGenuineNetIdType();               // [1.14.7 synthetic net-id type capture]
 static void MpVoiceProximityTick();                    // [1.14.7 hub proximity voice reports]
+static void MpHuntJoinTick();                          // [join-in-progress rescale + hunt state report]
 static bool IsClientRolePumpPossessionStable(UObject* PC, UObject** OutPawn);
 static void TickFrankDroneClientDiag(void* Pawn, const char* Trigger);
 static std::string FrankDroneGateSummary(void* PlayerRole);
@@ -5120,11 +5121,20 @@ struct Ref {
     }
 };
 
-static Ref s_PC, s_Bar, s_Label, s_BarClass, s_TextClass, s_Target;
-static std::vector<Ref> s_Behemoths;
-static std::unordered_map<SDK::UObject*, float> s_LastHp;
-static std::wstring s_LastText;
-static bool s_Shown = false, s_InTraining = false;
+// Several behemoths at once (events): one row per behemoth, stacked upward from kPosY. Rows are fixed widgets;
+// s_Tracked[i] is shown on row i, so when one leaves the ones above drop down a row.
+constexpr int kMaxBars = 4;                                               // ponytail: more in range wait for a free row
+constexpr float kRowPitch = kBarH + kTextSize * 1.35f - kTextOverlap + 8.f;
+struct Row {
+    Ref Bar, Label;
+    std::wstring LastText;
+    bool Shown = false;
+};
+static Row s_Rows[kMaxBars];
+static Ref s_PC, s_BarClass, s_TextClass;
+static std::vector<Ref> s_Behemoths, s_Tracked;
+static std::unordered_set<SDK::UObject*> s_Logged;
+static bool s_InTraining = false;
 static ULONGLONG s_NextUpdate = 0, s_NextScan = 0, s_NextCreate = 0;
 static int s_Logs = 0;
 static volatile bool s_Faulted = false;
@@ -5201,7 +5211,7 @@ static void Place(SDK::UUserWidget* W, float X, float Y, float Width, float Heig
     W->SetAlignmentInViewport(Alignment);
 }
 
-static bool Create(SDK::APlayerController* PC) {
+static bool Create(SDK::APlayerController* PC, Row& R, float PosY) {
     SDK::UClass* BarCls = LoadClass(s_BarClass, L"/Game/UI/EndOfHunt/StackableProgressBar.StackableProgressBar_C");
     SDK::UClass* TextCls = LoadClass(s_TextClass, L"/Game/UI/Chat/w_chat_log_label_bpw.w_chat_log_label_bpw_C");
     if (!BarCls || !TextCls) {
@@ -5244,9 +5254,9 @@ static bool Create(SDK::APlayerController* PC) {
     Bar->AddToViewport(997);
     Bar->StopAllAnimations();
     Fill->SetFillColorAndOpacity(kFill);
-    Place(Bar, 0.f, kPosY, kWidth, kBarH, SDK::FVector2D{ 0.5f, 1.f });
+    Place(Bar, 0.f, PosY, kWidth, kBarH, SDK::FVector2D{ 0.5f, 1.f });
     Fill->SetPercent(1.f);
-    s_Bar.Set(Bar);
+    R.Bar.Set(Bar);
 
     auto* Label = static_cast<SDK::Uw_chat_log_label_bpw_C*>(SDK::UWidgetBlueprintLibrary::Create(PC, TextCls, PC));
     if (Label && Label->ChatLogLabelTextBlock) {
@@ -5272,24 +5282,28 @@ static bool Create(SDK::APlayerController* PC) {
         Label->AddToViewport(1000);
         Tb->SetJustification(SDK::ETextJustify::Left);
         // label's bottom-left sits on the bar's top-left, dipping into it
-        Place(Label, -kWidth / 2.f + kTextIndent, kPosY - kBarH + kTextOverlap, kWidth, kTextSize * 1.35f,
+        Place(Label, -kWidth / 2.f + kTextIndent, PosY - kBarH + kTextOverlap, kWidth, kTextSize * 1.35f,
             SDK::FVector2D{ 0.f, 1.f });
-        s_Label.Set(Label);
+        R.Label.Set(Label);
     } else {
         Log("CreateWidget(w_chat_log_label_bpw) returned " + MpPtr(Label) + " - bar without number");
     }
-    s_LastText.clear();
-    s_Shown = true;
-    Log("bar created for " + PC->GetFullName());
+    R.LastText.clear();
+    R.Shown = true;
+    Log("bar created at y=" + std::to_string(PosY) + " for " + PC->GetFullName());
     return true;
 }
 
-static void SetShown(bool Show) {
-    if (s_Shown == Show) return;
-    s_Shown = Show;
+static void SetShown(Row& R, bool Show) {
+    if (R.Shown == Show) return;
+    R.Shown = Show;
     const auto Vis = Show ? SDK::ESlateVisibility::HitTestInvisible : SDK::ESlateVisibility::Collapsed;
-    if (auto* Bar = s_Bar.Get<SDK::UUserWidget>()) Bar->SetVisibility(Vis);
-    if (auto* Label = s_Label.Get<SDK::UUserWidget>()) Label->SetVisibility(Vis);
+    if (auto* Bar = R.Bar.Get<SDK::UUserWidget>()) Bar->SetVisibility(Vis);
+    if (auto* Label = R.Label.Get<SDK::UUserWidget>()) Label->SetVisibility(Vis);
+}
+
+static void HideRows(int From) {
+    for (int i = From; i < kMaxBars; ++i) SetShown(s_Rows[i], false);
 }
 
 static void Update() {
@@ -5307,18 +5321,17 @@ static void Update() {
     if (!PC) return;
     if (PC != s_PC.Get()) {                    // new world: the old widgets went with the old one
         s_PC.Set(PC);
-        s_Bar.Set(nullptr);
-        s_Label.Set(nullptr);
-        s_Target.Set(nullptr);
+        for (Row& R : s_Rows) R = Row{};
         s_Behemoths.clear();
-        s_LastHp.clear();
+        s_Tracked.clear();
+        s_Logged.clear();
         s_NextScan = s_NextCreate = 0;
         // training grounds dummies are behemoths too; no bar there (world name = map package, training_dojo_persistent)
         s_InTraining = World->GetName().find("training_dojo") != std::string::npos;
         if (s_InTraining) Log("training grounds - bar off");
     }
     if (s_InTraining) return;
-    if (g_MpHudHidden) { SetShown(false); return; }
+    if (g_MpHudHidden) { HideRows(0); return; }
 
     if (Now >= s_NextScan) {
         s_NextScan = Now + kScanMs;
@@ -5330,59 +5343,65 @@ static void Update() {
         }
     }
 
-    // Only behemoths near the player count (none during the arrival intro): in range within kShowRange, and the
-    // one already shown stays until kHideRange. Of those: the one damaged last; else the shown one; else the nearest.
+    // Only behemoths near the player count (none during the arrival intro): a new one joins within kShowRange
+    // (nearest first), a tracked one stays until kHideRange or death. Tracked order = arrival order = row order.
     SDK::APawn* Pawn = PC->Pawn;
-    if (!Pawn) { SetShown(false); return; }
+    if (!Pawn) { HideRows(0); return; }
     const SDK::FVector Me = Pawn->K2_GetActorLocation();
-    SDK::AArchonBehemoth* Current = s_Target.Get<SDK::AArchonBehemoth>();
-    SDK::AArchonBehemoth *Damaged = nullptr, *Nearest = nullptr;
-    float DamagedHp = 0.f, DamagedMax = 0.f, CurHp = 0.f, CurMax = 0.f, NearHp = 0.f, NearMax = 0.f;
-    float NearDist = 1e30f;
+    struct Live { SDK::AArchonBehemoth* B; float Hp, Max, Dist; };
+    std::vector<Live> Near;
     for (const Ref& R : s_Behemoths) {
         auto* B = R.Get<SDK::AArchonBehemoth>();
         float Hp = 0.f, Max = 0.f;
         if (!B || !ReadHealth(B, Hp, Max)) continue;
-        auto It = s_LastHp.find(B);
-        if (It == s_LastHp.end()) Log(B->GetFullName() + " hp=" + std::to_string(Hp) + " max=" + std::to_string(Max));
-        const bool WasHit = It != s_LastHp.end() && Hp < It->second - 0.01f;
-        s_LastHp[B] = Hp;
+        if (s_Logged.insert(B).second) Log(B->GetFullName() + " hp=" + std::to_string(Hp) + " max=" + std::to_string(Max));
         if (Hp <= 0.f) continue;
         const SDK::FVector At = B->K2_GetActorLocation();
         const float Dx = At.X - Me.X, Dy = At.Y - Me.Y, Dz = At.Z - Me.Z;
         const float Dist = std::sqrt(Dx * Dx + Dy * Dy + Dz * Dz);
-        if (Dist > (B == Current ? kHideRange : kShowRange)) continue;
-        if (WasHit) { Damaged = B; DamagedHp = Hp; DamagedMax = Max; }
-        if (B == Current) { CurHp = Hp; CurMax = Max; }
-        if (Dist < NearDist) { Nearest = B; NearDist = Dist; NearHp = Hp; NearMax = Max; }
+        if (Dist <= kHideRange) Near.push_back(Live{ B, Hp, Max, Dist });
     }
-    SDK::AArchonBehemoth* Target = Damaged;
-    float TargetHp = DamagedHp, TargetMax = DamagedMax;
-    if (!Target && CurHp > 0.f) { Target = Current; TargetHp = CurHp; TargetMax = CurMax; }
-    if (!Target && Nearest) { Target = Nearest; TargetHp = NearHp; TargetMax = NearMax; }
-    s_Target.Set(Target);
+    auto Find = [&](SDK::UObject* B) -> const Live* {
+        for (const Live& L : Near) if (L.B == B) return &L;
+        return nullptr;
+    };
+    std::erase_if(s_Tracked, [&](const Ref& T) { return !Find(T.Get()); });
+    std::sort(Near.begin(), Near.end(), [](const Live& A, const Live& B) { return A.Dist < B.Dist; });
+    for (const Live& L : Near) {
+        if (static_cast<int>(s_Tracked.size()) >= kMaxBars) break;
+        if (L.Dist > kShowRange) break;
+        if (std::none_of(s_Tracked.begin(), s_Tracked.end(), [&](const Ref& T) { return T.Get() == L.B; })) {
+            s_Tracked.emplace_back().Set(L.B);
+        }
+    }
 
-    if (!Target) { SetShown(false); return; }
-    if (!s_Bar.Get()) {
-        if (Now < s_NextCreate) return;
-        s_NextCreate = Now + kRetryMs;
-        if (!Create(PC)) return;
-    }
-    SetShown(true);
-    auto* Bar = s_Bar.Get<SDK::UStackableProgressBar_C>();
-    if (!Bar) return;
-    float Pct = TargetHp / TargetMax;
-    Pct = Pct < 0.f ? 0.f : (Pct > 1.f ? 1.f : Pct);
-    // compared with the widget's own value, so anything else moving the fill gets put back
-    if (Bar->ProgressBarComponent && std::fabs(Pct - Bar->ProgressBarComponent->Percent) >= 0.0005f) {
-        Bar->ProgressBarComponent->SetPercent(Pct);
-    }
-    std::wstring Text = Commas(std::ceil(TargetHp)) + L"/" + Commas(std::floor(TargetMax + 0.5f));
-    auto* Label = s_Label.Get<SDK::Uw_chat_log_label_bpw_C>();
-    if (Label && Label->ChatLogLabelTextBlock && Text != s_LastText) {
-        Label->ChatLogLabelTextBlock->SetText(SDK::UKismetTextLibrary::Conv_StringToText(SDK::FString(Text.c_str())));
-        s_LastText = Text;
-        Log("shows " + std::string(Text.begin(), Text.end()));
+    const int Count = static_cast<int>(s_Tracked.size());
+    HideRows(Count);
+    for (int i = 0; i < Count; ++i) {
+        const Live* T = Find(s_Tracked[i].Get());
+        Row& R = s_Rows[i];
+        if (!R.Bar.Get()) {
+            if (Now < s_NextCreate) return;
+            s_NextCreate = Now + kRetryMs;
+            if (!Create(PC, R, kPosY - i * kRowPitch)) return;
+            s_NextCreate = 0;                  // next row may build this same tick
+        }
+        SetShown(R, true);
+        auto* Bar = R.Bar.Get<SDK::UStackableProgressBar_C>();
+        if (!Bar) continue;
+        float Pct = T->Hp / T->Max;
+        Pct = Pct < 0.f ? 0.f : (Pct > 1.f ? 1.f : Pct);
+        // compared with the widget's own value, so anything else moving the fill gets put back
+        if (Bar->ProgressBarComponent && std::fabs(Pct - Bar->ProgressBarComponent->Percent) >= 0.0005f) {
+            Bar->ProgressBarComponent->SetPercent(Pct);
+        }
+        std::wstring Text = Commas(std::ceil(T->Hp)) + L"/" + Commas(std::floor(T->Max + 0.5f));
+        auto* Label = R.Label.Get<SDK::Uw_chat_log_label_bpw_C>();
+        if (Label && Label->ChatLogLabelTextBlock && Text != R.LastText) {
+            Label->ChatLogLabelTextBlock->SetText(SDK::UKismetTextLibrary::Conv_StringToText(SDK::FString(Text.c_str())));
+            R.LastText = Text;
+            Log("row " + std::to_string(i) + " shows " + std::string(Text.begin(), Text.end()));
+        }
     }
 }
 
@@ -5742,6 +5761,7 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
     MpSuppressPhantomReplication();
     MpDriveReplicationGraph(DeltaTime);
     if (Globals::AmServer) MpVoiceProximityTick();
+    if (Globals::AmServer) MpHuntJoinTick();
 
     // [2026-07-20] Server-side skeletal pose/socket fix (FORCE_SERVER_MESH_POSE.flag). Server-only; the
     // helper self-throttles + no-ops unless the flag is present. See its definition above.
@@ -12449,35 +12469,6 @@ static void MpServerProjectileTickFix(UObject* Object, const std::string& Functi
     if (s_logged.fetch_add(1) < 20) MpLog("[ProjTickFix] enabled tick on " + SafeObjectNameForDiagnostic(Object));
 }
 
-// [1.14.7 2026-10-16 PANGAR ROLL PROBE] Pangar's (mcrollin) roll does no damage to players. Read-only, server only:
-// logs [RollProbe] for each distinct UFunction reaching ProcessEvent on an object whose class (or whose outer's class)
-// contains "mcrollin" (first 20 per function), and any *Damage* UFunction (first 200 each), with actor tick state at BeginPlay, to see what the roll runs and
-// whether something it spawns has tick off like the projectile bug. DISABLE_ROLL_PROBE.flag (beside the exe) turns it off.
-static void MpPangarRollProbe(UObject* Object, const std::string& FunctionName) {
-    static const bool s_on = Globals::AmServer && !MpExeRelativeFlagPresent(L"DISABLE_ROLL_PROBE.flag");
-    if (!s_on || !Object || !Object->Class) return;
-    static std::unordered_map<SDK::UClass*, bool> s_classMatch;
-    auto Matches = [](SDK::UClass* C) {
-        auto It = s_classMatch.find(C);
-        if (It != s_classMatch.end()) return It->second;
-        std::string N = C->GetName();
-        for (auto& ch : N) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
-        return s_classMatch[C] = N.find("mcrollin") != std::string::npos;
-    };
-    const bool IsDamage = FunctionName.find("Damage") != std::string::npos;
-    bool Hit = IsDamage || Matches(Object->Class);
-    if (!Hit && Object->Outer && Object->Outer->Class) Hit = Matches(Object->Outer->Class);
-    if (!Hit) return;
-    static std::unordered_map<std::string, int> s_seen;
-    static int s_total = 0;
-    if (s_seen[FunctionName]++ >= (IsDamage ? 200 : 20) || ++s_total > 5000) return;
-    std::string Line = "[RollProbe] " + FunctionName + " obj=" + SafeObjectNameForDiagnostic(Object);
-    static SDK::UClass* s_ActorClass = SDK::AActor::StaticClass();
-    if (FunctionName.find(".ReceiveBeginPlay") != std::string::npos && s_ActorClass && Object->IsA(s_ActorClass))
-        Line += std::string(" tickEnabled=") + (static_cast<SDK::AActor*>(static_cast<void*>(Object))->IsActorTickEnabled() ? "1" : "0");
-    MpLog(Line);
-}
-
 // [1.14.7 2026-10-15 COIN TOSS PROBE] Ramsgate coin toss (coin_toss_interact_bp) does nothing: the backend has no
 // offer for UArchonActivitiesProgressionComponent::ClaimDailyBonus's store query. Read-only: logs [CoinToss] for
 // every coin toss / activities-progression UFunction reaching ProcessEvent, the store query and purchase results,
@@ -12590,6 +12581,9 @@ static void MpHuntPassProbe(UObject* Object, const std::string& FunctionName) {
 
 // Set when our own hunt arrival cinematic ends; reset at every LoadMap. See [PartyDropIn].
 static bool s_LocalArrivalDone = false;
+// Remote arrival triggers that reached us after our own arrival ended (a party member dropping in mid-hunt).
+// Every call on them and on their dynamic_cinematic_component_bp is skipped; cleared at every LoadMap.
+static std::unordered_set<const void*> s_MutedArrivalTriggers;
 
 // [1.14.7 2026-10-15] Talking icons for our own voice (Voice.cpp); the game's EOS voice that fed them is dead.
 //  - The game's own voip icons (UVoipChatStateAsset: party HUD names, social panel) show Speaking while that player
@@ -12810,11 +12804,19 @@ static void Tick() {
 // Keys (GetAsyncKeyState, only while the game window is in front and the menu is not taking typed text):
 //   F8 camera on/off (tripod/path: back to free)   F9 hide HUD (also without the camera)   F10 menu
 //   Free: WASD move, E/Space up, Q/Ctrl down, Shift fast, Alt slow, mouse look, wheel zoom, Z/X roll, R reset zoom+roll
-//   T tripod (camera stays put, you play your character)   Y aim at my character (tripod/path)
+//   T tripod (camera stays put, you play your character)   F follow the target   Y aim at the target (tripod/path)
+//   G framing guides
 //   K add keyframe   J remove last   L play the keyframe path (you play your character while it runs)
-// Free mode blocks all game input (no menus, chat, attacks); camera keys work only there. Tripod and path give the
-// game its input back and only F8, F9 and F10 stay ours.
+// Free mode blocks all game input (no menus, chat, attacks); camera keys work only there. Tripod, follow and path
+// give the game its input back and only F8, F9 and F10 stay ours.
+// The target (me, the nearest behemoth, another player) is what tracking aims at, follow rides along with and
+// auto focus focuses on. Camera shake is added on top of the smoothed pose, never into keyframes.
+// Keyframes carry focus distance too (focus pulls); each key picks how it moves to the next (smooth/linear/hold).
+// Photo = the engine's HighResShot (no HUD, no menu); files land in Archon\Saved\Screenshots.
 // Settings persist in CINECAM.ini beside the exe, saved shots in CINECAM_shots\. DISABLE_CINECAM.flag turns it off.
+// Owner accounts only: the local player's name must carry the backend's "[Owner] " tag (login.ts
+// GetDisplayNameForUserId; usernames are alphanumeric, so nobody else can type it). Anyone else: every key, the
+// menu and the guides stay off. Fails closed while the player state or its name is not there yet.
 // Log tag [CineCam].
 // ponytail: fixed keys, no gamepad; path speed between keys follows key times (use "Even out speed").
 namespace CineCam {
@@ -12825,7 +12827,9 @@ constexpr float kDeg = 3.14159265f / 180.f;
 
 static Mode s_Mode = Mode::Off;
 static Pose s_Target, s_Cam;               // where the controls want the camera / where it is (smoothed)
-static float s_PathT = 0.f, s_StartFov = 70.f;
+static float s_PathT = 0.f, s_StartFov = 70.f, s_ShakeT = 0.f, s_CountT = 0.f, s_DollyW = 0.f;
+static bool s_Dolly = false;               // dolly zoom: FOV keeps s_DollyW (cm across the frame) at the target
+static float s_FollowOff[3] = {};          // follow: camera minus target (target-yaw space when FollowLocal)
 static bool s_Front = false, s_KeysOn = false, s_Blocking = false, s_CursorShown = false, s_RmbLook = false, s_RmbWas = false;
 static bool s_ReopenMenu = false, s_Toasted = false, s_MenuWarned = false;
 static int s_Logs = 0;
@@ -12864,6 +12868,12 @@ static const IniField kIni[] = {
     CINE_INI(Saturation, 'f'), CINE_INI(Contrast, 'f'), CINE_INI(Split, 'f'), CINE_INI(Vignette, 'f'),
     CINE_INI(Grain, 'f'), CINE_INI(Fringe, 'f'), CINE_INI(Bloom, 'f'), CINE_INI(Loop, 'b'), CINE_INI(Ease, 'b'),
     CINE_INI(ShowPath, 'b'), CINE_INI(HideMenuOnPlay, 'b'), CINE_INI(Spacing, 'f'),
+    CINE_INI(Guides, 'b'), CINE_INI(GuidesHideOnPlay, 'b'), CINE_INI(GPhi, 'b'), CINE_INI(GCenter, 'b'),
+    CINE_INI(GDiagonals, 'b'), CINE_INI(GSafe, 'b'), CINE_INI(GHorizon, 'b'), CINE_INI(GCrop, 'i'),
+    CINE_INI(GSocial, 'i'), CINE_INI(GCropMask, 'f'), CINE_INI(GOpacity, 'f'),
+    CINE_INI(AimZ, 'f'), CINE_INI(FrameX, 'f'), CINE_INI(FrameY, 'f'), CINE_INI(FollowLocal, 'b'),
+    CINE_INI(Shake, 'i'), CINE_INI(ShakeAmt, 'f'), CINE_INI(ShakeFreq, 'f'), CINE_INI(Target, 'i'),
+    CINE_INI(PlaySpeed, 'f'), CINE_INI(Countdown, 'b'), CINE_INI(PhotoScale, 'i'),
 };
 #undef CINE_INI
 
@@ -12890,6 +12900,14 @@ static void Load(Settings& S) {
     S.Aspect = (std::clamp)(S.Aspect, 0, static_cast<int>(std::size(kAspects)) - 1);
     S.Dof = (std::clamp)(S.Dof, 0, 2);
     S.Preset = (std::max)(S.Preset, 0);
+    S.GCrop &= (1 << std::size(kCrops)) - 1;
+    S.GSocial = (std::clamp)(S.GSocial, 0, static_cast<int>(std::size(kSocial)));
+    S.GCropMask = Clamp(S.GCropMask, 0.f, 0.9f); S.GOpacity = Clamp(S.GOpacity, 0.05f, 1.f);
+    S.Shake = (std::clamp)(S.Shake, 0, static_cast<int>(std::size(kShakes)) - 1);
+    S.FrameX = Clamp(S.FrameX, -1.f, 1.f); S.FrameY = Clamp(S.FrameY, -1.f, 1.f);
+    S.ShakeAmt = Clamp(S.ShakeAmt, 0.f, 5.f); S.ShakeFreq = Clamp(S.ShakeFreq, 0.1f, 5.f);
+    S.Target = (std::clamp)(S.Target, 0, 1);            // other players are not there yet at load
+    S.PlaySpeed = Clamp(S.PlaySpeed, 0.1f, 4.f); S.PhotoScale = (std::clamp)(S.PhotoScale, 1, 4);
     S.Speed = Clamp(S.Speed, 1.f, 50000.f); S.Look = Clamp(S.Look, 0.01f, 50.f); S.Smooth = Clamp(S.Smooth, 0.f, 0.98f);
     S.Fov = Clamp(S.Fov, 5.f, 120.f); S.Fstop = Clamp(S.Fstop, 0.7f, 32.f); S.Focus = Clamp(S.Focus, 0.1f, 1000.f);
     S.Spacing = Clamp(S.Spacing, 0.1f, 60.f);
@@ -12966,6 +12984,65 @@ static void KeepHudHidden(SDK::APlayerController* PC, ULONGLONG Now) {
     HideExtras(true);
 }
 
+// ---------------------------------------------------------------- targets
+
+static std::vector<Ref> s_Behemoths, s_Players;
+static std::vector<std::string> s_PlayerNames;
+
+// Behemoths and other players, once a second (the lists only feed a menu and a nearest-pick).
+static void ScanTargets(SDK::APlayerController* PC, ULONGLONG Now) {
+    static ULONGLONG s_Next = 0;
+    if (Now < s_Next) return;
+    s_Next = Now + 1000;
+    static auto* s_Found = new SDK::TArray<SDK::AActor*>();   // engine-allocated storage, never freed (exit-safe)
+    SDK::UGameplayStatics::GetAllActorsOfClass(PC, SDK::AArchonBehemoth::StaticClass(), s_Found);
+    s_Behemoths.clear();
+    for (int32_t i = 0; i < s_Found->Num(); ++i) if ((*s_Found)[i]) s_Behemoths.emplace_back().Set((*s_Found)[i]);
+    SDK::UGameplayStatics::GetAllActorsOfClass(PC, SDK::AArchonCharacter::StaticClass(), s_Found);
+    s_Players.clear();
+    s_PlayerNames.clear();
+    for (int32_t i = 0; i < s_Found->Num(); ++i) {
+        auto* P = static_cast<SDK::APawn*>((*s_Found)[i]);
+        // NPCs have no player state; a replicated one can outlive its object, so check it is still live
+        if (!P || P == PC->Pawn || !P->PlayerState || !IsRegisteredLiveObject(P->PlayerState)) continue;
+        s_Players.emplace_back().Set(P);
+        std::string N = P->PlayerState->PlayerNamePrivate.ToString();
+        s_PlayerNames.push_back(N.empty() ? "Player " + std::to_string(s_Players.size()) : N);
+    }
+}
+
+struct Aim { SDK::FVector P{}; float Yaw = 0.f; bool Ok = false; std::string Name; };
+
+// Where the camera aims this frame: the chosen target's position + aim height. Falls back to my character.
+static Aim TargetOf(SDK::APlayerController* PC, const Settings& S) {
+    Aim R;
+    SDK::AActor* A = nullptr;
+    SDK::APawn* Me = PC->Pawn;
+    if (S.Target == 1) {
+        const SDK::FVector From = Me ? Me->K2_GetActorLocation() : SDK::FVector{ s_Cam[PX], s_Cam[PY], s_Cam[PZ] };
+        float Best = 1e30f;
+        for (const Ref& B : s_Behemoths) {
+            auto* Bh = B.Get<SDK::AArchonBehemoth>();
+            float Hp = 0.f, Max = 0.f;
+            if (!Bh || !BehemothHealthBar::ReadHealth(Bh, Hp, Max) || Hp <= 0.f) continue;
+            const SDK::FVector At = Bh->K2_GetActorLocation();
+            const float D = (At.X - From.X) * (At.X - From.X) + (At.Y - From.Y) * (At.Y - From.Y) + (At.Z - From.Z) * (At.Z - From.Z);
+            if (D < Best) { Best = D; A = Bh; }
+        }
+        if (A) R.Name = "Nearest behemoth";
+    } else if (S.Target >= 2 && S.Target - 2 < static_cast<int>(s_Players.size())) {
+        A = s_Players[S.Target - 2].Get<SDK::AActor>();
+        if (A) R.Name = s_PlayerNames[S.Target - 2];
+    }
+    if (!A) { A = Me; R.Name = S.Target ? "Me (target not found)" : "Me"; }
+    if (!A) return R;
+    R.P = A->K2_GetActorLocation();
+    R.P.Z += S.AimZ;
+    R.Yaw = A->K2_GetActorRotation().Yaw;
+    R.Ok = true;
+    return R;
+}
+
 // ---------------------------------------------------------------- camera
 
 static SDK::ACameraActor* Actor(SDK::APlayerController* PC) {
@@ -13001,8 +13078,12 @@ static void SetGameInput(SDK::APlayerController* PC, bool On) {
     }
 }
 
-// Free and tripod take zoom and roll from the settings; a pose set any other way hands its own to them.
-static void TakeZoomRoll(Settings& S) { S.Fov = Clamp(s_Target[PFov], 5.f, 120.f); S.Roll = s_Target[PRoll]; }
+// Free and tripod take zoom, roll and focus from the settings; a pose set any other way hands its own to them.
+static void TakeZoomRoll(Settings& S) {
+    S.Fov = Clamp(s_Target[PFov], 5.f, 120.f);
+    S.Roll = s_Target[PRoll];
+    S.Focus = Clamp(s_Target[PFocus], 0.1f, 1000.f);
+}
 
 static void ToFree(SDK::APlayerController* PC, Settings& S) {
     TakeZoomRoll(S);
@@ -13017,6 +13098,7 @@ static void ReopenMenu() {
 // A path that finished or was stopped holds its last frame on a tripod (you may still be acting).
 static void EndPath(Settings& S) {
     s_Mode = Mode::Tripod;
+    s_CountT = 0.f;
     TakeZoomRoll(S);
     ReopenMenu();
 }
@@ -13028,7 +13110,7 @@ static void Start(SDK::APlayerController* PC, Settings& S) {
     const SDK::FVector L = Pcm->GetCameraLocation();
     const SDK::FRotator R = Pcm->GetCameraRotation();
     s_StartFov = Clamp(Pcm->GetFOVAngle(), 5.f, 120.f);
-    s_Target = Pose{ { L.X, L.Y, L.Z, R.Yaw, R.Pitch, 0.f, s_StartFov } };   // starts exactly on the game's view
+    s_Target = Pose{ { L.X, L.Y, L.Z, R.Yaw, R.Pitch, 0.f, s_StartFov, S.Focus } };   // starts exactly on the game's view
     s_Cam = s_Target;
     TakeZoomRoll(S);
     s_OldView.Set(Pcm->ViewTarget.Target);
@@ -13042,6 +13124,8 @@ static void Start(SDK::APlayerController* PC, Settings& S) {
 static void Stop(SDK::APlayerController* PC) {
     SetGameInput(PC, true);
     s_Mode = Mode::Off;
+    s_Dolly = false;
+    s_CountT = 0.f;
     ReopenMenu();
     SDK::AActor* Back = s_OldView.Get<SDK::AActor>();
     if (!Back || Back == s_Actor.Get()) Back = PC->Pawn;
@@ -13081,9 +13165,8 @@ static void FreeInput(SDK::APlayerController* PC, float Dt, Settings& S) {
     if (Pressed('R')) { S.Fov = s_StartFov; S.Roll = 0.f; }
 }
 
-// Aims s_Target at the player (orbiting around them in tripod mode).
-static void Track(SDK::APawn* Pawn, float Dt, const Settings& S) {
-    const SDK::FVector P = Pawn->K2_GetActorLocation();
+// Aims s_Target at P (orbiting around it in tripod mode), with P at FrameX / FrameY on screen.
+static void Track(const SDK::FVector& P, float Dt, const Settings& S, float Aspect) {
     const float Orbit = S.Orbit * Dt * kDeg;
     if (s_Mode == Mode::Tripod && Orbit != 0.f) {
         const float Dx = s_Target[PX] - P.X, Dy = s_Target[PY] - P.Y;
@@ -13091,29 +13174,30 @@ static void Track(SDK::APawn* Pawn, float Dt, const Settings& S) {
         s_Target[PY] = P.Y + Dx * sinf(Orbit) + Dy * cosf(Orbit);
     }
     const float Dx = P.X - s_Target[PX], Dy = P.Y - s_Target[PY], Dz = P.Z - s_Target[PZ];
-    const float Yaw = atan2f(Dy, Dx) / kDeg;
+    const float Th = tanf(Clamp(s_Target[PFov], 5.f, 120.f) * 0.5f * kDeg);   // screen edge, as a tangent
+    const float Yaw = (atan2f(Dy, Dx) - atanf(S.FrameX * Th)) / kDeg;
     s_Target[PYaw] = Yaw + 360.f * roundf((s_Target[PYaw] - Yaw) / 360.f);   // nearest turn: no spin when wrapping
-    s_Target[PPitch] = atan2f(Dz, sqrtf(Dx * Dx + Dy * Dy)) / kDeg;
+    s_Target[PPitch] = Clamp((atan2f(Dz, sqrtf(Dx * Dx + Dy * Dy)) - atanf(S.FrameY * Th / Aspect)) / kDeg, -89.f, 89.f);
 }
 
 // Pose, zoom and frame shape, then the lens and grading as a camera post-process override (weight 0 when unused).
-static void Apply(SDK::ACameraActor* Cam, SDK::APawn* Pawn, const Settings& S) {
+static void Apply(SDK::ACameraActor* Cam, const Pose& V, const Settings& S, const Aim& T) {
     static SDK::FHitResult s_Hit;
     SDK::FRotator R{};
-    R.Pitch = s_Cam[PPitch]; R.Yaw = s_Cam[PYaw]; R.Roll = s_Cam[PRoll];
-    const SDK::FVector L{ s_Cam[PX], s_Cam[PY], s_Cam[PZ] };
+    R.Pitch = V[PPitch]; R.Yaw = V[PYaw]; R.Roll = V[PRoll];
+    const SDK::FVector L{ V[PX], V[PY], V[PZ] };
     Cam->K2_SetActorLocationAndRotation(L, R, false, &s_Hit, true);
     SDK::UCameraComponent* C = Cam->CameraComponent;
-    C->FieldOfView = s_Cam[PFov];                       // read by GetCameraView every frame
+    C->FieldOfView = V[PFov];                           // read by GetCameraView every frame
     const float Ratio = kAspects[S.Aspect].Ratio;
     C->bConstrainAspectRatio = Ratio > 0.f ? 1 : 0;     // black bars outside the chosen shape
     if (Ratio > 0.f) C->AspectRatio = Ratio;
 
     SDK::FPostProcessSettings& P = C->PostProcessSettings;
     const uint8_t Dof = S.Dof ? 1 : 0, Gr = S.Grade ? 1 : 0, Mb = S.MotionBlurOn ? 1 : 0;
-    float Focus = S.Focus * 100.f;
-    if (S.Dof == 2 && Pawn) {
-        const SDK::FVector A = Pawn->K2_GetActorLocation();
+    float Focus = Clamp(V[PFocus], 0.1f, 1000.f) * 100.f;
+    if (S.Dof == 2 && T.Ok) {
+        const SDK::FVector A = T.P;
         Focus = sqrtf((A.X - L.X) * (A.X - L.X) + (A.Y - L.Y) * (A.Y - L.Y) + (A.Z - L.Z) * (A.Z - L.Z));
     }
     P.bOverride_DepthOfFieldFocalDistance = Dof; P.DepthOfFieldFocalDistance = Focus;
@@ -13134,16 +13218,16 @@ static void Apply(SDK::ACameraActor* Cam, SDK::APawn* Pawn, const Settings& S) {
     C->PostProcessBlendWeight = Dof || Gr || Mb ? 1.f : 0.f;
 }
 
-static void Drive(SDK::APlayerController* PC, float Dt, Settings& S, const std::vector<Key>& Keys) {
+static void Drive(SDK::APlayerController* PC, float Dt, Settings& S, const std::vector<Key>& Keys, const Aim& T) {
     SDK::ACameraActor* Cam = Actor(PC);
     if (!Cam) { Stop(PC); return; }
-    SDK::APawn* Pawn = PC->Pawn;
 
     if (s_Mode == Mode::Path) {
         if (Keys.size() < 2) { EndPath(S); }
         else {
             const float Start = Keys.front().Time, End = Keys.back().Time;
-            s_PathT += Dt;
+            if (s_CountT > 0.f) s_CountT -= Dt;         // 3-2-1 sitting on the first key
+            else s_PathT += Dt * S.PlaySpeed;
             const bool Done = !S.Loop && s_PathT >= End;
             if (Done) s_PathT = End;
             else if (S.Loop && End > Start && s_PathT >= End) s_PathT = Start + fmodf(s_PathT - Start, End - Start);
@@ -13152,34 +13236,71 @@ static void Drive(SDK::APlayerController* PC, float Dt, Settings& S, const std::
         }
     } else {
         if (s_Mode == Mode::Free) FreeInput(PC, Dt, S);
+        if (s_Mode == Mode::Follow && T.Ok) {
+            const float Orbit = S.Orbit * Dt * kDeg, Ox = s_FollowOff[0], Oy = s_FollowOff[1];
+            s_FollowOff[0] = Ox * cosf(Orbit) - Oy * sinf(Orbit);
+            s_FollowOff[1] = Ox * sinf(Orbit) + Oy * cosf(Orbit);
+            const float Yaw = S.FollowLocal ? T.Yaw * kDeg : 0.f;
+            s_Target[PX] = T.P.X + s_FollowOff[0] * cosf(Yaw) - s_FollowOff[1] * sinf(Yaw);
+            s_Target[PY] = T.P.Y + s_FollowOff[0] * sinf(Yaw) + s_FollowOff[1] * cosf(Yaw);
+            s_Target[PZ] = T.P.Z + s_FollowOff[2];
+        }
+        if (s_Dolly && T.Ok) {                          // keep the target the same size as the distance changes
+            const float D = (std::max)(1.f, sqrtf((T.P.X - s_Target[PX]) * (T.P.X - s_Target[PX]) + (T.P.Y - s_Target[PY]) * (T.P.Y - s_Target[PY])
+                + (T.P.Z - s_Target[PZ]) * (T.P.Z - s_Target[PZ])));
+            S.Fov = Clamp(2.f * atanf(s_DollyW / (2.f * D)) / kDeg, 5.f, 120.f);
+        }
         s_Target[PFov] = S.Fov;
         s_Target[PRoll] = S.Roll;
+        s_Target[PFocus] = S.Focus;
     }
-    if (S.Track && Pawn && s_Mode != Mode::Free) Track(Pawn, Dt, S);
+    if (T.Ok && ((S.Track && s_Mode != Mode::Free) || s_Mode == Mode::Follow)) {
+        int32_t W = 0, H = 0;
+        PC->GetViewportSize(&W, &H);
+        Track(T.P, Dt, S, H > 0 ? float(W) / float(H) : 16.f / 9.f);
+    }
 
     // Smoothing = how much of the gap is left after 1/60 s; the path is already smooth.
     const float A = s_Mode == Mode::Path ? 1.f : 1.f - powf(S.Smooth, Dt * 60.f);
     for (int K = 0; K < PN; ++K) s_Cam[K] += (s_Target[K] - s_Cam[K]) * A;
-    Apply(Cam, Pawn, S);
+    s_ShakeT += Dt;
+    Pose V = s_Cam;
+    const Pose Sh = ShakeAt(s_ShakeT, S.Shake, S.ShakeAmt, S.ShakeFreq);
+    for (int K = 0; K < PN; ++K) V[K] += Sh[K];
+    Apply(Cam, V, S, T);
     // the server can hand the view back (respawn, the game's own cinematics); keep ours while on
     if (PC->PlayerCameraManager->ViewTarget.Target != Cam) {
         PC->SetViewTargetWithBlend(Cam, 0.f, SDK::EViewTargetBlendFunction::VTBlend_Linear, 0.f, false);
     }
 }
 
-static void Run(SDK::APlayerController* PC, const Cmd& C, Settings& S, const std::vector<Key>& Keys) {
+static void Run(SDK::APlayerController* PC, const Cmd& C, Settings& S, const std::vector<Key>& Keys, const Aim& T) {
     const bool On = s_Mode != Mode::Off;
     switch (C.T) {
     case CmdType::ToggleCam: if (On) Stop(PC); else Start(PC, S); break;
-    case CmdType::Free: if (s_Mode == Mode::Tripod || s_Mode == Mode::Path) ToFree(PC, S); break;
+    case CmdType::Free: if (s_Mode == Mode::Tripod || s_Mode == Mode::Path || s_Mode == Mode::Follow) ToFree(PC, S); break;
     case CmdType::Tripod:
         if (s_Mode == Mode::Path) EndPath(S);
-        else if (s_Mode == Mode::Free) { s_Mode = Mode::Tripod; SetGameInput(PC, true); }
+        else if (s_Mode == Mode::Free || s_Mode == Mode::Follow) { s_Mode = Mode::Tripod; SetGameInput(PC, true); }
         break;
+    case CmdType::Follow: {                             // keeps the camera where it is relative to the target
+        if (!On || !T.Ok) break;
+        if (s_Mode == Mode::Path) TakeZoomRoll(S);
+        const float Dx = s_Target[PX] - T.P.X, Dy = s_Target[PY] - T.P.Y, Yaw = S.FollowLocal ? -T.Yaw * kDeg : 0.f;
+        s_FollowOff[0] = Dx * cosf(Yaw) - Dy * sinf(Yaw);
+        s_FollowOff[1] = Dx * sinf(Yaw) + Dy * cosf(Yaw);
+        s_FollowOff[2] = s_Target[PZ] - T.P.Z;
+        s_Mode = Mode::Follow;
+        SetGameInput(PC, true);
+        ReopenMenu();
+        break;
+    }
     case CmdType::Play:
         if (!On || Keys.size() < 2) break;
         s_Mode = Mode::Path;
         s_PathT = Keys.front().Time;
+        s_CountT = S.Countdown ? 3.f : 0.f;
+        s_Dolly = false;
         SetGameInput(PC, true);
         if (S.HideMenuOnPlay && G.MenuOpen.load()) { G.MenuOpen = false; s_ReopenMenu = true; }
         break;
@@ -13187,6 +13308,31 @@ static void Run(SDK::APlayerController* PC, const Cmd& C, Settings& S, const std
     case CmdType::GoToKey: if (On && C.I >= 0 && C.I < static_cast<int>(Keys.size())) JumpTo(PC, S, Keys[C.I].P, Keys[C.I].Time); break;
     case CmdType::Preview: if (On && !Keys.empty()) JumpTo(PC, S, PathAt(Keys, C.F, S.Ease, false), C.F); break;
     case CmdType::ToggleHud: SetHudHidden(PC, !g_MpHudHidden); break;
+    case CmdType::Photo: {
+        const std::wstring Line = L"HighResShot " + std::to_wstring((std::clamp)(C.I, 1, 4));
+        SDK::UKismetSystemLibrary::ExecuteConsoleCommand(PC, SDK::FString(Line.c_str()), PC);
+        Log("photo x" + std::to_string(C.I));
+        break;
+    }
+    case CmdType::PickFocus: {                          // trace from the camera through the clicked pixel
+        SDK::FVector At{}, Dir{};
+        if (!PC->DeprojectScreenPositionToWorld(static_cast<float>(C.I), C.F, &At, &Dir)) break;
+        static SDK::FHitResult s_Hit;
+        static auto* s_None = new SDK::TArray<SDK::AActor*>();
+        const SDK::FVector End{ At.X + Dir.X * 200000.f, At.Y + Dir.Y * 200000.f, At.Z + Dir.Z * 200000.f };
+        if (SDK::UKismetSystemLibrary::LineTraceSingle(PC, At, End, SDK::ETraceTypeQuery::TraceTypeQuery1, true, *s_None,
+                SDK::EDrawDebugTrace::None, &s_Hit, true, SDK::FLinearColor{}, SDK::FLinearColor{}, 0.f) && s_Hit.Distance > 0.f) {
+            S.Focus = Clamp(s_Hit.Distance / 100.f, 0.1f, 1000.f);
+            Log("focus picked " + std::to_string(S.Focus) + " m");
+        }
+        break;
+    }
+    case CmdType::Dolly:
+        if (s_Dolly || !On || !T.Ok || s_Mode == Mode::Path) { s_Dolly = false; break; }
+        s_DollyW = 2.f * sqrtf((T.P.X - s_Target[PX]) * (T.P.X - s_Target[PX]) + (T.P.Y - s_Target[PY]) * (T.P.Y - s_Target[PY])
+            + (T.P.Z - s_Target[PZ]) * (T.P.Z - s_Target[PZ])) * tanf(S.Fov * 0.5f * kDeg);
+        s_Dolly = true;
+        break;
     default: break;                                     // keyframe edits are done under the lock in Update
     }
 }
@@ -13225,6 +13371,24 @@ static void UpdateCursor(SDK::APlayerController* PC, ULONGLONG Now) {
     s_CursorShown = Show;
 }
 
+// ---------------------------------------------------------------- owner gate
+
+static bool OwnerOnly(SDK::APlayerController* PC, ULONGLONG Now) {
+    static ULONGLONG s_Next = 0;
+    static bool s_Owner = false;
+    static int s_Logged = -1;
+    if (Now >= s_Next) {
+        s_Next = Now + 1000;
+        SDK::APlayerState* Ps = PC->PlayerState;
+        s_Owner = Ps && Ps->PlayerNamePrivate.ToString().rfind("[Owner] ", 0) == 0;
+        if (s_Logged != static_cast<int>(s_Owner) && (s_Owner || Ps)) {
+            s_Logged = static_cast<int>(s_Owner);
+            Log(s_Owner ? "owner account - camera unlocked" : "not an owner account - camera locked");
+        }
+    }
+    return s_Owner;
+}
+
 // ---------------------------------------------------------------- frame
 
 static void Update() {
@@ -13250,6 +13414,7 @@ static void Update() {
         s_Mode = Mode::Off;
         s_Blocking = s_CursorShown = s_RmbLook = s_ReopenMenu = g_MpHudHidden = false;
         s_HiddenWidgets.clear();
+        s_Behemoths.clear(); s_Players.clear(); s_PlayerNames.clear();
         const std::string Map = SDK::UGameplayStatics::GetCurrentLevelName(PC, true).ToString();
         {
             std::lock_guard<std::mutex> Lk(G.Lock);
@@ -13271,18 +13436,32 @@ static void Update() {
     const ULONGLONG Now = GetTickCount64();
     const float Dt = Clamp(SDK::UGameplayStatics::GetWorldDeltaSeconds(PC), 0.f, 0.1f);
 
+    if (!OwnerOnly(PC, Now)) {                          // locked: undo anything still on, then nothing
+        if (s_Mode != Mode::Off) Stop(PC);
+        if (g_MpHudHidden) SetHudHidden(PC, false);
+        G.MenuOpen = false;
+        G.GuidesShown = false;
+        G.Countdown = 0;
+        G.ToastUntil = 0;
+        { std::lock_guard<std::mutex> Lk(G.Lock); G.Cmds.clear(); G.M = Mode::Off; }
+        UpdateCursor(PC, Now);
+        return;
+    }
+
     // hotkeys -> the same commands the menu sends
     std::vector<Cmd> Cmds;
-    if (Pressed(VK_F8)) Cmds.push_back(Cmd{ s_Mode == Mode::Tripod || s_Mode == Mode::Path ? CmdType::Free : CmdType::ToggleCam });
+    if (Pressed(VK_F8)) Cmds.push_back(Cmd{ s_Mode == Mode::Off || s_Mode == Mode::Free ? CmdType::ToggleCam : CmdType::Free });
     if (Pressed(VK_F9)) Cmds.push_back(Cmd{ CmdType::ToggleHud });
     if (Pressed(VK_F10)) {
         if (G.MenuReady.load()) { G.MenuOpen = !G.MenuOpen.load(); s_ReopenMenu = false; }
         else if (!s_MenuWarned) { s_MenuWarned = true; Log("F10: menu unavailable (needs D3D11) - settings are in CINECAM.ini"); }
     }
-    bool TrackFlip = false, PopKey = false;
+    bool TrackFlip = false, PopKey = false, GuideFlip = false;
     if (s_Mode == Mode::Free) {                         // camera keys only where the game hears nothing
         if (Pressed('T')) Cmds.push_back(Cmd{ CmdType::Tripod });
+        if (Pressed('F')) Cmds.push_back(Cmd{ CmdType::Follow });
         TrackFlip = Pressed('Y');
+        GuideFlip = Pressed('G');
         if (Pressed('K')) Cmds.push_back(Cmd{ CmdType::AddKey });
         PopKey = Pressed('J');
         if (Pressed('L')) Cmds.push_back(Cmd{ CmdType::Play });
@@ -13306,15 +13485,18 @@ static void Update() {
         }
         if (PopKey && !G.Keys.empty()) G.Keys.pop_back();
         if (TrackFlip) G.S.Track = !G.S.Track;
+        if (GuideFlip) G.S.Guides = !G.S.Guides;
         S = G.S;
         Keys = G.Keys;
     }
-    const float Fov = S.Fov, Roll = S.Roll;
+    const float Fov = S.Fov, Roll = S.Roll, Focus = S.Focus;
 
-    for (const Cmd& C : Cmds) Run(PC, C, S, Keys);
+    if (s_Mode != Mode::Off || MenuVisible()) ScanTargets(PC, Now);
+    const Aim T = TargetOf(PC, S);
+    for (const Cmd& C : Cmds) Run(PC, C, S, Keys, T);
     KeepHudHidden(PC, Now);
     UpdateCursor(PC, Now);
-    if (s_Mode != Mode::Off) Drive(PC, Dt, S, Keys);
+    if (s_Mode != Mode::Off) Drive(PC, Dt, S, Keys, T);
     std::vector<Point> PathPts, KeyPts;
     if (MenuVisible() && S.ShowPath && s_Mode != Mode::Path) Project(PC, Keys, PathPts, KeyPts);
 
@@ -13324,9 +13506,16 @@ static void Update() {
         G.M = s_Mode;
         G.PathT = s_PathT;
         G.HudHidden = g_MpHudHidden;
+        G.CamFov = s_Mode == Mode::Off ? PC->PlayerCameraManager->GetFOVAngle() : s_Cam[PFov];
+        G.CamRoll = s_Mode == Mode::Off ? 0.f : s_Cam[PRoll];
+        G.GuidesShown = G.S.Guides && !(G.S.GuidesHideOnPlay && s_Mode == Mode::Path);
+        G.Party = s_PlayerNames;
+        G.TargetName = T.Name;
         G.PathPts.swap(PathPts);
         G.KeyPts.swap(KeyPts);
-        if (S.Fov != Fov || S.Roll != Roll) { G.S.Fov = S.Fov; G.S.Roll = S.Roll; }   // wheel, Z/X, R, Go to, path end
+        if (S.Fov != Fov || S.Roll != Roll || S.Focus != Focus) { G.S.Fov = S.Fov; G.S.Roll = S.Roll; G.S.Focus = S.Focus; }   // wheel, Z/X, R, Go to, path end, dolly, pick
+        G.Dolly = s_Dolly;
+        G.Countdown = s_Mode == Mode::Path && s_CountT > 0.f ? static_cast<int>(ceilf(s_CountT)) : 0;
         Now_S = G.S;
     }
     if (Now >= s_NextSave && memcmp(&Now_S, &s_Saved, sizeof(Settings)) != 0) {
@@ -13361,6 +13550,80 @@ static void Tick() {
 }
 
 }  // namespace CineCam
+
+// [2026-10-17 join-in-progress] Shows JoinPrompt.cpp's offer in the game's own confirm popup
+// (UArchonGlobalUI::DisplayPopup), relabels its buttons Join hunt / Stay, and returns the player's choice from the
+// popup's OnConfirmPressed / OnDismissPressed (caught in the ProcessEvent hook). The result is a native corner
+// notice (ClientShowCustomNoImagePopup, a client RPC that runs locally). Game thread only. Log tag [JoinPrompt].
+namespace JoinPopup {
+
+using BehemothHealthBar::Ref;
+static Ref s_Ui, s_Popup;
+static ULONGLONG s_Next = 0;
+
+static SDK::FText Text(const std::string& S) {
+    return SDK::UKismetTextLibrary::Conv_StringToText(SDK::FString(std::wstring(S.begin(), S.end()).c_str()));
+}
+
+static SDK::UArchonGlobalUI* FindUi() {
+    if (auto* U = s_Ui.Get<SDK::UArchonGlobalUI>()) return U;
+    auto* Cls = SDK::UArchonGlobalUI::StaticClass();
+    for (int32_t i = 0; i < SDK::UObject::GObjects->Num(); ++i) {
+        SDK::UObject* O = SDK::UObject::GObjects->GetByIndex(i);
+        if (O && !O->IsDefaultObject() && O->IsA(Cls)) { s_Ui.Set(O); return static_cast<SDK::UArchonGlobalUI*>(O); }
+    }
+    return nullptr;
+}
+
+static void Label(SDK::UArchonUserButton* B, const char* L) {
+    if (!B) return;
+    B->SetVisibility(SDK::ESlateVisibility::Visible);
+    B->SetButtonLabel(Text(L));
+}
+
+static void Tick() {
+    const ULONGLONG Now = GetTickCount64();
+    if (Now < s_Next) return;
+    s_Next = Now + 250;
+    std::string Msg;
+    if (MpJoinPromptTakeNotice(Msg)) {
+        SDK::UWorld* World = SDK::UWorld::GetWorld();
+        auto* PC = World ? SDK::UGameplayStatics::GetPlayerController(World, 0) : nullptr;
+        if (PC && PC->IsA(SDK::AArchonPlayerController::StaticClass()))
+            static_cast<SDK::AArchonPlayerController*>(PC)->ClientShowCustomNoImagePopup(Text("Party hunt"), Text(Msg), 6.f);
+        MpLog("[JoinPrompt] notice: " + Msg);
+    }
+    if (!MpJoinPromptTakeOffer(Msg)) return;
+    auto* Ui = FindUi();
+    SDK::UArchonPopup* P = Ui ? Ui->DisplayPopup(Text(Msg)) : nullptr;
+    s_Popup.Set(P);
+    if (P) { Label(P->ConfirmButton, "Join hunt"); Label(P->DismissButton, "Stay"); }
+    MpLog("[JoinPrompt] popup " + std::string(P ? P->Class->GetName() : "NOT shown (no ArchonGlobalUI)")
+        + " confirm=" + MpPtr(P ? P->ConfirmButton : nullptr) + " dismiss=" + MpPtr(P ? P->DismissButton : nullptr));
+}
+
+static void OnEvent(SDK::UObject* Object, const std::string& FunctionName) {
+    if (!Object || Object != s_Popup.Get()) return;
+    const bool Join = FunctionName.find("OnConfirmPressed") != std::string::npos;
+    if (!Join && FunctionName.find("OnDismissPressed") == std::string::npos) return;
+    s_Popup.Set(nullptr);
+    MpJoinPromptAnswer(Join);
+}
+
+static bool s_Faulted = false;
+
+static void TickSeh() {
+    __try { Tick(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { s_Faulted = true; }
+}
+
+static void TickGuarded() {
+    if (s_Faulted) return;
+    TickSeh();
+    if (s_Faulted) MpLog("[JoinPrompt] fault - popup off for this session");
+}
+
+}  // namespace JoinPopup
 
 void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     g_clientProcessEventCount.fetch_add(1, std::memory_order_relaxed);
@@ -13432,8 +13695,14 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     // bIsClientViewingCinematic, i.e. only the owner). Its start path still calls SetCinematicState(2) +
     // HideGameplayHUD on the local PC, so remote copies are only kept until our own arrival has ended
     // (late joiners keep retail behaviour). DISABLE_PARTY_DROP_IN.flag = retail for all of it.
+    if (Object && !s_MutedArrivalTriggers.empty()
+        && FunctionName.find("dynamic_cinematic_component_bp_C.") != std::string::npos
+        && s_MutedArrivalTriggers.count(Object->Outer)) {
+        return;
+    }
     if (Object && FunctionName.find("adventure_island_arrival_trigger_bp_C.") != std::string::npos) {
         static const bool s_Disabled = MpExeRelativeFlagPresent(L"DISABLE_PARTY_DROP_IN.flag");
+        if (s_MutedArrivalTriggers.count(Object)) return;
         if (!s_Disabled) {
             const bool IsTick = FunctionName.find("_C.ReceiveTick") != std::string::npos;
             const bool IsBeginPlay = FunctionName.find("_C.ReceiveBeginPlay") != std::string::npos;
@@ -13467,7 +13736,13 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
                         + " localPawn=" + MpPtr(LocalPawn) + " clientReady=" + Ready);
                     return;
                 }
-                MpLog("[PartyDropIn] local arrival already ended; retail destroy for trigger " + MpPtr(Object));
+                // Retail's answer here is K2_DestroyActor, which a client cannot do to a replicated actor: the
+                // copy lived on and played the joiner's arrival cinematic on us (2026-10-17: black fades, HUD
+                // hidden 2 min, near-black screen for the player already hunting). Mute it instead.
+                s_MutedArrivalTriggers.insert(Object);
+                MpLog("[PartyDropIn] local arrival already ended; muting late trigger " + MpPtr(Object)
+                    + " owner=" + MpPtr(TriggerOwner));
+                return;
             }
         }
     }
@@ -13873,7 +14148,9 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
         VoiceIndicators::Tick();
         InventoryProbe::Tick();
         CineCam::Tick();
+        JoinPopup::TickGuarded();
     }
+    if (FunctionName.find("Pressed") != std::string::npos) JoinPopup::OnEvent(Object, FunctionName);
 
     if (IsAccessoryUnlockDiagFn) {
         static std::atomic<int> s_accessoryUnlockDiagCount{ 0 };
@@ -15955,7 +16232,6 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     MpHuntPassProbe(Object, FunctionName);
     MpCoinTossProbe(FunctionName, Parms);
     MpServerProjectileTickFix(Object, FunctionName);
-    MpPangarRollProbe(Object, FunctionName);
 
 
     // [1.14.7 HEADLESS AUDIO 2026-10-03] A dedicated hub must not play sound. Removing the Wwise
@@ -17317,6 +17593,7 @@ bool LoadMapDiagHook(void* Engine, void* Ctx, void* URL, void* Pending, void* Er
     void* Prev = s_lmCtx;
     s_lmCtx = Ctx;
     s_LocalArrivalDone = false;
+    s_MutedArrivalTriggers.clear();
     MpLog("[LoadMapPL] ENTER map=" + Map + " pending=" + MpPtr(Pending) + " ctx=" + MpPtr(Ctx) + " " + MpLmWorld(MpLmCtxWorld()));
     if (MpLmHasZombieWorld(Map)) {
         if (MpExeRelativeFlagPresent(L"DISABLE_ZOMBIE_WORLD_TRASH.flag")) {
@@ -17734,6 +18011,7 @@ void InitClientHooks() {
     }
     MpCrashReporterInstall();
     MpVoiceStart();
+    MpJoinPromptStart();
     // [1.14.7] +0x02657770 is an exception-text formatter, not the UE unhandled-exception
     // filter. Its ABI differs from UEUnhandledExceptionFilterHook, so do not detour it.
     MpLog("[ExitTrace] (client) UEUnhandledExceptionFilter hook skipped (1.14.7 target ABI mismatch)");
@@ -20901,6 +21179,82 @@ static void MpVoiceProximityTick() {
         Players.push_back({ AccountId, X, Y, Z });
     }
     MpVoiceReportPositions(Players);
+}
+
+// [2026-10-17 join-in-progress] Hunt servers (g_wdIsHub == 0), once a second:
+// 1. Behemoth health follows the connected player count UP. The game only rescales on logout
+//    (BPGM_Archon_Prototype K2_OnLogout -> AdjustBehemothHealthForPlayerCount, gated on
+//    AdjustBehemothHealthOnPlayerLogout), so a party member dropping in mid-hunt fought the smaller party's
+//    behemoth. We call the same function when the count rises: it sets every live behemoth's max health for
+//    GetConnectedPlayerCount (Bp_Behemoth RetroactivelyAdjustMaxHealthForPlayerCount, also part/stagger health)
+//    and only acts in sub-state PreMatchAirship/OnHunt. DISABLE_LATE_JOIN_RESCALE.flag skips this part.
+// 2. "MYSTICPARADOX_HUNT_STATE hpPct= players= subState=" on stdout for the Director (gameservers.ts), on change
+//    and every 5 s; the backend's join-in-progress gate (matchmakingParty.ts) treats a 15 s old report as stale.
+//    hpPct = the live behemoth with the largest max health (the hunt target), -1 before any behemoth exists.
+static void MpHuntJoinTick() {
+    if (g_wdIsHub.load(std::memory_order_relaxed) != 0) return;
+    static uint64_t s_nextMs = 0, s_reportMs = 0;
+    static int32_t s_lastPlayers = 0;
+    static std::string s_lastLine;
+    const uint64_t Now = GetTickCount64();
+    if (Now < s_nextMs) return;
+    s_nextMs = Now + 1000;
+
+    SDK::UWorld* World = SDK::UWorld::GetWorld();
+    SDK::AGameModeBase* GM = World ? World->AuthorityGameMode : nullptr;
+    if (!GM || !GM->IsA(SDK::ABPGM_Archon_Prototype_C::StaticClass())) return;
+    auto* Mode = static_cast<SDK::ABPGM_Archon_Prototype_C*>(GM);
+    auto* GS = (GM->GameState && GM->GameState->IsA(SDK::AArchonGameState::StaticClass()))
+        ? static_cast<SDK::AArchonGameState*>(GM->GameState) : nullptr;
+
+    int32_t Players = 0;
+    Mode->GetConnectedPlayerCount(&Players);
+    const int SubState = GS ? static_cast<int>(GS->GetInProgressGameSubState()) : 0;
+
+    static auto* s_Actors = new SDK::TArray<SDK::AActor*>();   // engine-allocated storage, never freed (exit-safe)
+    SDK::UGameplayStatics::GetAllActorsOfClass(World, SDK::AArchonBehemoth::StaticClass(), s_Actors);
+    auto Target = [&](float& Hp, float& Max) {
+        SDK::AArchonBehemoth* Best = nullptr;
+        bool Any = false;
+        for (int32_t i = 0; i < s_Actors->Num(); ++i) {
+            auto* B = static_cast<SDK::AArchonBehemoth*>((*s_Actors)[i]);
+            float H = 0.f, M = 0.f;
+            if (!B || !BehemothHealthBar::ReadHealth(B, H, M)) continue;
+            Any = true;
+            if (H > 0.f && (!Best || M > Max)) { Best = B; Hp = H; Max = M; }
+        }
+        if (!Best) { Hp = Any ? 0.f : -1.f; Max = 1.f; }
+        return Best;
+    };
+    float Hp = -1.f, Max = 1.f;
+    SDK::AArchonBehemoth* Main = Target(Hp, Max);
+
+    // The call is idempotent for a given count, so it also runs once per newly seen target: a behemoth that
+    // spawned after a drop-in may have been sized for the launch roster. Drops only lower the watermark (the
+    // game's own logout path owns scaling down).
+    static SDK::AArchonBehemoth* s_scaledTarget = nullptr;
+    if (Players < s_lastPlayers) s_lastPlayers = Players;
+    if (Main && Players > 0 && (Players > s_lastPlayers || Main != s_scaledTarget)
+        && !MpExeRelativeFlagPresent(L"DISABLE_LATE_JOIN_RESCALE.flag")) {
+        const float BeforeHp = Hp, BeforeMax = Max;
+        Mode->AdjustBehemothHealthForPlayerCount();
+        Target(Hp, Max);
+        MpLog("[LateJoin] rescale players " + std::to_string(s_lastPlayers) + "->" + std::to_string(Players)
+            + (Main != s_scaledTarget ? " (new target)" : "") + " subState=" + std::to_string(SubState)
+            + " behemoth hp " + std::to_string(BeforeHp) + "/" + std::to_string(BeforeMax)
+            + " -> " + std::to_string(Hp) + "/" + std::to_string(Max));
+        s_scaledTarget = Main;
+        s_lastPlayers = Players;
+    }
+
+    const int HpPct = Hp < 0.f ? -1 : static_cast<int>(std::ceil(100.f * Hp / Max));
+    const std::string Line = "MYSTICPARADOX_HUNT_STATE hpPct=" + std::to_string(HpPct)
+        + " players=" + std::to_string(Players) + " subState=" + std::to_string(SubState);
+    if (Line != s_lastLine || Now - s_reportMs >= 5000) {
+        std::cout << Line << std::endl;
+        s_lastLine = Line;
+        s_reportMs = Now;
+    }
 }
 
 // ============================================================================

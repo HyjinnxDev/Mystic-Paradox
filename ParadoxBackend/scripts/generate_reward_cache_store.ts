@@ -139,12 +139,10 @@ const SELECTIONS: Selection[] = [
     { catalogId: "AR_HP09B_COMMANDO_ARMS_00", category: "armour", price: 2000 },
     { catalogId: "AR_HP09B_COMMANDO_LEGS_00", category: "armour", price: 2000 },
 
-    // Weapons (35 total including Salvator Rex).
-    { catalogId: "WP_IH_HP10B_RAIDERS_01", category: "weapon", price: 2500 },
+    // Weapons (33 total including Salvator Rex).
     { catalogId: "WP_EB_HP12A_FROSTWARDEN_01", category: "weapon", price: 2500 },
     { catalogId: "WP_AC_HP10A_CELESTIAL_01", category: "weapon", price: 2500 },
     { catalogId: "WP_DP_HP10A_CELESTIAL_01", category: "weapon", price: 2500 },
-    { catalogId: "WP_MS_HP11A_ALCHEMIST_01", category: "weapon", price: 2500 },
     { catalogId: "WP_EB_HP10A_CELESTIAL_00", category: "weapon", price: 2000 },
     { catalogId: "WP_IH_HP08B_PUNK_00", category: "weapon", price: 2000 },
     { catalogId: "WP_AC_HP10A_CELESTIAL_00", category: "weapon", price: 2000 },
@@ -188,7 +186,7 @@ const SELECTIONS: Selection[] = [
       displayNameOverride: "The Debt Collector",
       descriptionOverride: "A heavy legendary metal axe transmog built to collect what is owed." },
 
-    // Style (23 total including Portal Beam).
+    // Style (18 total including Portal Beam).
     { catalogId: "DYE_RED01_DURABLE", category: "style", price: 1000 },
     { catalogId: "DYE_GRAY05_DURABLE", category: "style", price: 1000 },
     { catalogId: "DYE_GREEN14_DURABLE", category: "style", price: 1000 },
@@ -198,14 +196,9 @@ const SELECTIONS: Selection[] = [
     { catalogId: "EM_INTRO_HP08A_HEROIC_00", category: "style", price: 2500 },
 
     // Premium player and arrival emotes.
-    { catalogId: "EM_INTRO_HP12A_FROSTWARDEN_00", category: "style", price: 2500 },
     { catalogId: "EM_INTRO_HP09A_ASSASSINS_00", category: "style", price: 2500 },
     { catalogId: "EM_INTRO_HP03_VINE_00", category: "style", price: 2500 },
-    { catalogId: "EM_INTRO_HP08B_SKATEBOARD_00", category: "style", price: 2500 },
     { catalogId: "EM_PLAYER_HP11A_ALCHEMIST_00", category: "style", price: 2500 },
-    { catalogId: "EM_INTRO_HP10B_RAIDERS_01", category: "style", price: 2500 },
-    { catalogId: "EM_INTRO_HP07B_COFFINDROP_BAT_00", category: "style", price: 2500 },
-    { catalogId: "EM_INTRO_HP07B_COFFINDROP_DANCE_00", category: "style", price: 2500 },
     { catalogId: "EM_INTRO_HP09B_COMMANDO_00", category: "style", price: 2500 },
     { catalogId: "EM_INTRO_HP10B_RAIDERS_00", category: "style", price: 2500 },
     { catalogId: "EM_INTRO_HP08A_WARCRY_00", category: "style", price: 2500 },
@@ -217,8 +210,6 @@ const SELECTIONS: Selection[] = [
     { catalogId: "QI_FLARE_SAINTS19_06", category: "style", price: 1000 },
 
     // Event (9).
-    { catalogId: "WP_DP_EVENT_SPRING_00", category: "event", price: 2500 },
-    { catalogId: "EM_PLAYER_EVENT_FROST17_002", category: "event", price: 2000 },
     { catalogId: "BNC_ANIMATION_EVENT_FROST17_00", category: "event", price: 1000 },
     { catalogId: "BNC_SIGIL_EVENT_FROST17_00", category: "event", price: 800 },
 
@@ -285,18 +276,12 @@ const SELECTIONS: Selection[] = [
     { catalogId: "BNC_SIGIL_EVENT_HP08A_00", category: "event", price: 1000 },
     { catalogId: "BNC_SIGIL_036", category: "event", price: 2000 },
 
-    // Limited (10 total including the Unseen Crown).
+    // Limited (4 total including the Unseen Crown).
     { catalogId: "AC_BACK_HP06-1_01", category: "limited", price: 2500 },
     { catalogId: "AC_BACK_HP06-1_00", category: "limited", price: 2500 },
-    { catalogId: "GD_FRAME_A_REDSTRIPE", category: "limited", price: 2500 },
 
     // Named glider frames with resolved 1.12 display data.
     { catalogId: "GD_FRAME_A_BASE", category: "limited", price: 2500 },
-    { catalogId: "GD_FRAME_B_BLUEWING", category: "limited", price: 2000 },
-    { catalogId: "GD_FRAME_B_FLUTTERHEART", category: "limited", price: 2000 },
-    { catalogId: "GD_FRAME_B_SPRINGTIDE", category: "limited", price: 2000 },
-    { catalogId: "GD_FRAME_B_BASE", category: "limited", price: 2000 },
-    { catalogId: "GD_FRAME_C_BASE", category: "limited", price: 2000 },
 
     // General (8).
     { catalogId: "TITLE_HP10A_CELESTIAL_01", category: "general", price: 700 },
@@ -313,10 +298,10 @@ const SELECTIONS: Selection[] = [
 
 const EXPECTED_CATEGORY_COUNTS: Record<Category, number> = {
     armour: 48,
-    weapon: 34,
-    style: 23,
-    event: 55,
-    limited: 10,
+    weapon: 32,
+    style: 18,
+    event: 53,
+    limited: 4,
     general: 8,
 };
 
@@ -369,7 +354,7 @@ function Assert(condition: unknown, message: string): asserts condition {
 }
 
 Assert(fs.existsSync(CatalogPath), `Catalog dump not found: ${CatalogPath}`);
-Assert(SELECTIONS.length === 178, `Expected 178 selections, found ${SELECTIONS.length}`);
+Assert(SELECTIONS.length === 163, `Expected 163 selections, found ${SELECTIONS.length}`);
 
 const Catalog = new Map<string, CatalogRow>();
 for (const Line of fs.readFileSync(CatalogPath, "utf8").split(/\r?\n/)) {

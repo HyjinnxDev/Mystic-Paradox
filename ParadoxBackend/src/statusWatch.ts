@@ -24,7 +24,7 @@ export function StatusName(players: number | null): string {
 async function Discord(token: string, path: string, init: RequestInit = {}): Promise<any> {
     const Res = await fetch(`https://discord.com/api/v10${path}`, {
         ...init,
-        headers: { authorization: `Bot ${token}`, "content-type": "application/json", "user-agent": "DauntlessForever (status, 1.0)" },
+        headers: { authorization: `Bot ${token}`, "content-type": "application/json", "user-agent": "DauntlessRevamped (status, 1.0)" },
         signal: AbortSignal.timeout(10000),
     });
     if (!Res.ok) throw new Error(`Discord answered ${Res.status} ${await Res.text()}`);

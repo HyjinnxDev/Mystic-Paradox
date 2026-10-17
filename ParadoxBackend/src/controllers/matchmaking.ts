@@ -13,6 +13,7 @@ import { logger } from "../logger";
 import { GetRequestId, REQUEST_ID_HEADER } from "../observability/requestContext";
 import crypto from "node:crypto";
 import { GetP2PExtension } from "../extensions/p2p";
+import { LateJoinBlockReason, LateJoinHuntState } from "../matchmakingParty";
 
 const MATCHMAKING_MODE = process.env.MATCHMAKING_MODE;
 const DEPLOYSERVER_URL = process.env.DEPLOYSERVER_URL;
@@ -410,6 +411,48 @@ export async function FetchLiveHubStatus(): Promise<LiveHubStatus | undefined> {
         logger.warn(`hub-status unreachable (${e}); treating cached hub candidates as unverified`);
         return undefined;
     }
+}
+
+// Join-in-progress: the running hunt of another party member that PlayerId (in Ramsgate) may drop into, with
+// the hunt server's own state. undefined when there is none; Blocked names why an existing hunt is closed.
+export type LateJoinOffer = { MemberId: string, Result: MatchmakingResult, State: LateJoinHuntState | null, Blocked?: string };
+
+async function FetchHuntServerState(Port: number): Promise<LateJoinHuntState | null> {
+    try {
+        const Response = await fetch(`http://${DEPLOYSERVER_URL}/api/hunt-status?port=${Port}`);
+        if (!Response.ok) return null;
+        const Body = await Response.json() as { huntState?: LateJoinHuntState | null } | null;
+        return Body?.huntState ?? null;
+    } catch {
+        return null;
+    }
+}
+
+export async function FindLateJoinOffer(PlayerId: string, PartyMembers: readonly string[], IsOnline: (Id: string) => boolean): Promise<LateJoinOffer | undefined> {
+    const Own = MatchmakingResultMap.get(PlayerId);
+    if (Own != undefined && !IsHubDestination("", Own.HuntId)) return undefined;   // already hunting
+    for (const MemberId of PartyMembers) {
+        if (MemberId === PlayerId || !IsOnline(MemberId)) continue;
+        const Result = MatchmakingResultMap.get(MemberId);
+        if (Result == undefined || !Result.Ready || Result.Canceled || Result.Port <= 0
+            || Result.HuntId.trim().length === 0 || IsHubDestination("", Result.HuntId)) continue;
+        const State = await FetchHuntServerState(Result.Port);
+        return { MemberId, Result, State, Blocked: LateJoinBlockReason(State, Date.now()) };
+    }
+    return undefined;
+}
+
+// Sends PlayerId to the offered hunt through the same path party members already follow a leader on: a fresh
+// candidate of their own plus the party instance, so their client's POST /party poll sees the party go
+// MATCHING -> IN_PROGRESS and travels. CreatedAt 0 keeps this instance out of the 120 s same-hunt reuse.
+export function GrantLateJoin(PlayerId: string, PartyId: string, Offer: LateJoinOffer): void {
+    const CandidateId = crypto.randomUUID();
+    const Result: MatchmakingResult = { ...Offer.Result, CandidateId, ReadyAt: CreateGoNowReleaseAt(false) };
+    MatchmakingResultMap.set(PlayerId, Result);
+    PartyInstanceMap.set(PartyId, { ...Result });
+    PartyInstanceCreatedAtMap.set(PartyId, 0);
+    logger.info(`[LateJoin] ${PlayerId} -> ${Offer.MemberId}'s hunt '${Result.HuntId}' ${Result.Host}:${Result.Port} `
+        + `hp=${Offer.State?.hpPct} players=${Offer.State?.players} release in ${Result.ReadyAt - Date.now()}ms`);
 }
 
 export async function GetPlayerCandidate(PlayerId: string): Promise<MatchmakingResult | undefined> {

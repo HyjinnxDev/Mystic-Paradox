@@ -47,6 +47,12 @@ std::wstring MpApiBaseForCrashReports();
 
 // Voice.cpp: in-game party voice chat (client only; off without the launcher's voice relay env).
 void MpVoiceStart();
+// JoinPrompt.cpp: join-in-progress offer (client only). Worker thread <-> game thread (dllmain.cpp JoinPopup):
+// take a new offer's popup text / a result notice once each, answer the popup.
+void MpJoinPromptStart();
+bool MpJoinPromptTakeOffer(std::string& Text);
+bool MpJoinPromptTakeNotice(std::string& Text);
+void MpJoinPromptAnswer(bool Join);
 // Game thread -> voice threads: the game's Audio "Voice chat" toggle and voice chat volume (0..1).
 void MpVoiceApplySettings(bool enabled, float volume);
 // Game thread -> voice threads: the Bindings "Push to Talk" key (a VK code, 0 = unusable) and the Audio Open Mic toggle.

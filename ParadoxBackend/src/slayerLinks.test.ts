@@ -93,6 +93,11 @@ test("chests: wiki curve, pool draw, hidden unlocks, grant at the end", () => {
     assert.equal(pool.length, PRIZE_POOL_SIZE);
     assert.equal(new Set(pool.map((p) => `${p.catalog_id}x${p.quantity}`)).size, PRIZE_POOL_SIZE, "no repeats");
     assert.ok(pool.every((p) => p.catalog_id !== LINK_CROWN && p.received_for_level === 0), "owned crown left out, nothing unlocked");
+    const old = pool.slice(0, 8).map((p, i) => ({ ...p, received_for_level: i === 0 ? 1 : 0 }));
+    const topped = DrawPrizePool(rand, new Set(), old);
+    assert.equal(topped.length, PRIZE_POOL_SIZE, "old 8-prize pool topped up");
+    assert.deepEqual(topped.slice(0, 8), old, "old prizes and unlocks kept");
+    assert.equal(new Set(topped.map((p) => `${p.catalog_id}x${p.quantity}`)).size, PRIZE_POOL_SIZE, "no repeats after top-up");
 
     const s = Store();
     s.apply(Invite(s.rows, "A", new Set(["B"]), { account_id: "B", slot: 1 }, 0, "L1"));
